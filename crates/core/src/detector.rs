@@ -273,17 +273,19 @@ impl Detector {
         let pad = (s.slot.bandwidth / 2.0 / self.bank.bin_hz()) as usize;
         let lo = s.lo.saturating_sub(pad);
         let hi = (s.hi + pad).min(self.raw.len());
+        self.excess_centroid(lo, hi, floor).unwrap_or(s.offset_hz)
+    }
+
+    /// Power-weighted centre (offset Hz) of the power above `floor` in
+    /// shifted bins `lo..hi`, or None if nothing is above it.
+    fn excess_centroid(&self, lo: usize, hi: usize, floor: f32) -> Option<f64> {
         let (mut w, mut acc) = (0.0f64, 0.0f64);
-        for k in lo..hi {
-            let excess = (self.raw[k] - floor).max(0.0) as f64;
+        for (k, &p) in self.raw[lo..hi].iter().enumerate() {
+            let excess = (p - floor).max(0.0) as f64;
             w += excess;
-            acc += excess * k as f64;
+            acc += excess * (lo + k) as f64;
         }
-        if w <= 0.0 {
-            return s.offset_hz;
-        }
-        let bin = acc / w - (self.bank.n / 2) as f64;
-        bin * self.bank.bin_hz()
+        (w > 0.0).then(|| (acc / w - (self.bank.n / 2) as f64) * self.bank.bin_hz())
     }
 
     /// Whether the excess power in an explicit slot's own window is centred
@@ -291,16 +293,9 @@ impl Detector {
     fn is_centred(&self, i: usize) -> bool {
         let s = &self.slots[i];
         let floor = self.seg_floor[s.segment];
-        let (mut w, mut acc) = (0.0f64, 0.0f64);
-        for k in s.lo..s.hi {
-            let excess = (self.raw[k] - floor).max(0.0) as f64;
-            w += excess;
-            acc += excess * k as f64;
-        }
-        if w <= 0.0 {
+        let Some(off) = self.excess_centroid(s.lo, s.hi, floor) else {
             return false;
-        }
-        let off = (acc / w - (self.bank.n / 2) as f64) * self.bank.bin_hz();
+        };
         (off - s.offset_hz).abs() < s.slot.bandwidth / 4.0
     }
 
@@ -363,9 +358,7 @@ impl Detector {
             if h > w + 1 {
                 let a = self.raw[h - w - 1];
                 let b = self.raw[h + w + 1];
-                for k in h - w..=h + w {
-                    self.raw[k] = 0.5 * (a + b);
-                }
+                self.raw[h - w..=h + w].fill(0.5 * (a + b));
             }
         }
         let alpha = if self.blocks_seen == 0 {
