@@ -61,8 +61,9 @@ impl Default for DetectorParams {
             floor_segments: 64,
             usable: 0.9,
             max_active: 32,
-            // Zero-IF tuners (RSP1A measured) leave a DC residual ~5 kHz wide.
-            dc_notch_hz: 3000.0,
+            // Zero-IF tuners leave a DC residual; the RSP1A's skirt reaches
+            // ~5 kHz either side (live test, Nov 2026).
+            dc_notch_hz: 6000.0,
             grid_window_hz: 0.0,
             burst_slots: 6,
             burst_margin_db: 10.0,

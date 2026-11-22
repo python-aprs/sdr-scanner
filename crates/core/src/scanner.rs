@@ -450,6 +450,12 @@ impl Scanner {
                     let snapped = (rf / self.cfg.grid_tune_step).round() * self.cfg.grid_tune_step;
                     offset += snapped - ws.slot.freq;
                     tuned.freq = snapped;
+                    // A grid slot pulled onto the tuner's DC residual (the
+                    // notch's skirt) is not a transmission.
+                    if offset.abs() < self.cfg.detector.dc_notch_hz {
+                        self.stats.not_recorded += 1;
+                        return;
+                    }
                 }
                 // A signal between two grid windows can open both; once
                 // retuned they land on the same frequency. Keep the first.

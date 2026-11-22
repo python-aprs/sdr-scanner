@@ -197,7 +197,7 @@ struct Tuning {
     max_active: usize,
     /// Half-width (Hz) of the notch over the tuner's DC residual. Zero-IF
     /// radios (RSP1A) need a few kHz; 0 disables.
-    #[arg(long, default_value_t = 3000.0)]
+    #[arg(long, default_value_t = 6000.0)]
     dc_notch: f64,
     /// Run channels on one thread.
     #[arg(long)]
