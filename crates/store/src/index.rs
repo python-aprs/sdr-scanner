@@ -1,14 +1,31 @@
 //! SQLite index of recorded transmissions (PLAN.md 3.5). One row per
 //! transmission; the web API (Phase 3) queries it.
 
+use crate::migrate::{self, MigrateError, Migration, Schema, Up};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
-pub use rusqlite::Error as IndexError;
+#[derive(Debug, thiserror::Error)]
+pub enum IndexError {
+    #[error("recordings index: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Schema(#[from] MigrateError),
+}
 
-const SCHEMA_VERSION: i64 = 1;
+/// The recordings index's migrations; see [`crate::migrate`] for the rules.
+/// Version 1 is the schema from before versioning, so it keeps
+/// `IF NOT EXISTS`; later steps must not.
+pub static SCHEMA: Schema = Schema {
+    name: "recordings index",
+    application_id: 0x5343_4E49, // "SCNI"
+    migrations: &[Migration {
+        description: "transmissions table",
+        up: Up::Sql(V1),
+    }],
+};
 
-const SCHEMA: &str = "
+const V1: &str = "
 CREATE TABLE IF NOT EXISTS transmissions (
     id          INTEGER PRIMARY KEY,
     freq_hz     REAL    NOT NULL,
@@ -78,22 +95,30 @@ pub struct Index {
 }
 
 impl Index {
+    /// Open (creating if needed) the index as its writer: upgrades the
+    /// schema and marks rows a crash left unfinished. One process records
+    /// into a directory at a time.
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         Self::init(Connection::open(path)?)
+    }
+
+    /// Open an existing index to read it while a recorder may be writing
+    /// it. Doesn't migrate or touch rows; fails if the index is missing or
+    /// at another schema version.
+    pub fn open_reader(path: &Path) -> Result<Self, IndexError> {
+        Ok(Index {
+            db: migrate::open_current(path, &SCHEMA)?,
+        })
     }
 
     pub fn in_memory() -> Result<Self, IndexError> {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(db: Connection) -> Result<Self, IndexError> {
+    fn init(mut db: Connection) -> Result<Self, IndexError> {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
-        db.execute_batch(SCHEMA)?;
-        let v: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if v == 0 {
-            db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        migrate::migrate(&mut db, &SCHEMA)?;
         // Rows left 'recording' by a crash have no finished file.
         db.execute(
             "UPDATE transmissions SET status = 'interrupted' WHERE status = 'recording'",
@@ -146,6 +171,7 @@ impl Index {
         self.db
             .query_row("SELECT * FROM transmissions WHERE id = ?1", [id], row)
             .optional()
+            .map_err(Into::into)
     }
 
     /// Most recent first.
@@ -153,7 +179,9 @@ impl Index {
         let mut st = self
             .db
             .prepare("SELECT * FROM transmissions ORDER BY start_ns DESC, id DESC LIMIT ?1")?;
-        st.query_map([limit as i64], row)?.collect()
+        Ok(st
+            .query_map([limit as i64], row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Completed transmissions matching `q`, newest first.
@@ -179,16 +207,18 @@ impl Index {
             ],
             row,
         )?
-        .collect()
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Into::into)
     }
 
     pub fn count(&self) -> Result<i64, IndexError> {
         self.db
             .query_row("SELECT COUNT(*) FROM transmissions", [], |r| r.get(0))
+            .map_err(Into::into)
     }
 }
 
-fn row(r: &rusqlite::Row) -> Result<Row, IndexError> {
+fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     Ok(Row {
         id: r.get("id")?,
         freq_hz: r.get("freq_hz")?,
@@ -309,5 +339,62 @@ mod tests {
         drop(ix);
         let ix = Index::open(&p).unwrap();
         assert_eq!(ix.get(id).unwrap().unwrap().status, "interrupted");
+    }
+
+    /// The schema every migration adds up to. A change here should come
+    /// with a new migration, never an edit to an old one.
+    #[test]
+    fn schema_snapshot() {
+        let ix = Index::in_memory().unwrap();
+        assert_eq!(
+            migrate::schema_sql(&ix.db).unwrap(),
+            include_str!("../schema/index.sql")
+        );
+    }
+
+    #[test]
+    fn adopts_an_index_from_before_migrations() {
+        // What PR 1 to PR 5 created: the same table, user_version 1 and no
+        // application id.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("index.sqlite");
+        let old = Connection::open(&p).unwrap();
+        old.execute_batch(V1).unwrap();
+        old.pragma_update(None, "user_version", 1).unwrap();
+        old.execute(
+            "INSERT INTO transmissions (freq_hz, origin, mode, start_ns, audio_rate, wav_path, status)
+             VALUES (147.52e6, 'grid', 'nbfm', 1, 8000, 'a.wav', 'complete')",
+            [],
+        )
+        .unwrap();
+        drop(old);
+        let ix = Index::open(&p).unwrap();
+        assert_eq!(ix.count().unwrap(), 1);
+        let app: i32 = ix
+            .db
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(app, SCHEMA.application_id);
+    }
+
+    #[test]
+    fn readers_leave_rows_being_recorded_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("index.sqlite");
+        assert!(Index::open_reader(&p).is_err());
+        let w = Index::open(&p).unwrap();
+        let id = w
+            .insert(&NewRow {
+                freq_hz: 1.0,
+                channel: None,
+                origin: "grid",
+                mode: "nbfm",
+                start_ns: 0,
+                audio_rate: 8000,
+                wav_path: "x",
+            })
+            .unwrap();
+        let r = Index::open_reader(&p).unwrap();
+        assert_eq!(r.get(id).unwrap().unwrap().status, "recording");
     }
 }

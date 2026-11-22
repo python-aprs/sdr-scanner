@@ -122,6 +122,35 @@ cargo bench -p scanner-core --bench pipeline
 
 A recording path can be given as `name`, `name.sigmf-meta` or `name.sigmf-data`.
 
+### Database migrations
+
+The scanner keeps two SQLite databases: the recordings index
+(`<out>/index.sqlite`, `scanner_store::index::SCHEMA`) and the accounts
+database (`auth.sqlite`, `scanner_web::auth::SCHEMA`). Each schema is a list
+of migrations in `scanner_store::migrate`; `PRAGMA user_version` records how
+many have run and `PRAGMA application_id` marks which database a file is
+(`SCNI` or `SCNA`), so passing one where the other belongs fails cleanly.
+
+- The writer upgrades on open: the recorder for the index, `scanner serve`
+  and `scanner admin` for accounts. All pending steps run in one
+  `BEGIN IMMEDIATE` transaction, so a failed step changes nothing and two
+  processes can't migrate at once.
+- Before upgrading a database that holds data it saves
+  `<file>.v<old version>-<unix seconds>.bak` next to it, with the same
+  permissions as the database.
+- A database from a newer scanner is refused with a message, never
+  downgraded.
+- The web API opens the index with `Index::open_reader`, which requires the
+  current version and doesn't migrate.
+
+To change a schema, append a `Migration` (SQL, or a Rust function for data
+changes) to its list. Never edit one that has shipped. Then update the
+snapshot that `schema_snapshot` compares against
+(`crates/store/schema/index.sql` or `crates/web/schema/auth.sql`) and add
+an upgrade test from the previous version. Databases made before migrations
+existed are adopted as version 1, so later steps must not use
+`IF NOT EXISTS`.
+
 ### SDRplay (RSP1A)
 
 The SDRplay backend is behind the `sdrplay` cargo feature, because it needs
