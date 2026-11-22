@@ -269,14 +269,17 @@ impl HighPass {
 /// NBFM transmitters differ a lot in deviation: a handheld's voice can sit
 /// 15-20 dB below a repeater's, so one fixed gain leaves some recordings
 /// barely audible and clips others. This follows the audio's peak
-/// envelope and steers the gain to put speech peaks near `target`: the
-/// gain drops within milliseconds when the audio gets louder and rises
-/// slowly (half a second) when it gets quieter, between `min` and `max`.
-/// A transmission starts at unity gain and may rise ten times faster over
-/// its first 0.3 s of audio, so the first words are not lost while the
-/// gain finds its level, and the gain never overshoots at key-up. While
-/// the squelch is muted the gain holds, so silence never winds it up. A
-/// soft limiter catches the onsets the gain has not yet caught.
+/// envelope and steers the gain to put speech peaks near `target`, between
+/// `min` and `max`.
+///
+/// A transmission plays its first 0.1 s of audio at unity gain while the
+/// AGC measures its peak, then the gain jumps once to the level that peak
+/// calls for. After that it moves slowly (half a second down, three
+/// seconds up), so it settles on a level per transmission rather than
+/// riding every word; it drops within milliseconds only when the audio
+/// would reach the limiter.
+/// While the squelch is muted the gain holds, so silence never winds it
+/// up. A soft limiter catches the onsets the gain has not yet caught.
 #[derive(Debug, Clone)]
 pub struct Agc {
     gain: f32,
@@ -288,10 +291,11 @@ pub struct Agc {
     env_decay: f32,
     /// Per-sample smoothing coefficients for falling and rising gain.
     down: f32,
+    /// Falling gain when the audio would reach the limiter.
+    down_fast: f32,
     up: f32,
-    up_fast: f32,
-    /// Samples of audio left with the fast rise.
-    warm: u32,
+    /// Samples of audio left to measure before the first gain setting.
+    settle: u32,
 }
 
 impl Agc {
@@ -313,11 +317,11 @@ impl Agc {
             target: Self::TARGET,
             min: Self::MIN_GAIN,
             max: Self::MAX_GAIN,
-            env_decay: (-1.0 / (0.5 * rate)).exp() as f32,
-            down: coef(0.005),
-            up: coef(0.5),
-            up_fast: coef(0.05),
-            warm: (0.3 * rate) as u32,
+            env_decay: (-1.0 / (3.0 * rate)).exp() as f32,
+            down: coef(0.5),
+            down_fast: coef(0.005),
+            up: coef(3.0),
+            settle: (0.1 * rate) as u32,
         }
     }
 
@@ -336,26 +340,34 @@ impl Agc {
                 } else {
                     self.max
                 };
-                let k = if want < self.gain {
-                    self.down
-                } else if self.warm > 0 {
-                    self.up_fast
+                if self.settle > 0 {
+                    self.settle -= 1;
+                    if self.settle == 0 {
+                        self.gain = want;
+                    }
                 } else {
-                    self.up
-                };
-                self.warm = self.warm.saturating_sub(1);
-                // Smoothed in log terms, so the gain moves at the same rate
-                // in dB whichever way it goes.
-                self.gain *= (want / self.gain).powf(k);
+                    let k = if want >= self.gain {
+                        self.up
+                    } else if self.env * self.gain > SOFT_KNEE {
+                        self.down_fast
+                    } else {
+                        self.down
+                    };
+                    // Smoothed in log terms, so the gain moves at the same
+                    // rate in dB whichever way it goes.
+                    self.gain *= (want / self.gain).powf(k);
+                }
             }
             *v = soft_limit(*v * self.gain);
         }
     }
 }
 
+const SOFT_KNEE: f32 = 0.8;
+
 /// Linear up to 0.8, then a tanh knee that never exceeds 1.0.
 pub fn soft_limit(x: f32) -> f32 {
-    const KNEE: f32 = 0.8;
+    const KNEE: f32 = SOFT_KNEE;
     let a = x.abs();
     if a <= KNEE {
         x
