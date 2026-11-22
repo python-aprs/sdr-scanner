@@ -23,6 +23,11 @@ pub enum Mode {
     Nbfm,
     Afsk1200,
     Dmr,
+    /// Yaesu System Fusion (C4FM)
+    Ysf,
+    Dstar,
+    P25,
+    Nxdn,
     Usb,
     Lsb,
     Cw,
@@ -78,6 +83,15 @@ pub struct RepeaterEntry {
     pub mode: Option<Mode>,
     #[serde(default)]
     pub priority: bool,
+    /// Defaults to true. Importers set false for digital-only repeaters
+    /// until their decoder exists.
+    pub record: Option<bool>,
+    /// Informational fields carried through from coordinator lists.
+    pub call: Option<String>,
+    pub location: Option<String>,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub modes: Vec<String>,
 }
 
 /// A frequency or range whose slots stay on the spectrum but are not recorded.
@@ -310,7 +324,7 @@ impl Profile {
                 deviation: r.deviation.unwrap_or(self.deviation).0,
                 mode: r.mode.unwrap_or(self.mode),
                 priority: r.priority,
-                record: true,
+                record: r.record.unwrap_or(true),
                 name: Some(r.name.clone()),
                 origin: SlotOrigin::RepeaterOutput,
             };
@@ -539,6 +553,36 @@ deviation = "2.5 kHz"
         assert_eq!(slot_at(&p, 146.84e6).origin, SlotOrigin::RepeaterOutput);
         // Grid is now 12.5 kHz.
         assert_eq!(slot_at(&p, 146.5125e6).bandwidth, 11e3);
+    }
+
+    #[test]
+    fn repeater_info_fields_and_record_flag() {
+        let cfg = r#"
+[profiles.p]
+span = { start = "144 MHz", stop = "148 MHz" }
+spacing = "25 kHz"
+bandwidth = "16 kHz"
+deviation = "5 kHz"
+[[profiles.p.repeaters]]
+name = "W7XXX Somewhere"
+call = "W7XXX"
+location = "Somewhere, WA"
+source = "WWARA"
+modes = ["DMR"]
+output = "146.4500 MHz"
+offset = "1 MHz"
+mode = "dmr"
+record = false
+"#;
+        let p = ConfigFile::parse(cfg)
+            .unwrap()
+            .profile("p")
+            .unwrap()
+            .channel_plan();
+        let out = slot_at(&p, 146.45e6);
+        assert_eq!(out.mode, Mode::Dmr);
+        assert!(!out.record);
+        assert!(!slot_at(&p, 147.45e6).record);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/sources", "crates/cli", "crates/web"]
+members = ["crates/core", "crates/sources", "crates/store", "crates/cli", "crates/web"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/masenf/sdr-scanner"
 [workspace.dependencies]
 scanner-core = { path = "crates/core" }
 scanner-sources = { path = "crates/sources" }
+scanner-store = { path = "crates/store" }
 scanner-web = { path = "crates/web" }
 num-complex = "0.4"
 rustfft = "6.4"
@@ -22,6 +23,8 @@ clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 tempfile = "3"
+rayon = "1.10"
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

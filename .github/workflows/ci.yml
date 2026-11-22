@@ -33,6 +33,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release -p scanner-cli
       - run: target/release/scanner config check config/example-2m.toml
+      - run: target/release/scanner config check config/rainier.toml
       - uses: actions/upload-artifact@v4
         with:
           name: scanner-${{ matrix.name }}
@@ -69,4 +70,8 @@ jobs:
       - run: uv run --extra test pytest -v
         env:
           SCANNER_BIN: ${{ runner.temp }}/bin/scanner
-
+      - name: Repeater importer
+        run: |
+          uvx ruff check ../channels
+          uvx ruff format --check ../channels
+          uv run --extra test pytest -v ../channels/tests

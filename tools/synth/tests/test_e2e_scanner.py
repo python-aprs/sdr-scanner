@@ -43,3 +43,46 @@ def test_scanner_info_reads_metadata(tmp_path):
     assert "146.0000 MHz" in out
     assert "500000 (0.200 s)" in out
     assert "ci16_le" in out
+
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+def test_scanner_run_records_ci_smoke(tmp_path):
+    """`scanner run` writes one WAV per transmission at the right frequency and
+    time, with audio close to the truth (PLAN.md 4.3)."""
+    from synth import score
+
+    sc = scenario.load(Path(__file__).parent.parent / "scenarios" / "ci_smoke.yaml")
+    res = writer.write(sc, tmp_path / "ci_smoke")
+    out = subprocess.run(
+        [
+            SCANNER,
+            "run",
+            str(tmp_path / "ci_smoke.sigmf-meta"),
+            "--config",
+            str(REPO / "config" / "example-2m.toml"),
+            "--profile",
+            "2m-25k",
+            "--out",
+            str(tmp_path / "out"),
+            "--hang",
+            "0.5",
+            "--json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    result = json.loads(out)
+    s = score.score(res.truth_path, result)
+    print(score.report(s))
+    assert s.recall == 1.0
+    assert not s.false_positives
+    for m in s.matches:
+        assert abs(m.start_err) < 0.05, m
+        assert abs(m.end_err) < 0.05, m
+        assert abs(m.found_freq_hz - m.freq_hz) < 1500, m
+        # Python reference demod gets 29, 15 and 28 dB on these.
+        assert m.audio_snr_db is not None and m.audio_snr_db > 12, m
+    assert (tmp_path / "out" / "index.sqlite").exists()
