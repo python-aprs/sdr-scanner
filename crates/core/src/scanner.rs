@@ -249,6 +249,8 @@ pub struct Scanner {
     events: Vec<Event>,
     stats: ScannerStats,
     last_block: Option<u64>,
+    /// Frequency ranges (Hz) never recorded, whichever slot hears them.
+    lockouts: Vec<(f64, f64)>,
 }
 
 impl Scanner {
@@ -285,6 +287,7 @@ impl Scanner {
             events: Vec::new(),
             stats: ScannerStats::default(),
             last_block: None,
+            lockouts: Vec::new(),
             cfg,
         }
     }
@@ -331,6 +334,72 @@ impl Scanner {
         for b in blocks {
             self.on_block(b, out);
         }
+    }
+
+    fn locked_out(&self, freq: f64) -> bool {
+        self.lockouts
+            .iter()
+            .any(|&(lo, hi)| freq >= lo && freq <= hi)
+    }
+
+    /// Set the record and priority flags of the watched slot at `freq` (Hz,
+    /// within 1 Hz). A recording in progress on a slot that stops being
+    /// recorded is closed now. Returns false if no watched slot is there.
+    pub fn set_slot_flags(
+        &mut self,
+        freq: f64,
+        record: bool,
+        priority: bool,
+        out: &mut Vec<Output>,
+    ) -> bool {
+        let Some(i) = self
+            .detector
+            .slots()
+            .iter()
+            .position(|w| (w.slot.freq - freq).abs() < 1.0)
+        else {
+            return false;
+        };
+        self.detector.set_flags(i, record, priority);
+        if !record {
+            self.close_where(|c| c.slot == i, out);
+        }
+        true
+    }
+
+    /// Frequency ranges that are never recorded, on top of the slots' own
+    /// flags (for signals a grid slot retunes onto). Recordings in progress
+    /// inside a range are closed now.
+    pub fn set_lockouts(&mut self, ranges: Vec<(f64, f64)>, out: &mut Vec<Output>) {
+        self.lockouts = ranges;
+        let locked: Vec<f64> = self
+            .chains
+            .iter()
+            .map(|c| c.tuned.freq)
+            .filter(|&f| self.locked_out(f))
+            .collect();
+        self.close_where(|c| locked.contains(&c.tuned.freq), out);
+    }
+
+    /// Close the transmissions of chains matching `pick` as if their signal
+    /// had just stopped.
+    fn close_where(&mut self, pick: impl Fn(&Chain) -> bool, out: &mut Vec<Output>) {
+        let Some(last) = self.last_block else { return };
+        let slots: Vec<usize> = self
+            .chains
+            .iter()
+            .filter(|c| pick(c))
+            .map(|c| c.slot)
+            .collect();
+        let mut events = std::mem::take(&mut self.events);
+        events.clear();
+        for i in slots {
+            self.detector.close(i, last, &mut events);
+        }
+        for e in events.drain(..) {
+            self.on_event(e, out);
+        }
+        self.events = events;
     }
 
     /// End of stream: close all open transmissions.
@@ -456,6 +525,10 @@ impl Scanner {
                         self.stats.not_recorded += 1;
                         return;
                     }
+                }
+                if self.locked_out(tuned.freq) {
+                    self.stats.not_recorded += 1;
+                    return;
                 }
                 // A signal between two grid windows can open both; once
                 // retuned they land on the same frequency. Keep the first.
@@ -819,6 +892,87 @@ mod tests {
         let (out, stats) = collect(&x, &[s], ScannerConfig::default());
         assert!(out.is_empty());
         assert_eq!(stats.not_recorded, 1);
+    }
+
+    /// Run `x` in chunks, calling `edit` once after `at` seconds.
+    fn collect_with_edit(
+        x: &[Complex32],
+        plan: &[Slot],
+        at: f64,
+        edit: impl FnOnce(&mut Scanner, &mut Vec<Output>),
+    ) -> (Vec<Output>, ScannerStats) {
+        let mut s = Scanner::with_params(
+            ScannerConfig::default(),
+            params(),
+            0.0,
+            SystemTime::UNIX_EPOCH,
+            plan,
+        );
+        let mut out = Vec::new();
+        let split = (at * params().sample_rate) as usize;
+        for c in x[..split].chunks(50_000) {
+            s.push(c, &mut out);
+        }
+        edit(&mut s, &mut out);
+        for c in x[split..].chunks(50_000) {
+            s.push(c, &mut out);
+        }
+        s.finish(&mut out);
+        (out, s.stats())
+    }
+
+    fn closes(out: &[Output]) -> Vec<&TxEnd> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Close(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn locking_out_mid_transmission_ends_it_and_stops_new_ones() {
+        // On 0.3-3.0 s; locked out at 1.5 s, unlocked at never.
+        let x = scene(4.0, &[(100e3, 1000.0, 0.3, 3.0)]);
+        let (out, stats) = collect_with_edit(&x, &[slot(100e3)], 1.5, |s, out| {
+            assert!(s.set_slot_flags(100e3, false, false, out));
+            assert!(!s.set_slot_flags(123e3, false, false, out), "no slot there");
+        });
+        let ends = closes(&out);
+        assert_eq!(ends.len(), 1, "{stats:?}");
+        // Ended at the lockout, not at key-down (2.7 s of signal).
+        assert!(ends[0].signal_secs < 1.4, "{}", ends[0].signal_secs);
+        assert!(s_opens(&out) == 1);
+        assert!(
+            stats.not_recorded >= 1,
+            "re-opened but not recorded: {stats:?}"
+        );
+    }
+
+    fn s_opens(out: &[Output]) -> usize {
+        out.iter().filter(|o| matches!(o, Output::Open(_))).count()
+    }
+
+    #[test]
+    fn lockout_ranges_catch_retuned_grid_signals() {
+        // An off-grid signal at 112.5 kHz heard by the 100 kHz grid slot,
+        // which retunes onto it; a lockout at 112.5 kHz +/- 5 kHz stops it.
+        let x = scene(3.0, &[(112.5e3, 1000.0, 0.3, 2.5)]);
+        let plan = vec![slot(100e3), slot(125e3)];
+        let (out, _) = collect(&x, &plan, ScannerConfig::default());
+        assert_eq!(s_opens(&out), 1);
+        let (out, stats) = collect_with_edit(&x, &plan, 0.0, |s, out| {
+            s.set_lockouts(vec![(107.5e3, 117.5e3)], out);
+        });
+        assert_eq!(s_opens(&out), 0, "{stats:?}");
+        assert!(stats.not_recorded >= 1);
+        // Mid-transmission: closed at the edit.
+        let (out, _) = collect_with_edit(&x, &plan, 1.2, |s, out| {
+            s.set_lockouts(vec![(107.5e3, 117.5e3)], out);
+        });
+        let ends = closes(&out);
+        assert_eq!(ends.len(), 1);
+        assert!(ends[0].signal_secs < 1.1, "{}", ends[0].signal_secs);
     }
 
     #[test]

@@ -43,7 +43,8 @@ pub type SpectrumHandle = Arc<RwLock<Spectrum>>;
 pub struct ChannelInfo {
     pub freq_hz: f64,
     pub name: Option<String>,
-    /// "channel", "repeater_output", "repeater_input" or "grid".
+    /// "channel", "repeater_output", "repeater_input", "grid", or "lockout"
+    /// for a locked-out frequency that isn't a watched slot.
     pub kind: &'static str,
     pub mode: String,
     pub bandwidth_hz: f64,
@@ -53,6 +54,9 @@ pub struct ChannelInfo {
     /// For a repeater, the frequency of its other half (input or output)
     /// when that is watched too.
     pub pair_hz: Option<f64>,
+    /// Lockout or priority differs from the config file because of an edit
+    /// (undo with `DELETE /api/v1/channels/{freq_hz}/override`).
+    pub overridden: bool,
 }
 
 pub type ChannelsHandle = Arc<RwLock<Vec<ChannelInfo>>>;

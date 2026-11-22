@@ -676,25 +676,43 @@ impl Detector {
     /// End of stream: close everything that is open.
     pub fn finish(&mut self, last_block: u64, events: &mut Vec<Event>) {
         for i in 0..self.slots.len() {
-            let (start, end) = match self.states[i] {
-                SlotState::Active { start } => (start, last_block),
-                SlotState::Hang { start, since } => (start, since.saturating_sub(1)),
-                _ => continue,
-            };
-            let st = &self.stats[i];
-            events.push(Event::Close {
-                slot: i,
-                start_block: start,
-                end_block: end,
-                peak_snr_db: st.peak,
-                mean_snr_db: if st.count > 0 {
-                    (st.sum / st.count as f64) as f32
-                } else {
-                    st.snr_db
-                },
-            });
-            self.states[i] = SlotState::Idle;
+            self.close(i, last_block, events);
         }
+    }
+
+    /// End slot `i`'s transmission now (if it has one), as if the signal had
+    /// stopped at `last_block`. The slot can open again on a later block.
+    pub fn close(&mut self, i: usize, last_block: u64, events: &mut Vec<Event>) {
+        let (start, end) = match self.states[i] {
+            SlotState::Active { start } => (start, last_block),
+            SlotState::Hang { start, since } => (start, since.saturating_sub(1)),
+            SlotState::Attack { .. } => {
+                self.states[i] = SlotState::Idle;
+                return;
+            }
+            SlotState::Idle => return,
+        };
+        let st = &self.stats[i];
+        events.push(Event::Close {
+            slot: i,
+            start_block: start,
+            end_block: end,
+            peak_snr_db: st.peak,
+            mean_snr_db: if st.count > 0 {
+                (st.sum / st.count as f64) as f32
+            } else {
+                st.snr_db
+            },
+        });
+        self.states[i] = SlotState::Idle;
+    }
+
+    /// Change whether slot `i` is recorded and whether it is a priority
+    /// slot (lockout and priority edits while running).
+    pub fn set_flags(&mut self, i: usize, record: bool, priority: bool) {
+        let s = &mut self.slots[i].slot;
+        s.record = record;
+        s.priority = priority;
     }
 }
 

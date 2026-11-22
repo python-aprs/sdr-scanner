@@ -112,6 +112,21 @@ loaded from other sites. Edit the files and rebuild to change it.
 - **Admin**: log in and out, change your password, and create or revoke API
   tokens. It also shows what visitors can see.
 
+Logged in as admin, the Channels page can lock out a channel, unlock it, or
+make it a priority channel, and the Live page has a Lock out button on each
+transmission on the air. Changes take effect at once: a recording on a
+channel that gets locked out ends there. They are saved in
+`<out>/settings.sqlite` and override the config file until you press Reset
+(`DELETE /api/v1/channels/{freq_hz}/override`). A lockout on a frequency
+that isn't a watched channel, such as an off-grid signal or a birdie that a
+grid slot retunes onto, covers ±5 kHz. Every change goes in the audit log
+(`scanner admin audit`). Over the API:
+
+```sh
+curl -X PATCH -H "Authorization: Bearer scn_..." -H "Content-Type: application/json" \
+    -d '{"locked_out": true}' localhost:8080/api/v1/channels/145212500
+```
+
 The UI uses only `/api/v1`. Live data comes over one WebSocket,
 `/api/v1/live`: about one status message a second, plus spectrum frames of
 1,024 bins (one byte each) at 1, 2 or 5 frames a second. The spectrum stops
@@ -155,12 +170,13 @@ A recording path can be given as `name`, `name.sigmf-meta` or `name.sigmf-data`.
 
 ### Database migrations
 
-The scanner keeps two SQLite databases: the recordings index
-(`<out>/index.sqlite`, `scanner_store::index::SCHEMA`) and the accounts
-database (`auth.sqlite`, `scanner_web::auth::SCHEMA`). Each schema is a list
+The scanner keeps three SQLite databases: the recordings index
+(`<out>/index.sqlite`, `scanner_store::index::SCHEMA`), the accounts
+database (`auth.sqlite`, `scanner_web::auth::SCHEMA`) and settings edited
+while running (`<out>/settings.sqlite`, `scanner_store::settings::SCHEMA`). Each schema is a list
 of migrations in `scanner_store::migrate`; `PRAGMA user_version` records how
 many have run and `PRAGMA application_id` marks which database a file is
-(`SCNI` or `SCNA`), so passing one where the other belongs fails cleanly.
+(`SCNI`, `SCNA` or `SCNS`), so passing one where another belongs fails cleanly.
 
 - The writer upgrades on open: the recorder for the index, `scanner serve`
   and `scanner admin` for accounts. All pending steps run in one
