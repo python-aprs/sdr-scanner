@@ -649,11 +649,10 @@ fn run(a: RunArgs) -> Result<()> {
             );
         }
         println!(
-            "{} transmissions ({} opened, {} too short, {} silent, {} not recorded), {:.1} s of audio, {:.1} MB",
+            "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB",
             rec.files,
             stats.opened,
-            stats.discarded_short,
-            stats.discarded_silent,
+            stats.discarded_short + stats.discarded_silent,
             stats.not_recorded,
             rec.audio_secs,
             rec.bytes as f64 / 1e6
