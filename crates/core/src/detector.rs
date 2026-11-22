@@ -39,6 +39,13 @@ pub struct DetectorParams {
     /// so the grid tiles the band with no gaps for off-raster signals to
     /// fall through. 0 uses the slot bandwidth.
     pub grid_window_hz: f64,
+    /// Broadband-burst guard: when at least this many idle slots cross the
+    /// open threshold in the same block, it is front-end overload or
+    /// intermod (a strong nearby transmitter), not that many new
+    /// transmissions. Then only slots within `burst_margin_db` of the
+    /// strongest signal (open or not) may open. 0 disables.
+    pub burst_slots: usize,
+    pub burst_margin_db: f32,
 }
 
 impl Default for DetectorParams {
@@ -57,6 +64,8 @@ impl Default for DetectorParams {
             // Zero-IF tuners (RSP1A measured) leave a DC residual ~5 kHz wide.
             dc_notch_hz: 3000.0,
             grid_window_hz: 0.0,
+            burst_slots: 6,
+            burst_margin_db: 10.0,
         }
     }
 }
@@ -136,6 +145,13 @@ pub struct Detector {
     alpha: f32,
     floor_alpha: f32,
     blocks_seen: u64,
+    /// Blocks in which the burst guard held slots back.
+    burst_blocks: u64,
+    /// Scratch: per slot, whether it may start or continue an attack.
+    opens: Vec<bool>,
+    /// Per grid slot: sum and count of the signal centre over the attack,
+    /// so a retune is not thrown off by one block of lopsided FM speech.
+    attack_centre: Vec<(f64, u32)>,
     attack_blocks: u64,
     hang_blocks: u64,
     preroll_blocks: u64,
@@ -247,6 +263,9 @@ impl Detector {
             seg_floor: vec![0.0; nseg],
             seg_scratch: Vec::new(),
             blocks_seen: 0,
+            burst_blocks: 0,
+            opens: Vec::new(),
+            attack_centre: Vec::new(),
             skipped,
         }
     }
@@ -267,6 +286,13 @@ impl Detector {
     /// excess power over the noise floor in a slot's window, from the latest
     /// block. Used to tune fallback grid slots onto off-raster signals.
     pub fn centroid_hz(&self, i: usize) -> f64 {
+        match self.attack_centre.get(i) {
+            Some(&(sum, n)) if n > 0 => sum / n as f64,
+            _ => self.block_centroid_hz(i),
+        }
+    }
+
+    fn block_centroid_hz(&self, i: usize) -> f64 {
         let s = &self.slots[i];
         let floor = self.seg_floor[s.segment];
         // Look half a channel beyond the window on each side, so a signal
@@ -428,6 +454,7 @@ impl Detector {
             .iter()
             .filter(|s| matches!(s, SlotState::Active { .. } | SlotState::Hang { .. }))
             .count();
+        self.opens.clear();
         for i in 0..self.slots.len() {
             let snr = self.stats[i].snr_db;
             let dens = |j: usize| self.stats[j].snr_db;
@@ -440,7 +467,37 @@ impl Detector {
                 );
                 !(dens(j) > snr || (other_owns && dens(j) >= snr - 3.0))
             });
-            let open = snr >= self.params.open_db && wins;
+            self.opens.push(snr >= self.params.open_db && wins);
+        }
+        // Broadband-burst guard (see DetectorParams::burst_slots).
+        if self.params.burst_slots > 0 {
+            let waiting = |i: usize| {
+                matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. })
+                    && self.opens[i]
+            };
+            let hot = (0..self.slots.len()).filter(|&i| waiting(i)).count();
+            if hot >= self.params.burst_slots {
+                // The reference is the strongest signal anywhere, including
+                // one already open: the transmitter causing the overload is
+                // usually open before its products cross the threshold.
+                let top = (0..self.slots.len())
+                    .filter(|&i| waiting(i) || !matches!(self.states[i], SlotState::Idle))
+                    .map(|i| self.stats[i].snr_db)
+                    .fold(f32::MIN, f32::max);
+                let keep = top - self.params.burst_margin_db;
+                let drop: Vec<usize> = (0..self.slots.len())
+                    .filter(|&i| waiting(i) && self.stats[i].snr_db < keep)
+                    .collect();
+                for i in drop {
+                    self.opens[i] = false;
+                }
+                self.burst_blocks += 1;
+            }
+        }
+        self.attack_centre.resize(self.slots.len(), (0.0, 0));
+        for i in 0..self.slots.len() {
+            let snr = self.stats[i].snr_db;
+            let open = self.opens[i];
             // An explicit slot starts its attack only for a signal centred on
             // it, not for the skirt of a neighbour 10 kHz away. (Grid slots
             // retune to the signal instead.) Checked once, at the start of the
@@ -503,6 +560,27 @@ impl Detector {
                     }
                 }
             };
+            let grid = self.slots[i].slot.origin == SlotOrigin::Grid;
+            match (self.states[i], next) {
+                (_, SlotState::Attack { .. }) if grid => {
+                    let c = self.block_centroid_hz(i);
+                    let a = &mut self.attack_centre[i];
+                    if matches!(self.states[i], SlotState::Idle) {
+                        *a = (0.0, 0);
+                    }
+                    a.0 += c;
+                    a.1 += 1;
+                }
+                (SlotState::Attack { .. }, SlotState::Active { .. }) if grid => {
+                    let c = self.block_centroid_hz(i);
+                    let a = &mut self.attack_centre[i];
+                    a.0 += c;
+                    a.1 += 1;
+                }
+                (_, SlotState::Idle) => self.attack_centre[i] = (0.0, 0),
+                _ => {}
+            }
+            let st = &mut self.stats[i];
             if matches!(next, SlotState::Active { .. }) {
                 st.peak = st.peak.max(snr);
                 st.sum += snr as f64;
@@ -510,6 +588,11 @@ impl Detector {
             }
             self.states[i] = next;
         }
+    }
+
+    /// Blocks in which the broadband-burst guard held slots back.
+    pub fn burst_blocks(&self) -> u64 {
+        self.burst_blocks
     }
 
     /// End of stream: close everything that is open.
@@ -721,6 +804,43 @@ mod tests {
         let plan: Vec<Slot> = (-20..=20).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
         let (_, events, _) = run(&x, &plan, DetectorParams::default());
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn broadband_burst_opens_only_the_strong_signal() {
+        // A strong carrier plus eight weak "intermod products" that all key
+        // up in the same instant, as when a nearby handheld overloads the
+        // front end.
+        let mut sigs = vec![(100e3, 45.0, 0.5, 2.0)];
+        for k in 0..8 {
+            sigs.push((-300e3 + k as f64 * 50e3, 12.0, 0.5, 2.0));
+        }
+        let x = scene(3.0, &sigs, 11);
+        let plan: Vec<Slot> = (-20..=20).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let (det, events, _) = run(&x, &plan, DetectorParams::default());
+        let opened: Vec<f64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Open { slot, .. } => Some(det.slots()[*slot].slot.freq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, vec![100e3], "{opened:?}");
+        assert!(det.burst_blocks() > 0);
+        // With the guard off, the products open too.
+        let (_, events, _) = run(
+            &x,
+            &plan,
+            DetectorParams {
+                burst_slots: 0,
+                ..Default::default()
+            },
+        );
+        let n = events
+            .iter()
+            .filter(|e| matches!(e, Event::Open { .. }))
+            .count();
+        assert!(n >= 7, "{n}");
     }
 
     #[test]

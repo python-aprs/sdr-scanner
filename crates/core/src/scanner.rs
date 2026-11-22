@@ -690,6 +690,25 @@ mod tests {
     }
 
     #[test]
+    fn off_grid_signals_retune_to_their_own_frequency() {
+        // 5 kHz off the 25 kHz grid (like 147.520 between 147.500 and
+        // 147.525), modulated by a slow tone so single blocks are lopsided.
+        let sigs = [(120e3, 40.0, 0.5, 1.5), (-205e3, 55.0, 0.5, 1.5)];
+        let x = scene(2.0, &sigs);
+        let plan: Vec<Slot> = (-16..=16).map(|k| slot(k as f64 * 25e3)).collect();
+        let (out, _) = collect(&x, &plan, ScannerConfig::default());
+        let mut tuned: Vec<f64> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Open(s) => Some(s.slot.freq),
+                _ => None,
+            })
+            .collect();
+        tuned.sort_by(f64::total_cmp);
+        assert_eq!(tuned, vec![-205e3, 120e3]);
+    }
+
+    #[test]
     fn noise_outside_the_signal_is_muted() {
         let x = scene(3.0, &[(100e3, 1000.0, 1.0, 2.0)]);
         let plan = vec![slot(100e3)];

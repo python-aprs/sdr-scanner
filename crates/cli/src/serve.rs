@@ -333,7 +333,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 })
                 .unwrap_or_default();
             eprintln!(
-                "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}",
+                "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}",
                 wall,
                 busy.as_secs_f64() / wall * 100.0,
                 rs.blocks_written - rs.blocks_read,
@@ -341,6 +341,10 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 rs.dropped_samples,
                 st.recorded,
                 active.join(", "),
+                match scanner.detector().burst_blocks() {
+                    0 => String::new(),
+                    n => format!(", burst guard held opens in {n} blocks"),
+                },
                 radio_note
             );
             next_status += o.status_every;
