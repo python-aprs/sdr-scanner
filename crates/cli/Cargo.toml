@@ -25,3 +25,4 @@ scanner-store.workspace = true
 scanner-web.workspace = true
 serde_json.workspace = true
 ctrlc.workspace = true
+rpassword.workspace = true

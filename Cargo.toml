@@ -29,11 +29,23 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tower = { version = "0.5", features = ["util"] }
 rayon = "1.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
+argon2 = { version = "0.5.3", features = ["std"] }
+sha2 = "0.10"
+getrandom = "0.3"
+base64 = "0.22"
+rpassword = "7"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 debug = 1
+
+# Password hashing is deliberately slow; unoptimised it makes debug builds
+# and tests crawl.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.bench]
 debug = 1
