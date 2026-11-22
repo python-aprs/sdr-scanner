@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-24.04 }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: macos-arm64, os: macos-15 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      # Hardware backends compile as stubs until Phase 2; keep them building.
+      - run: cargo clippy -p scanner-sources --all-targets --features airspy,sdrplay
+      - run: cargo test --workspace
+      - run: cargo build --release -p scanner-cli
+      - run: target/release/scanner config check config/example-2m.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scanner-${{ matrix.name }}
+          path: target/release/scanner
+
+  macos-x86_64:
+    name: Rust (macos-x86_64 cross build)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --target x86_64-apple-darwin
+
+  synth:
+    name: Python synth + end-to-end
+    needs: rust
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: tools/synth
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: scanner-linux-x86_64
+          path: ${{ runner.temp }}/bin
+      - run: chmod +x ${{ runner.temp }}/bin/scanner
+      - run: uvx ruff check src tests
+      - run: uvx ruff format --check src tests
+      - run: uv run --extra test pytest -v
+        env:
+          SCANNER_BIN: ${{ runner.temp }}/bin/scanner
+
