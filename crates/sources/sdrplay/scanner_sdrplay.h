@@ -26,6 +26,8 @@ typedef struct {
     int bias_t;
     int rf_notch;
     int dab_notch;
+    /* USB transfer mode: 0 isochronous (the API default), 1 bulk. */
+    int usb_bulk;
 } scn_sdrplay_config;
 
 enum {

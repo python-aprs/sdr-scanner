@@ -316,6 +316,7 @@ int scn_sdrplay_start(const scn_sdrplay_config *cfg, scn_samples_fn on_samples,
     sdrplay_api_RxChannelParamsT *rx = h->params->rxChannelA;
 
     dp->fsFreq.fsHz = cfg->sample_rate;
+    dp->mode = cfg->usb_bulk ? sdrplay_api_BULK : sdrplay_api_ISOCH;
     dp->ppm = cfg->ppm;
     rx->tunerParams.rfFreq.rfHz = cfg->center_hz;
     rx->tunerParams.bwType = bw_type(cfg->bandwidth_khz);

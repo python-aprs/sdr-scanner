@@ -22,7 +22,7 @@ sdrplay_api_ErrT sdrplay_api_GetDeviceParams(HANDLE dev, sdrplay_api_DeviceParam
 static void *run(void *x){
   double fs=devp.fsFreq.fsHz, off=147.52e6-rxa.tunerParams.rfFreq.rfHz, ph=0; unsigned int first=0; short xi[1008],xq[1008];
   struct timespec t0; clock_gettime(CLOCK_MONOTONIC,&t0); unsigned long long sent=0; int ncb=0;
-  fprintf(stderr,"fake: fs=%.0f rf=%.0f lna=%d gr=%d bw=%d\n",fs,rxa.tunerParams.rfFreq.rfHz,rxa.tunerParams.gain.LNAstate,rxa.tunerParams.gain.gRdB,rxa.tunerParams.bwType);
+  fprintf(stderr,"fake: mode=%d fs=%.0f rf=%.0f lna=%d gr=%d bw=%d\n",devp.mode,fs,rxa.tunerParams.rfFreq.rfHz,rxa.tunerParams.gain.LNAstate,rxa.tunerParams.gain.gRdB,rxa.tunerParams.bwType);
   unsigned int seed=1;
   while(running){
     double t=sent/fs; int on = fmod(t,4.0)>1.0 && fmod(t,4.0)<3.0;

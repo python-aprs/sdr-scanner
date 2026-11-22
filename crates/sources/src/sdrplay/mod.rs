@@ -50,6 +50,8 @@ pub struct SdrplayConfig {
     /// The RSP1A's broadcast FM and DAB band-stop filters.
     pub rf_notch: bool,
     pub dab_notch: bool,
+    /// USB bulk transfers instead of isochronous (the API default).
+    pub usb_bulk: bool,
 }
 
 impl Default for SdrplayConfig {
@@ -68,6 +70,7 @@ impl Default for SdrplayConfig {
             bias_t: false,
             rf_notch: false,
             dab_notch: false,
+            usb_bulk: false,
         }
     }
 }

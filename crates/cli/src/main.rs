@@ -138,6 +138,9 @@ struct RadioArgs {
     /// Switch in the RSP1A's DAB band-stop filter.
     #[arg(long)]
     dab_notch: bool,
+    /// Use USB bulk transfers instead of isochronous.
+    #[arg(long)]
+    usb_bulk: bool,
 }
 
 impl RadioArgs {
@@ -160,6 +163,7 @@ impl RadioArgs {
             bias_t: self.bias_t,
             rf_notch: self.fm_notch,
             dab_notch: self.dab_notch,
+            usb_bulk: self.usb_bulk,
         }
     }
 }

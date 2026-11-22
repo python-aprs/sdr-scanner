@@ -27,6 +27,7 @@ struct CConfig {
     bias_t: c_int,
     rf_notch: c_int,
     dab_notch: c_int,
+    usb_bulk: c_int,
 }
 
 #[repr(C)]
@@ -186,6 +187,7 @@ impl Sdrplay {
             bias_t: cfg.bias_t as c_int,
             rf_notch: cfg.rf_notch as c_int,
             dab_notch: cfg.dab_notch as c_int,
+            usb_bulk: cfg.usb_bulk as c_int,
         };
         if let Some(s) = &cfg.serial {
             for (d, b) in c.serial.iter_mut().zip(s.bytes()) {
