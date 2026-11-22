@@ -7,6 +7,7 @@
 pub mod index;
 pub mod migrate;
 pub mod recorder;
+pub mod settings;
 pub mod wav;
 
 pub use index::{Index, Query, Row};

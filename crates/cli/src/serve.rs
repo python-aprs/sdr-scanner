@@ -12,6 +12,7 @@ use scanner_core::scanner::{Output, Scanner, ScannerConfig};
 use scanner_core::units::Hz;
 use scanner_sources::{FileSource, Source, SourceInfo, ring};
 use scanner_store::Recorder;
+use scanner_store::settings::{Override, Settings};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -211,7 +212,42 @@ fn start_sdrplay(_: &ServeOptions, _: Option<String>, _: Arc<AtomicBool>) -> Res
 }
 
 /// The watched slots as the web channel list shows them.
-fn channel_list(slots: &[scanner_core::detector::WatchedSlot]) -> Vec<scanner_web::ChannelInfo> {
+/// Half-width of a lockout placed on a frequency that isn't a watched slot
+/// (an off-grid signal a grid slot retunes onto, or a birdie).
+const LOCKOUT_HALF_HZ: f64 = 5e3;
+
+/// The config file's flags for each watched slot: (freq, record, priority).
+type BaseFlags = Vec<(f64, bool, bool)>;
+
+/// Put the config's flags back, then apply `list` on top. Recordings that
+/// become locked out end now (their outputs go into `out`).
+fn apply_overrides(
+    scanner: &mut Scanner,
+    base: &BaseFlags,
+    list: &[Override],
+    out: &mut Vec<Output>,
+) {
+    let mut ranges = Vec::new();
+    for &(freq, record, priority) in base {
+        let o = list.iter().find(|o| (o.freq_hz as f64 - freq).abs() < 1.0);
+        let record = o.and_then(|o| o.locked_out).map_or(record, |l| !l);
+        let priority = o.and_then(|o| o.priority).unwrap_or(priority);
+        scanner.set_slot_flags(freq, record, priority, out);
+    }
+    for o in list {
+        let freq = o.freq_hz as f64;
+        let on_slot = base.iter().any(|&(f, _, _)| (f - freq).abs() < 1.0);
+        if !on_slot && o.locked_out == Some(true) {
+            ranges.push((freq - LOCKOUT_HALF_HZ, freq + LOCKOUT_HALF_HZ));
+        }
+    }
+    scanner.set_lockouts(ranges, out);
+}
+
+fn channel_list(
+    slots: &[scanner_core::detector::WatchedSlot],
+    overrides: &[Override],
+) -> Vec<scanner_web::ChannelInfo> {
     use scanner_core::config::SlotOrigin;
     // Only link to a half that is actually watched (inside the capture).
     let watched = |f: f64| slots.iter().any(|w| (w.slot.freq - f).abs() < 1.0);
@@ -233,8 +269,27 @@ fn channel_list(slots: &[scanner_core::detector::WatchedSlot]) -> Vec<scanner_we
                 priority: s.priority,
                 locked_out: !s.record,
                 pair_hz: s.pair.filter(|&f| watched(f)),
+                overridden: overrides
+                    .iter()
+                    .any(|o| (o.freq_hz as f64 - s.freq).abs() < 1.0),
             }
         })
+        .chain(
+            overrides
+                .iter()
+                .filter(|o| o.locked_out == Some(true) && !watched(o.freq_hz as f64))
+                .map(|o| scanner_web::ChannelInfo {
+                    freq_hz: o.freq_hz as f64,
+                    name: None,
+                    kind: "lockout",
+                    mode: "nbfm".into(),
+                    bandwidth_hz: 2.0 * LOCKOUT_HALF_HZ,
+                    priority: false,
+                    locked_out: true,
+                    pair_hz: None,
+                    overridden: true,
+                }),
+        )
         .collect()
 }
 
@@ -272,6 +327,36 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let recorder = Recorder::new(o.out)?;
     let (tx, writer) = recorder.spawn(256);
 
+    // Lockout and priority edits made in the web UI, on top of the config.
+    let settings_path = o.out.join("settings.sqlite");
+    let settings = Arc::new(
+        Settings::open(&settings_path)
+            .with_context(|| format!("opening {}", settings_path.display()))?,
+    );
+    let base: BaseFlags = scanner
+        .detector()
+        .slots()
+        .iter()
+        .map(|w| (w.slot.freq, w.slot.record, w.slot.priority))
+        .collect();
+    let mut overrides = settings.overrides()?;
+    if !overrides.is_empty() {
+        let mut ignored = Vec::new();
+        apply_overrides(&mut scanner, &base, &overrides, &mut ignored);
+        eprintln!(
+            "{} channel overrides from {}",
+            overrides.len(),
+            settings_path.display()
+        );
+    }
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<scanner_web::Control>();
+    let channels: scanner_web::ChannelsHandle = Default::default();
+    let publish_channels = |scanner: &Scanner, overrides: &[Override]| {
+        if let Ok(mut g) = channels.write() {
+            *g = channel_list(scanner.detector().slots(), overrides);
+        }
+    };
+    publish_channels(&scanner, &overrides);
     let status: scanner_web::StatusHandle = Default::default();
     let spectrum: scanner_web::SpectrumHandle = Default::default();
     // The spectrum shows the profile's span, inside what the radio delivers
@@ -297,9 +382,9 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         );
         state.secure_cookies = !o.insecure_cookies;
         state.spectrum = spectrum.clone();
-        if let Ok(mut g) = state.channels.write() {
-            *g = channel_list(scanner.detector().slots());
-        }
+        state.channels = channels.clone();
+        state.settings = Some(settings.clone());
+        state.control = Some(control_tx.clone());
         scanner_web::spawn(addr, state)
             .with_context(|| format!("starting the web API on {addr}"))?;
         eprintln!("web interface on http://{addr}/");
@@ -315,6 +400,16 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         let k = source.read(&mut buf)?;
         if k == 0 {
             break;
+        }
+        while let Ok(cmd) = control_rx.try_recv() {
+            match cmd {
+                scanner_web::Control::Overrides { list, done } => {
+                    apply_overrides(&mut scanner, &base, &list, &mut out);
+                    overrides = list;
+                    publish_channels(&scanner, &overrides);
+                    let _ = done.send(());
+                }
+            }
         }
         let t = Instant::now();
         scanner.push(&buf[..k], &mut out);

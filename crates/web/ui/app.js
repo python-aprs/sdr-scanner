@@ -98,6 +98,33 @@
     try { state.channels = await api('/channels'); } catch (_) { state.channels = []; }
   }
 
+  /** Lock out / prioritise a frequency (admin), then refresh the channel list. */
+  async function editChannel(freqHz, body) {
+    await api(`/channels/${Math.round(freqHz)}`, { method: 'PATCH', body });
+    await loadChannels();
+  }
+  async function resetChannel(freqHz) {
+    await api(`/channels/${Math.round(freqHz)}/override`, { method: 'DELETE' });
+    await loadChannels();
+  }
+
+  /** A button that asks once more before doing something. */
+  function confirmButton(label, really, action, cls = '') {
+    const b = h('button', { type: 'button', class: cls });
+    b.textContent = label;
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (b.dataset.confirm !== '1') {
+        b.dataset.confirm = '1'; b.textContent = really;
+        setTimeout(() => { if (b.isConnected) { b.dataset.confirm = ''; b.textContent = label; } }, 4000);
+        return;
+      }
+      b.disabled = true;
+      try { await action(); } catch (ex) { b.disabled = false; b.textContent = ex.message; }
+    });
+    return b;
+  }
+
   /** The named channel a frequency belongs to, if any (within half a bandwidth). */
   function channelAt(hz) {
     let best = null, bestD = Infinity;
@@ -108,7 +135,7 @@
     return best;
   }
   const kindLabel = {
-    channel: 'Channel', repeater_output: 'Repeater output', repeater_input: 'Repeater input', grid: 'Grid',
+    channel: 'Channel', repeater_output: 'Repeater output', repeater_input: 'Repeater input', grid: 'Grid', lockout: 'Lockout',
   };
   function channelName(hz) {
     const c = channelAt(hz);
@@ -478,10 +505,13 @@
       activeList.replaceChildren(...(act.length ? act.map((a) => {
         const c = channelAt(a.freq_hz);
         const snr = Math.max(0, Math.min(40, a.snr_db));
-        return h('li', {},
+        // A slot's own frequency, or (for a retuned grid signal) where it is.
+        const target = c && c.kind !== 'grid' ? c.freq_hz : a.freq_hz;
+        return h('li', { class: isAdmin() ? 'with-action' : '' },
           h('span', { class: 'f' }, MHZ(a.freq_hz, 4)),
           h('span', { class: 'n' }, c && c.name ? c.name : (c ? kindLabel[c.kind] : '')),
           h('span', { class: 't' }, `${fmtDb(a.snr_db)} · ${fmtSecs(a.secs)}`),
+          isAdmin() ? confirmButton('Lock out', 'Sure?', () => editChannel(target, { locked_out: true }), 'mini danger lock-btn') : null,
           h('div', { class: 'snr', title: `${a.snr_db.toFixed(1)} dB SNR` }, h('i', { style: `width:${(snr / 40) * 100}%` })));
       }) : [h('li', { class: 'empty' }, 'Quiet. Nothing on the air right now.')]));
       if (st.recorded !== lastRecorded) { lastRecorded = st.recorded; loadRecent(); }
@@ -650,7 +680,7 @@
       h('section', { class: 'panel' },
         h('div', { class: 'panel-head' }, chips, h('span', { class: 'spacer' }), search),
         h('div', { class: 'table-wrap' }, h('table', {},
-          h('thead', {}, h('tr', {}, ['Frequency', 'Name', 'Type', 'Mode', 'Bandwidth', '', 'Pair'].map((t) => h('th', {}, t)))),
+          h('thead', {}, h('tr', {}, ['Frequency', 'Name', 'Type', 'Mode', 'Bandwidth', '', 'Pair', isAdmin() ? 'Change' : ''].map((t) => h('th', {}, t)))),
           tbody))));
     search.oninput = render;
 
@@ -686,9 +716,24 @@
       h('td', { class: 'mono' }, `${(c.bandwidth_hz / 1e3).toFixed(c.bandwidth_hz % 1e3 ? 1 : 0)} kHz`),
       h('td', {}, active.has(c.freq_hz) ? h('span', { class: 'badge live' }, 'On air') : null,
         c.priority ? h('span', { class: 'badge prio' }, 'Priority') : null,
-        c.locked_out ? h('span', { class: 'badge lock' }, 'Locked out') : null),
-      h('td', { class: 'mono' }, c.pair_hz ? h('a', { href: `#/channels`, onclick: (e) => { e.preventDefault(); e.stopPropagation(); jump(c.pair_hz); } }, `${c.kind === 'repeater_output' ? 'in' : 'out'} ${MHZ(c.pair_hz, 4)}`) : null))) :
-        [h('tr', {}, h('td', { colspan: 7, class: 'empty' }, state.channels.length ? 'No channels match.' : 'No channel list (is live status private?).'))]));
+        c.locked_out ? h('span', { class: 'badge lock' }, 'Locked out') : null,
+        c.overridden ? h('span', { class: 'badge', title: 'Changed in the web UI; Reset goes back to the config file' }, 'Edited') : null),
+      h('td', { class: 'mono' }, c.pair_hz ? h('a', { href: `#/channels`, onclick: (e) => { e.preventDefault(); e.stopPropagation(); jump(c.pair_hz); } }, `${c.kind === 'repeater_output' ? 'in' : 'out'} ${MHZ(c.pair_hz, 4)}`) : null),
+      h('td', { class: 'actions' }, isAdmin() ? actions(c) : null))) :
+        [h('tr', {}, h('td', { colspan: 8, class: 'empty' }, state.channels.length ? 'No channels match.' : 'No channel list (is live status private?).'))]));
+    }
+
+    function actions(c) {
+      const run = (fn) => async (e) => {
+        e.stopPropagation();
+        const b = e.currentTarget; b.disabled = true;
+        try { await fn(); render(); } catch (ex) { b.disabled = false; b.textContent = ex.message; }
+      };
+      return [
+        c.kind === 'lockout' ? null : h('button', { type: 'button', class: 'mini', onclick: run(() => editChannel(c.freq_hz, { locked_out: !c.locked_out })) }, c.locked_out ? 'Unlock' : 'Lock out'),
+        c.kind === 'lockout' ? null : h('button', { type: 'button', class: 'mini', onclick: run(() => editChannel(c.freq_hz, { priority: !c.priority })) }, c.priority ? 'No priority' : 'Priority'),
+        c.overridden ? h('button', { type: 'button', class: 'mini', title: 'Back to the config file', onclick: run(() => resetChannel(c.freq_hz)) }, c.kind === 'lockout' ? 'Remove' : 'Reset') : null,
+      ];
     }
 
     function jump(hz) {

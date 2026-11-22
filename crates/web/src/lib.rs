@@ -9,6 +9,8 @@
 //! | `GET /api/v1/recordings/{id}` | same as the list |
 //! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin |
 //! | `GET /api/v1/channels` | same as status |
+//! | `PATCH /api/v1/channels/{freq_hz}` | admin (+ CSRF): `{"locked_out": bool, "priority": bool}`, either or both |
+//! | `DELETE /api/v1/channels/{freq_hz}/override` | admin (+ CSRF): back to the config file |
 //! | `GET /api/v1/live` (WebSocket) | same as status; see [`live`] |
 //! | `GET /`, `/assets/*` | anyone: the browser UI (see [`ui`]) |
 //!
@@ -46,6 +48,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use scanner_store::settings::{Override, Settings};
 use scanner_store::{Index, Query, Row};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -131,7 +134,23 @@ pub struct AppState {
     pub spectrum: SpectrumHandle,
     /// The watched channels.
     pub channels: ChannelsHandle,
+    /// Lockout and priority overrides; `None` means they can't be edited.
+    pub settings: Option<Arc<Settings>>,
+    /// Commands to the DSP thread.
+    pub control: Option<ControlSender>,
 }
+
+/// A command for the running scanner.
+#[derive(Debug)]
+pub enum Control {
+    /// The channel overrides changed: apply this full set, then reply.
+    Overrides {
+        list: Vec<Override>,
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+pub type ControlSender = std::sync::mpsc::Sender<Control>;
 
 impl AppState {
     pub fn new(
@@ -149,6 +168,8 @@ impl AppState {
             secure_cookies: true,
             spectrum: Default::default(),
             channels: Default::default(),
+            settings: None,
+            control: None,
         }
     }
 }
@@ -341,6 +362,11 @@ pub fn router(state: AppState) -> Router {
     }
     r.route("/api/v1/status", get(status))
         .route("/api/v1/channels", get(channels))
+        .route(
+            "/api/v1/channels/{freq_hz}",
+            axum::routing::patch(edit_channel),
+        )
+        .route("/api/v1/channels/{freq_hz}/override", delete(reset_channel))
         .route("/api/v1/live", get(live::live_ws))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/{id}", get(get_recording))
@@ -354,6 +380,156 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn(ui::security_headers))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelEdit {
+    locked_out: Option<bool>,
+    priority: Option<bool>,
+}
+
+fn settings_err(_: scanner_store::settings::SettingsError) -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "settings database error".into(),
+    )
+}
+
+impl AppState {
+    fn settings(&self) -> Result<Arc<Settings>, ApiError> {
+        self.settings.clone().ok_or(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "channel settings can't be changed on this scanner".into(),
+        ))
+    }
+
+    /// Hand the full override list to the DSP thread and wait until it has
+    /// applied it (so the next channel list reflects the change).
+    async fn apply_overrides(&self, settings: Arc<Settings>) -> Result<(), ApiError> {
+        let list = blocking(move || settings.overrides().map_err(settings_err)).await?;
+        let Some(tx) = &self.control else {
+            return Ok(());
+        };
+        let (done, rx) = tokio::sync::oneshot::channel();
+        tx.send(Control::Overrides { list, done }).map_err(|_| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the scanner has stopped".into(),
+            )
+        })?;
+        match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "saved, but the scanner didn't confirm it in time".into(),
+            )),
+        }
+    }
+
+    fn channel_at(&self, freq_hz: i64) -> Option<ChannelInfo> {
+        self.channels.read().ok().and_then(|g| {
+            g.iter()
+                .find(|c| (c.freq_hz - freq_hz as f64).abs() < 1.0)
+                .cloned()
+        })
+    }
+}
+
+/// Lock out a frequency or make it a priority channel, or undo either.
+/// Priority needs a watched channel there; a lockout can go anywhere in the
+/// capture (an off-grid signal or a birdie) and then covers +/- 5 kHz.
+async fn edit_channel(
+    State(s): State<AppState>,
+    Client(client): Client,
+    headers: HeaderMap,
+    UrlPath(freq_hz): UrlPath<i64>,
+    Json(req): Json<ChannelEdit>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = s.caller(&headers).await?;
+    c.require_write(&headers)?;
+    let settings = s.settings()?;
+    if req.locked_out.is_none() && req.priority.is_none() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "send locked_out and/or priority".into(),
+        ));
+    }
+    let watched = s.channel_at(freq_hz).filter(|c| c.kind != "lockout");
+    if req.priority.is_some() && watched.is_none() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "priority can only be set on a watched channel".into(),
+        ));
+    }
+    let snap = s.status.read().map(|g| g.clone()).unwrap_or_default();
+    let half = snap.sample_rate * 0.45;
+    if watched.is_none()
+        && snap.sample_rate > 0.0
+        && (freq_hz as f64 - snap.center_freq_hz).abs() > half
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "that frequency is outside what the radio receives".into(),
+        ));
+    }
+    let actor = c.actor();
+    let (st, a2) = (settings.clone(), actor.clone());
+    let o = blocking(move || {
+        st.set(freq_hz, req.locked_out, req.priority, now_ns(), &a2)
+            .map_err(settings_err)
+    })
+    .await?;
+    if let Some(auth) = &s.auth {
+        let what = [
+            req.locked_out
+                .map(|l| if l { "locked out" } else { "unlocked" }),
+            req.priority
+                .map(|p| if p { "priority on" } else { "priority off" }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        auth.audit(
+            now_ns(),
+            &actor,
+            "channel_changed",
+            &format!("{:.4} MHz {what}", freq_hz as f64 / 1e6),
+            &client,
+        );
+    }
+    s.apply_overrides(settings).await?;
+    Ok(Json(serde_json::json!({
+        "override": o,
+        "channel": s.channel_at(freq_hz),
+    })))
+}
+
+async fn reset_channel(
+    State(s): State<AppState>,
+    Client(client): Client,
+    headers: HeaderMap,
+    UrlPath(freq_hz): UrlPath<i64>,
+) -> Result<StatusCode, ApiError> {
+    let c = s.caller(&headers).await?;
+    c.require_write(&headers)?;
+    let settings = s.settings()?;
+    let st = settings.clone();
+    if !blocking(move || st.clear(freq_hz).map_err(settings_err)).await? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no override there".into()));
+    }
+    if let Some(auth) = &s.auth {
+        auth.audit(
+            now_ns(),
+            &c.actor(),
+            "channel_reset",
+            &format!("{:.4} MHz", freq_hz as f64 / 1e6),
+            &client,
+        );
+    }
+    s.apply_overrides(settings).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn channels(
@@ -1437,6 +1613,7 @@ mod tests {
             priority: true,
             locked_out: false,
             pair_hz: None,
+            overridden: false,
         });
         let (status, body) = get(&state, "/api/v1/channels", None, None).await;
         assert_eq!(status, StatusCode::OK);
@@ -1469,5 +1646,145 @@ mod tests {
         // Past the origin check, refused only as a handshake without upgrade
         // headers.
         assert_eq!(send(&state, req).await.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn channel_edits_need_admin_persist_and_reach_the_scanner() {
+        let (_dir, mut state, _, token) = setup(Public::default());
+        state.settings = Some(Arc::new(Settings::in_memory().unwrap()));
+        state.channels.write().unwrap().push(ChannelInfo {
+            freq_hz: 146.52e6,
+            name: Some("Calling".into()),
+            kind: "channel",
+            mode: "nbfm".into(),
+            bandwidth_hz: 16e3,
+            priority: false,
+            locked_out: false,
+            pair_hz: None,
+            overridden: false,
+        });
+        {
+            let mut g = state.status.write().unwrap();
+            g.sample_rate = 8e6;
+            g.center_freq_hz = 146.0125e6;
+        }
+        // A stand-in DSP thread that applies the list to the channel list.
+        let (tx, rx) = std::sync::mpsc::channel::<Control>();
+        state.control = Some(tx);
+        let channels = state.channels.clone();
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let seen = applied.clone();
+        std::thread::spawn(move || {
+            while let Ok(Control::Overrides { list, done }) = rx.recv() {
+                let mut g = channels.write().unwrap();
+                for c in g.iter_mut() {
+                    let o = list.iter().find(|o| o.freq_hz as f64 == c.freq_hz);
+                    c.locked_out = o.and_then(|o| o.locked_out).unwrap_or(false);
+                    c.priority = o.and_then(|o| o.priority).unwrap_or(false);
+                    c.overridden = o.is_some();
+                }
+                seen.lock().unwrap().push(list.len());
+                let _ = done.send(());
+            }
+        });
+        let cookie = login(&state, "masen", PASSWORD).await.cookie().unwrap();
+        let lock = serde_json::json!({"locked_out": true});
+        let uri = "/api/v1/channels/146520000";
+        let r = send(&state, json_req("PATCH", uri, lock.clone(), None, None)).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        let r = send(
+            &state,
+            json_req("PATCH", uri, lock.clone(), Some(&cookie), None),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "cookie without CSRF");
+        let bearer = |method: &str, uri: &str, body: serde_json::Value| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let r = send(&state, bearer("PATCH", uri, lock.clone())).await;
+        assert_eq!(r.status, StatusCode::OK);
+        let v = r.json();
+        assert_eq!(v["channel"]["locked_out"], true);
+        assert_eq!(v["channel"]["overridden"], true);
+        assert_eq!(v["override"]["updated_by"], "token:tests");
+        // Priority is merged in, the lockout stays.
+        let r = send(
+            &state,
+            bearer("PATCH", uri, serde_json::json!({"priority": true})),
+        )
+        .await;
+        assert_eq!(r.json()["channel"]["priority"], true);
+        assert_eq!(r.json()["channel"]["locked_out"], true);
+        // Priority off a watched channel, lockouts outside the capture,
+        // empty and unknown bodies: refused.
+        for (u, body) in [
+            (
+                "/api/v1/channels/145212500",
+                serde_json::json!({"priority": true}),
+            ),
+            (
+                "/api/v1/channels/440000000",
+                serde_json::json!({"locked_out": true}),
+            ),
+            (uri, serde_json::json!({})),
+        ] {
+            let r = send(&state, bearer("PATCH", u, body)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{u}");
+        }
+        let r = send(
+            &state,
+            bearer("PATCH", uri, serde_json::json!({"record": true})),
+        )
+        .await;
+        assert!(r.status.is_client_error());
+        // An off-grid lockout inside the capture is fine.
+        let r = send(
+            &state,
+            bearer("PATCH", "/api/v1/channels/145212500", lock.clone()),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(
+            state.settings.as_ref().unwrap().overrides().unwrap().len(),
+            2
+        );
+        // Reset.
+        let del = "/api/v1/channels/146520000/override";
+        let r = send(&state, bearer("DELETE", del, serde_json::json!(null))).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let r = send(&state, bearer("DELETE", del, serde_json::json!(null))).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        let c = state.channel_at(146_520_000).unwrap();
+        assert!(!c.locked_out && !c.priority && !c.overridden);
+        assert_eq!(*applied.lock().unwrap(), vec![1, 1, 2, 1]);
+        let log = state.auth.as_ref().unwrap().recent_audit(20).unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.action == "channel_changed"
+                    && e.detail.contains("146.5200 MHz locked out"))
+        );
+        assert!(log.iter().any(|e| e.action == "channel_reset"));
+    }
+
+    #[tokio::test]
+    async fn channel_edits_are_refused_without_a_settings_database() {
+        let (_dir, state, _, token) = setup(Public::default());
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/channels/146520000")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"locked_out":true}"#))
+            .unwrap();
+        assert_eq!(
+            send(&state, req).await.status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
