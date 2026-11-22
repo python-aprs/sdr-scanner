@@ -14,20 +14,27 @@ fn sdrplay() {
     let include = std::env::var_os("SDRPLAY_API_INCLUDE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/usr/local/include"));
-    if !include.join("sdrplay_api.h").exists() {
-        panic!(
-            "the sdrplay feature needs the SDRplay API 3.x header, but {} has no \
-             sdrplay_api.h. Install the API from sdrplay.com, or set \
-             SDRPLAY_API_INCLUDE to the folder that holds the header.",
+    println!("cargo:rerun-if-changed=sdrplay/shim_nosdk.c");
+    let mut build = cc::Build::new();
+    build.include("sdrplay").warnings(true);
+    if include.join("sdrplay_api.h").exists() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            include.join("sdrplay_api.h").display()
+        );
+        build.file("sdrplay/shim.c").include(&include);
+    } else {
+        // Keep the Rust side building (CI checks it on every platform), but
+        // never guess the vendor's struct layouts: the stand-in fails at run
+        // time with a clear message.
+        println!(
+            "cargo:warning=sdrplay: no sdrplay_api.h in {}; building without SDRplay \
+             support. Install SDRplay API 3.x or set SDRPLAY_API_INCLUDE.",
             include.display()
         );
+        build.file("sdrplay/shim_nosdk.c");
     }
-    cc::Build::new()
-        .file("sdrplay/shim.c")
-        .include("sdrplay")
-        .include(&include)
-        .warnings(true)
-        .compile("scanner_sdrplay");
+    build.compile("scanner_sdrplay");
     // The API library itself is opened with dlopen at run time.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {

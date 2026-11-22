@@ -104,7 +104,9 @@ target/release/scanner serve --source sdrplay --config config/rainier.toml \
     --out out/live [--lna 3 --gr 40 --rate 8e6 --center-mhz 146.0125]
 ```
 
-Set `SDRPLAY_API_INCLUDE` if the header is somewhere else. The library is
+Set `SDRPLAY_API_INCLUDE` if the header is somewhere else. Without the
+header the feature still builds (with a warning) so CI can check it, but the
+radio then fails to open with a message saying to install the API and rebuild. The library is
 opened at run time (`SDRPLAY_API_LIB` overrides where), so the binary starts
 and explains what is missing on a machine without the API. Only another
 program holding the radio (SDRconnect, SDRuno) stops it from opening.
