@@ -1006,6 +1006,7 @@ dependencies = [
 name = "scanner-store"
 version = "0.1.0"
 dependencies = [
+ "opus",
  "rusqlite",
  "scanner-core",
  "serde",

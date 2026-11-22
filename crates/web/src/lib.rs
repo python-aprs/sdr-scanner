@@ -7,7 +7,7 @@
 //! | `GET /api/v1/status` | anonymous if `public.live` (default on), else admin |
 //! | `GET /api/v1/recordings` | anonymous if `public.recordings` (default off), else admin |
 //! | `GET /api/v1/recordings/{id}` | same as the list |
-//! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin |
+//! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin: the Opus copy, or the WAV with `?format=wav` or when there's no copy |
 //! | `GET /api/v1/channels` | same as status |
 //! | `PATCH /api/v1/channels/{freq_hz}` | admin (+ CSRF): `{"locked_out": bool, "priority": bool}`, either or both |
 //! | `DELETE /api/v1/channels/{freq_hz}/override` | admin (+ CSRF): back to the config file |
@@ -574,14 +574,24 @@ pub struct ListParams {
 struct Recording {
     #[serde(flatten)]
     row: Row,
+    /// The Opus copy when there is one, else the WAV.
     audio_url: String,
+    /// Always the WAV.
+    wav_url: String,
 }
 
 fn recording(r: Row) -> Recording {
     Recording {
         audio_url: format!("/api/v1/recordings/{}/audio", r.id),
+        wav_url: format!("/api/v1/recordings/{}/audio?format=wav", r.id),
         row: r,
     }
+}
+
+#[derive(Deserialize)]
+struct AudioParams {
+    /// `wav` or `opus`; left out, the Opus copy if there is one.
+    format: Option<String>,
 }
 
 async fn list_recordings(
@@ -620,21 +630,40 @@ async fn get_recording(
     }
 }
 
-/// The WAV, with single-range support so browsers can seek.
+/// The recording's audio, with single-range support so browsers can seek.
 async fn get_audio(
     State(s): State<AppState>,
     headers: HeaderMap,
     UrlPath(id): UrlPath<i64>,
+    UrlQuery(p): UrlQuery<AudioParams>,
 ) -> Result<Response, ApiError> {
     s.caller(&headers).await?.require(s.public.audio)?;
+    let want_opus = match p.format.as_deref() {
+        None => None,
+        Some("wav") => Some(false),
+        Some("opus") => Some(true),
+        Some(_) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "format is wav or opus".into(),
+            ));
+        }
+    };
     let root = s.recordings.clone();
     let row = blocking(move || s.index()?.get(id).map_err(db_err)).await?;
     let Some(row) = row.filter(|r| r.status == "complete") else {
         return Err(ApiError(StatusCode::NOT_FOUND, "no such recording".into()));
     };
+    let (path, mime) = match (want_opus, row.opus_path.as_deref()) {
+        (Some(false), _) | (None, None) => (row.wav_path.as_str(), "audio/wav"),
+        (Some(true) | None, Some(p)) => (p, "audio/ogg; codecs=opus"),
+        (Some(true), None) => {
+            return Err(ApiError(StatusCode::NOT_FOUND, "no Opus copy".into()));
+        }
+    };
     // Paths in the index are relative and written by the recorder; refuse
     // anything that could step outside the recordings folder.
-    let rel = std::path::Path::new(&row.wav_path);
+    let rel = std::path::Path::new(path);
     if rel.is_absolute()
         || rel
             .components()
@@ -651,8 +680,14 @@ async fn get_audio(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| parse_range(v, total));
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+    resp_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     resp_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    // A finished recording never changes, but who may fetch it can, so
+    // only the viewer's own browser keeps it, and not for long.
+    resp_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=3600"),
+    );
     match range {
         Some((a, b)) => {
             let v = format!("bytes {a}-{b}/{total}");
@@ -1559,6 +1594,47 @@ mod tests {
         );
         let (st, _) = get(&state, "/api/v1/recordings/999", Some(token), None).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serves_the_opus_copy_by_default_and_wav_on_request() {
+        let (dir, state, id, tok) = setup(Public::default());
+        let token = Some(tok.as_str());
+        let audio = format!("/api/v1/recordings/{id}/audio");
+        // No copy yet: the default is the WAV, and asking for Opus is a 404.
+        let (st, body) = get(&state, &audio, token, None).await;
+        assert_eq!((st, &body[..4]), (StatusCode::OK, b"RIFF".as_slice()));
+        let (st, _) = get(&state, &format!("{audio}?format=opus"), token, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        std::fs::write(dir.path().join("2026/11/22/a.opus"), b"OggS-opus").unwrap();
+        Index::open(&dir.path().join("index.sqlite"))
+            .unwrap()
+            .set_opus(id, "2026/11/22/a.opus", 9)
+            .unwrap();
+        let r = send(
+            &state,
+            Request::get(&audio)
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.body.as_slice()),
+            (StatusCode::OK, b"OggS-opus".as_slice())
+        );
+        assert_eq!(r.headers[header::CONTENT_TYPE], "audio/ogg; codecs=opus");
+        assert_eq!(r.headers[header::CACHE_CONTROL], "private, max-age=3600");
+        let (st, body) = get(&state, &format!("{audio}?format=wav"), token, None).await;
+        assert_eq!((st, &body[..4]), (StatusCode::OK, b"RIFF".as_slice()));
+        let (st, _) = get(&state, &format!("{audio}?format=mp3"), token, None).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        let (_, body) = get(&state, &format!("/api/v1/recordings/{id}"), token, None).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["opus_path"], "2026/11/22/a.opus");
+        assert_eq!(v["wav_url"], format!("{audio}?format=wav"));
     }
 
     #[test]

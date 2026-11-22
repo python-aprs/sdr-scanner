@@ -11,6 +11,7 @@ repository.workspace = true
 scanner-core.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+opus.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

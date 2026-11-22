@@ -2,6 +2,7 @@
 //! its own thread so disk latency never stalls the DSP threads.
 
 use crate::index::{Index, IndexError, NewRow};
+use crate::ogg::OggOpusWriter;
 use crate::wav::WavWriter;
 use scanner_core::clock::compact_utc;
 use scanner_core::scanner::{Output, TxStart};
@@ -24,6 +25,11 @@ pub struct RecorderStats {
     pub files: u64,
     pub bytes: u64,
     pub audio_secs: f64,
+    /// Opus copies written, and their bytes.
+    pub opus_files: u64,
+    pub opus_bytes: u64,
+    /// Opus copies abandoned after an error (the WAV is still kept).
+    pub opus_errors: u64,
     /// Index row ids completed by this recorder, in close order.
     pub rows: Vec<i64>,
 }
@@ -33,6 +39,8 @@ struct Open {
     start: TxStart,
     rel: String,
     wav: WavWriter,
+    /// The web copy; dropped (leaving a stray `.part`) if it fails.
+    opus: Option<(String, OggOpusWriter)>,
 }
 
 pub struct Recorder {
@@ -40,6 +48,7 @@ pub struct Recorder {
     index: Index,
     open: HashMap<u64, Open>,
     stats: RecorderStats,
+    opus: bool,
 }
 
 /// `146.5200_20261122T065403.123Z.wav` under `YYYY/MM/DD/`.
@@ -52,6 +61,17 @@ pub fn relative_path(start: &TxStart) -> String {
         &ts[6..8],
         start.slot.freq / 1e6
     )
+}
+
+/// Sample rates the Opus encoder accepts.
+pub const OPUS_RATES: [u32; 5] = [8000, 12000, 16000, 24000, 48000];
+
+/// The Opus copy sits next to the WAV with the same name.
+pub fn opus_path(wav_rel: &str) -> String {
+    match wav_rel.strip_suffix(".wav") {
+        Some(stem) => format!("{stem}.opus"),
+        None => format!("{wav_rel}.opus"),
+    }
 }
 
 fn unix_ns(t: std::time::SystemTime) -> i64 {
@@ -69,7 +89,21 @@ impl Recorder {
             root: root.to_owned(),
             open: HashMap::new(),
             stats: RecorderStats::default(),
+            opus: true,
         })
+    }
+
+    /// Also write an Opus copy of each recording for the web UI (on by
+    /// default). Rates Opus can't take (anything but 8, 12, 16, 24 or
+    /// 48 kHz) get no copy.
+    pub fn with_opus(mut self, on: bool) -> Self {
+        self.opus = on;
+        self
+    }
+
+    fn opus_failed(&mut self, rel: &str, e: std::io::Error) {
+        eprintln!("recorder: dropping the Opus copy of {rel}: {e}");
+        self.stats.opus_errors += 1;
     }
 
     pub fn index(&self) -> &Index {
@@ -92,6 +126,18 @@ impl Recorder {
                     k += 1;
                 }
                 let wav = WavWriter::create(&self.root.join(&rel), start.audio_rate)?;
+                let opus = if self.opus && OPUS_RATES.contains(&start.audio_rate) {
+                    let orel = opus_path(&rel);
+                    match OggOpusWriter::create(&self.root.join(&orel), start.audio_rate) {
+                        Ok(w) => Some((orel, w)),
+                        Err(e) => {
+                            self.opus_failed(&orel, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let row = self.index.insert(&NewRow {
                     freq_hz: start.slot.freq,
                     channel: start.slot.name.as_deref(),
@@ -108,12 +154,21 @@ impl Recorder {
                         start,
                         rel,
                         wav,
+                        opus,
                     },
                 );
             }
             Output::Audio { id, samples } => {
                 if let Some(o) = self.open.get_mut(&id) {
                     o.wav.write(&samples)?;
+                    let failed = match &mut o.opus {
+                        Some((orel, w)) => w.write(&samples).err().map(|e| (orel.clone(), e)),
+                        None => None,
+                    };
+                    if let Some((orel, e)) = failed {
+                        o.opus = None;
+                        self.opus_failed(&orel, e);
+                    }
                 }
             }
             Output::Close(end) => {
@@ -132,6 +187,16 @@ impl Recorder {
                         &o.rel,
                         bytes,
                     )?;
+                    if let Some((orel, w)) = o.opus {
+                        match w.finish() {
+                            Ok((_, n)) => {
+                                self.index.set_opus(o.row, &orel, n)?;
+                                self.stats.opus_files += 1;
+                                self.stats.opus_bytes += n;
+                            }
+                            Err(e) => self.opus_failed(&orel, e),
+                        }
+                    }
                     self.stats.files += 1;
                     self.stats.bytes += bytes;
                     self.stats.audio_secs += audio_secs;
@@ -219,6 +284,14 @@ mod tests {
         assert_eq!(rows[0].origin, "listed");
         assert_eq!(rows[0].audio_secs, Some(1.0));
         assert!(dir.path().join(&rows[0].wav_path).exists());
+        assert_eq!(
+            rows[0].opus_path.as_deref(),
+            Some("2026/11/22/146.5200_20261122T065403.123Z.opus")
+        );
+        let opus = std::fs::read(dir.path().join(rows[0].opus_path.as_ref().unwrap())).unwrap();
+        assert_eq!(rows[0].opus_bytes, Some(opus.len() as i64));
+        assert_eq!(&opus[..4], b"OggS");
         assert_eq!(r.stats().files, 1);
+        assert_eq!((r.stats().opus_files, r.stats().opus_errors), (1, 0));
     }
 }

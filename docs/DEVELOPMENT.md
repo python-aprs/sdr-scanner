@@ -11,7 +11,7 @@ crates/
              DSP (dsp.rs), fast-convolution channelizer (channelizer.rs),
              detector + slot state machine (detector.rs), pipeline (scanner.rs)
   sources/   Source trait, SigMF FileSource; Airspy/SDRplay stubs (Phase 2)
-  store/     WAV writer, SQLite transmission index, recorder thread
+  store/     WAV and Ogg Opus writers, SQLite databases, recorder thread
   cli/       the `scanner` binary
   web/       HTTP API (axum): status, recordings search, audio; role guards
 tools/synth/ Python synthetic IQ generator + reference DSP
@@ -51,7 +51,8 @@ to disable), routes under `/api/v1` (see `crates/web/src/lib.rs`):
 `status` (live snapshot: active channels, noise floor, DSP load, drops),
 `recordings` (search by `freq_min`/`freq_max` Hz, `since`/`until` Unix s,
 `min_secs`; page with `before_id`), `recordings/{id}` and
-`recordings/{id}/audio` (WAV, HTTP range requests). Anonymous visitors see
+`recordings/{id}/audio` (the Opus copy if there is one, else the WAV;
+`?format=wav` or `?format=opus` to choose; HTTP range requests). Anonymous visitors see
 live status only unless `--public-recordings` / `--public-audio`.
 
 ### Admin accounts
@@ -105,8 +106,8 @@ loaded from other sites. Edit the files and rebuild to change it.
   active transmissions marked, what is on the air now, and the latest
   recordings. Click the spectrum to see that channel's recordings.
 - **Recordings**: search by channel or frequency, start time and length,
-  then play in the browser (the player can step through the list) or
-  download the WAV.
+  then play in the browser (the player can step through the list, and
+  plays the small Opus copy) or download the WAV.
 - **Channels**: every watched slot with its name, type, mode and lockout or
   priority flag; repeaters link their input and output.
 - **Admin**: log in and out, change your password, and create or revoke API
@@ -155,7 +156,10 @@ Static files are revalidated with ETags, so repeat visits cost a 304.
 
 `scanner run` writes `out/YYYY/MM/DD/146.5200_20261122T065403.123Z.wav` per
 transmission (via `.wav.part` and a rename) and one row per transmission in
-`out/index.sqlite`. `--json` prints a machine-readable summary that
+`out/index.sqlite`. Next to each WAV goes an Ogg Opus copy (`.opus`, mono,
+16 kb/s, 40 ms frames) for the web player: about an eighth of the size, and
+it decodes to exactly the WAV's length. `--no-opus` skips it; audio rates
+Opus can't take (anything but 8, 12, 16, 24 or 48 kHz) get no copy. `--json` prints a machine-readable summary that
 `synth score` reads.
 
 How the pipeline fits together (PLAN.md 3.2–3.4):
