@@ -1,6 +1,6 @@
 # sdr-scanner: design and test plan
 
-Status: approved 2026-11-22; Phase 0 in progress. A working config example is in `config/example-2m.toml`.
+Status: approved 2026-11-22; Phase 0 done, Phase 1 (offline core) in progress. A working config example is in `config/example-2m.toml`.
 
 Goal: a purpose-built replacement for ham2mon (originally to bring
 scanner.kf7hvm.com back online). Watch the whole 2 m band (144–148 MHz), find

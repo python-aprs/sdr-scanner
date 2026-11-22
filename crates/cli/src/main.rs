@@ -4,6 +4,10 @@
 //! - `scanner info <recording>`: SigMF metadata and signal level
 //! - `scanner peaks <recording>`: averaged spectrum peaks, in RF frequency
 //! - `scanner config check <file> [--profile NAME]`: validate band profiles
+//!
+//! Phase 1:
+//! - `scanner run <recording> --config FILE`: scan a recording and write one
+//!   WAV per transmission plus the SQLite index
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -41,11 +45,52 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Scan a recording: detect transmissions and write one WAV per
+    /// transmission, plus `index.sqlite`, under `--out`.
+    Run(RunArgs),
     /// Work with band-profile config files.
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    recording: PathBuf,
+    /// Band-profile config file.
+    #[arg(long)]
+    config: PathBuf,
+    /// Profile to use (default: the only/first profile in the file).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Output folder.
+    #[arg(long, default_value = "out")]
+    out: PathBuf,
+    /// SNR (dB in the slot bandwidth) to open a transmission.
+    #[arg(long, default_value_t = 6.0)]
+    open_db: f32,
+    /// SNR to keep a transmission open.
+    #[arg(long, default_value_t = 3.0)]
+    close_db: f32,
+    /// Seconds below the close threshold before a transmission ends.
+    #[arg(long, default_value_t = 1.5)]
+    hang: f64,
+    /// Drop transmissions shorter than this (seconds).
+    #[arg(long, default_value_t = 0.3)]
+    min_len: f64,
+    /// Most transmissions recorded at once.
+    #[arg(long, default_value_t = 32)]
+    max_active: usize,
+    /// Pace reading at the recording's sample rate (like a live radio).
+    #[arg(long)]
+    realtime: bool,
+    /// Run channels on one thread.
+    #[arg(long)]
+    serial: bool,
+    /// Print a JSON summary instead of a table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -72,6 +117,7 @@ fn main() -> Result<()> {
             merge,
             json,
         } => peaks(recording, fft, threshold, merge, json),
+        Cmd::Run(args) => run(args),
         Cmd::Config {
             cmd:
                 ConfigCmd::Check {
@@ -231,6 +277,187 @@ fn config_check(file: PathBuf, only: Option<String>, list_slots: bool) -> Result
     }
     if warned {
         eprintln!("config has warnings");
+    }
+    Ok(())
+}
+
+fn run(a: RunArgs) -> Result<()> {
+    use scanner_core::detector::DetectorParams;
+    use scanner_core::scanner::{Output, Scanner, ScannerConfig};
+    use scanner_store::Recorder;
+    use std::time::{Instant, SystemTime};
+
+    let cfg = ConfigFile::load(&a.config)?;
+    let name = match a.profile {
+        Some(n) => n,
+        None => cfg
+            .profiles
+            .keys()
+            .next()
+            .cloned()
+            .context("config defines no profiles")?,
+    };
+    let profile = cfg.profile(&name)?;
+    let plan = profile.channel_plan();
+    for w in &plan.warnings {
+        eprintln!("warning: {w}");
+    }
+
+    let src = open(&a.recording)?.realtime(a.realtime);
+    let info = src.info().clone();
+    let t0 = info.start_time.unwrap_or(SystemTime::now());
+    let sc = ScannerConfig {
+        detector: DetectorParams {
+            open_db: a.open_db,
+            close_db: a.close_db,
+            hang: a.hang,
+            max_active: a.max_active,
+            grid_window_hz: profile.spacing.map(|s| s.0).unwrap_or(0.0),
+            ..Default::default()
+        },
+        audio_rate: profile.audio_rate,
+        deemphasis: profile.deemphasis,
+        min_len: a.min_len,
+        parallel: !a.serial,
+        ..Default::default()
+    };
+    let mut scanner = Scanner::new(sc, info.sample_rate, info.center_freq, t0, &plan.slots);
+    let p = *scanner.params();
+    if !a.json {
+        eprintln!(
+            "{}: {} S/s at {}, FFT {} ({:.1} Hz bins, {:.1} ms blocks), watching {} of {} slots",
+            info.description,
+            info.sample_rate,
+            Hz(info.center_freq),
+            p.n,
+            p.bin_hz(),
+            p.block_secs() * 1e3,
+            scanner.detector().slots().len(),
+            plan.slots.len()
+        );
+    }
+
+    let recorder = Recorder::new(&a.out)?;
+    let (tx, writer) = recorder.spawn(64);
+
+    // Reader thread: file I/O and sample conversion overlap with DSP.
+    let (rtx, rrx) = std::sync::mpsc::sync_channel::<Vec<Complex32>>(4);
+    let reader =
+        std::thread::Builder::new()
+            .name("reader".into())
+            .spawn(move || -> Result<()> {
+                let mut src = src;
+                loop {
+                    let mut buf = vec![Complex32::default(); 1 << 18];
+                    let k = src.read(&mut buf)?;
+                    if k == 0 {
+                        return Ok(());
+                    }
+                    buf.truncate(k);
+                    if rtx.send(buf).is_err() {
+                        return Ok(());
+                    }
+                }
+            })?;
+
+    let started = Instant::now();
+    let mut out: Vec<Output> = Vec::new();
+    let send = |out: &mut Vec<Output>| -> Result<()> {
+        if !out.is_empty() {
+            tx.send(std::mem::take(out))
+                .ok()
+                .context("recorder thread stopped")?;
+        }
+        Ok(())
+    };
+    for chunk in rrx {
+        scanner.push(&chunk, &mut out);
+        send(&mut out)?;
+    }
+    scanner.finish(&mut out);
+    send(&mut out)?;
+    drop(tx);
+    reader.join().expect("reader thread panicked")?;
+    let rec = writer.join().expect("recorder thread panicked")?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let stats = scanner.stats();
+    let secs = stats.samples as f64 / info.sample_rate;
+
+    let index = scanner_store::Index::open(&a.out.join("index.sqlite"))?;
+    let mut ours = Vec::new();
+    for id in &rec.rows {
+        ours.extend(index.get(*id)?);
+    }
+    ours.sort_by_key(|r| (r.start_ns, r.id));
+    let t0_ns = t0
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    if a.json {
+        let txs: Vec<serde_json::Value> = ours
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "freq_hz": r.freq_hz,
+                    "channel": r.channel,
+                    "origin": r.origin,
+                    "start_s": (r.start_ns - t0_ns) as f64 / 1e9,
+                    "audio_s": r.audio_secs,
+                    "signal_s": r.signal_secs,
+                    "peak_snr_db": r.peak_snr_db,
+                    "mean_snr_db": r.mean_snr_db,
+                    "wav": a.out.join(&r.wav_path),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "input_s": secs,
+                "elapsed_s": elapsed,
+                "realtime_factor": secs / elapsed,
+                "blocks": stats.blocks,
+                "opened": stats.opened,
+                "recorded": stats.recorded,
+                "discarded_short": stats.discarded_short,
+                "not_recorded": stats.not_recorded,
+                "duplicates": stats.duplicates,
+                "max_concurrent": stats.max_concurrent,
+                "transmissions": txs,
+            })
+        );
+    } else {
+        println!(
+            "{:>14} {:>9} {:>8} {:>8} {:>7}  file",
+            "frequency", "start s", "signal s", "audio s", "SNR dB"
+        );
+        for r in &ours {
+            println!(
+                "{:>14} {:>9.2} {:>8.2} {:>8.2} {:>7.1}  {}",
+                Hz(r.freq_hz).to_string(),
+                (r.start_ns - t0_ns) as f64 / 1e9,
+                r.signal_secs.unwrap_or(0.0),
+                r.audio_secs.unwrap_or(0.0),
+                r.peak_snr_db.unwrap_or(0.0),
+                r.wav_path
+            );
+        }
+        println!(
+            "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB",
+            rec.files,
+            stats.opened,
+            stats.discarded_short,
+            stats.not_recorded,
+            rec.audio_secs,
+            rec.bytes as f64 / 1e6
+        );
+        println!(
+            "{:.1} s of IQ in {:.2} s ({:.1}x realtime), up to {} channels at once",
+            secs,
+            elapsed,
+            secs / elapsed,
+            stats.max_concurrent
+        );
     }
     Ok(())
 }

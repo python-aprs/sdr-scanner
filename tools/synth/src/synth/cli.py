@@ -21,7 +21,20 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--block", type=int, default=1 << 20, help="samples per block")
     d = sub.add_parser("describe", help="print a scenario's signals")
     d.add_argument("scenario", type=Path)
+    s = sub.add_parser("score", help="score `scanner run --json` output against ground truth")
+    s.add_argument("truth", type=Path, help="<name>.truth.json")
+    s.add_argument("result", type=Path, help="JSON written by `scanner run --json`")
+    s.add_argument("--min-len", type=float, default=0.3)
     args = ap.parse_args(argv)
+
+    if args.cmd == "score":
+        import json
+
+        from . import score
+
+        sc = score.score(args.truth, json.loads(args.result.read_text()), args.min_len)
+        print(score.report(sc))
+        return 0 if sc.recall == 1.0 else 1
 
     sc = scenario.load(args.scenario)
     if args.cmd == "describe":
