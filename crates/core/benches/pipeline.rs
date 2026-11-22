@@ -48,6 +48,7 @@ fn main() {
             record: true,
             name: None,
             origin: SlotOrigin::Grid,
+            pair: None,
         })
         .collect();
     let mut det = Detector::new(DetectorParams::default(), p, 146e6, &plan);

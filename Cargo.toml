@@ -24,7 +24,7 @@ thiserror = "2"
 anyhow = "1"
 tempfile = "3"
 ctrlc = "3.4"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "signal"] }
 tower = { version = "0.5", features = ["util"] }
 rayon = "1.10"

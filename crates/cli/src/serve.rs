@@ -120,6 +120,8 @@ pub struct ServeOptions<'a> {
     pub insecure_cookies: bool,
     pub scanner: ScannerConfig,
     pub plan: &'a [scanner_core::config::Slot],
+    /// The profile's span (Hz), which the web spectrum shows.
+    pub span: (f64, f64),
     pub out: &'a Path,
     pub status_every: Duration,
 }
@@ -208,6 +210,34 @@ fn start_sdrplay(_: &ServeOptions, _: Option<String>, _: Arc<AtomicBool>) -> Res
     )
 }
 
+/// The watched slots as the web channel list shows them.
+fn channel_list(slots: &[scanner_core::detector::WatchedSlot]) -> Vec<scanner_web::ChannelInfo> {
+    use scanner_core::config::SlotOrigin;
+    // Only link to a half that is actually watched (inside the capture).
+    let watched = |f: f64| slots.iter().any(|w| (w.slot.freq - f).abs() < 1.0);
+    slots
+        .iter()
+        .map(|w| {
+            let s = &w.slot;
+            scanner_web::ChannelInfo {
+                freq_hz: s.freq,
+                name: s.name.clone(),
+                kind: match s.origin {
+                    SlotOrigin::Listed => "channel",
+                    SlotOrigin::RepeaterOutput => "repeater_output",
+                    SlotOrigin::RepeaterInput => "repeater_input",
+                    SlotOrigin::Grid => "grid",
+                },
+                mode: format!("{:?}", s.mode).to_lowercase(),
+                bandwidth_hz: s.bandwidth,
+                priority: s.priority,
+                locked_out: !s.record,
+                pair_hz: s.pair.filter(|&f| watched(f)),
+            }
+        })
+        .collect()
+}
+
 pub fn serve(o: ServeOptions) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -243,6 +273,12 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let (tx, writer) = recorder.spawn(256);
 
     let status: scanner_web::StatusHandle = Default::default();
+    let spectrum: scanner_web::SpectrumHandle = Default::default();
+    // The spectrum shows the profile's span, inside what the radio delivers
+    // cleanly.
+    let half = info.sample_rate * 0.45;
+    let spec_lo = (o.span.0 - info.center_freq).max(-half);
+    let spec_hi = (o.span.1 - info.center_freq).min(half);
     if let Some(addr) = o.http {
         let auth = scanner_web::auth::AuthStore::open(&o.auth_db)
             .with_context(|| format!("opening {}", o.auth_db.display()))?;
@@ -260,11 +296,16 @@ pub fn serve(o: ServeOptions) -> Result<()> {
             Some(Arc::new(auth)),
         );
         state.secure_cookies = !o.insecure_cookies;
+        state.spectrum = spectrum.clone();
+        if let Ok(mut g) = state.channels.write() {
+            *g = channel_list(scanner.detector().slots());
+        }
         scanner_web::spawn(addr, state)
             .with_context(|| format!("starting the web API on {addr}"))?;
-        eprintln!("web API on http://{addr}/api/v1/status");
+        eprintln!("web interface on http://{addr}/");
     }
     let mut next_publish = Instant::now();
+    let mut next_spectrum = Instant::now();
     let mut buf = vec![Complex32::default(); BLOCK];
     let mut out: Vec<Output> = Vec::new();
     let started = Instant::now();
@@ -319,6 +360,19 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 *g = snap;
             }
             next_publish += Duration::from_millis(500);
+        }
+        if o.http.is_some() && Instant::now() >= next_spectrum && spec_hi > spec_lo {
+            let db =
+                scanner
+                    .detector()
+                    .spectrum_db(spec_lo, spec_hi, scanner_web::live::SPECTRUM_BINS);
+            if let Ok(mut g) = spectrum.write() {
+                g.seq += 1;
+                g.start_hz = info.center_freq + spec_lo;
+                g.stop_hz = info.center_freq + spec_hi;
+                g.db = db;
+            }
+            next_spectrum = Instant::now() + Duration::from_millis(200);
         }
         if Instant::now() >= next_status {
             let wall = started.elapsed().as_secs_f64();

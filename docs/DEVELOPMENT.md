@@ -94,6 +94,37 @@ curl localhost:8080/api/v1/status
 curl -H "Authorization: Bearer scn_..." localhost:8080/api/v1/recordings
 ```
 
+### Web interface
+
+`scanner serve` also serves a browser UI at `http://127.0.0.1:8080/`
+(`--http` sets the address). It is plain HTML, CSS and JavaScript in
+`crates/web/ui/`, compiled into the binary, with no build step and nothing
+loaded from other sites. Edit the files and rebuild to change it.
+
+- **Live**: status, a spectrum and waterfall of the profile's span with
+  active transmissions marked, what is on the air now, and the latest
+  recordings. Click the spectrum to see that channel's recordings.
+- **Recordings**: search by channel or frequency, start time and length,
+  then play in the browser (the player can step through the list) or
+  download the WAV.
+- **Channels**: every watched slot with its name, type, mode and lockout or
+  priority flag; repeaters link their input and output.
+- **Admin**: log in and out, change your password, and create or revoke API
+  tokens. It also shows what visitors can see.
+
+The UI uses only `/api/v1`. Live data comes over one WebSocket,
+`/api/v1/live`: about one status message a second, plus spectrum frames of
+1,024 bins (one byte each) at 1, 2 or 5 frames a second. The spectrum stops
+while the Live page isn't showing or the tab is hidden, so an idle tab costs
+about 1 kB/s. The wire format is documented in `crates/web/src/live.rs`. The
+socket checks the same login as the API, and it refuses pages from other
+sites (`Origin` must match `Host`). A reverse proxy must therefore pass the
+original `Host` header and forward WebSocket upgrades.
+
+Every response carries a strict Content Security Policy: same-origin
+scripts, styles and connections only, no inline script, and no framing.
+Static files are revalidated with ETags, so repeat visits cost a 304.
+
 `scanner run` writes `out/YYYY/MM/DD/146.5200_20261122T065403.123Z.wav` per
 transmission (via `.wav.part` and a rename) and one row per transmission in
 `out/index.sqlite`. `--json` prints a machine-readable summary that

@@ -586,6 +586,7 @@ mod tests {
             record: true,
             name: None,
             origin: SlotOrigin::Grid,
+            pair: None,
         }
     }
 

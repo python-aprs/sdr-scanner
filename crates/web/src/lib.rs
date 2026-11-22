@@ -1,6 +1,6 @@
 //! Web API built into the scanner binary (PLAN.md 3.5a).
 //!
-//! Phase 3 groundwork: read-only routes under `/api/v1` with role guards.
+//! The browser UI ([`ui`]) and `/api/v1` with role guards.
 //!
 //! | Route | Needs |
 //! |---|---|
@@ -8,6 +8,9 @@
 //! | `GET /api/v1/recordings` | anonymous if `public.recordings` (default off), else admin |
 //! | `GET /api/v1/recordings/{id}` | same as the list |
 //! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin |
+//! | `GET /api/v1/channels` | same as status |
+//! | `GET /api/v1/live` (WebSocket) | same as status; see [`live`] |
+//! | `GET /`, `/assets/*` | anyone: the browser UI (see [`ui`]) |
 //!
 //! Accounts (see [`auth`]):
 //!
@@ -31,6 +34,8 @@
 //! thread so the async runtime never waits on disk.
 
 pub mod auth;
+pub mod live;
+pub mod ui;
 
 use auth::{AuthStore, LoginLimiter, Session, Token, constant_time_eq, now_ns};
 use axum::extract::{
@@ -46,6 +51,8 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+
+pub use live::{ChannelInfo, ChannelsHandle, Spectrum, SpectrumHandle};
 
 /// Name of the browser session cookie.
 pub const SESSION_COOKIE: &str = "scanner_session";
@@ -120,6 +127,10 @@ pub struct AppState {
     /// Mark the session cookie `Secure` (browsers then send it only over
     /// HTTPS, or to localhost). Off only for plain-HTTP setups on a LAN.
     pub secure_cookies: bool,
+    /// Display spectrum, published by the DSP thread.
+    pub spectrum: SpectrumHandle,
+    /// The watched channels.
+    pub channels: ChannelsHandle,
 }
 
 impl AppState {
@@ -136,6 +147,8 @@ impl AppState {
             auth,
             limiter: Default::default(),
             secure_cookies: true,
+            spectrum: Default::default(),
+            channels: Default::default(),
         }
     }
 }
@@ -322,8 +335,13 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/api/v1/status", get(status))
+    let mut r = Router::new();
+    for path in ui::paths() {
+        r = r.route(path, get(ui::asset));
+    }
+    r.route("/api/v1/status", get(status))
+        .route("/api/v1/channels", get(channels))
+        .route("/api/v1/live", get(live::live_ws))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/{id}", get(get_recording))
         .route("/api/v1/recordings/{id}/audio", get(get_audio))
@@ -334,7 +352,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/auth/tokens/{id}", delete(revoke_token))
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn(ui::security_headers))
         .with_state(state)
+}
+
+async fn channels(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ChannelInfo>>, ApiError> {
+    s.caller(&headers).await?.require(s.public.live)?;
+    Ok(Json(
+        s.channels.read().map(|g| g.clone()).unwrap_or_default(),
+    ))
 }
 
 async fn status(
@@ -493,6 +522,8 @@ struct SessionInfo {
     /// "session", "token" or null.
     via: Option<&'static str>,
     accounts_configured: bool,
+    /// What anonymous visitors may see.
+    public: Public,
 }
 
 fn limiter_keys(client: &str, username: &str) -> Vec<String> {
@@ -574,6 +605,7 @@ async fn login(
         expires_ns: Some(new.expires_ns),
         via: Some("session"),
         accounts_configured: true,
+        public: s.public,
     })
     .into_response();
     resp.headers_mut().insert(
@@ -617,6 +649,7 @@ async fn session_info(
             expires_ns: Some(session.expires_ns),
             via: Some("session"),
             accounts_configured: configured,
+            public: s.public,
         },
         Via::Token(t) => SessionInfo {
             role: c.role,
@@ -625,6 +658,7 @@ async fn session_info(
             expires_ns: t.expires_ns,
             via: Some("token"),
             accounts_configured: configured,
+            public: s.public,
         },
         _ => SessionInfo {
             role: c.role,
@@ -633,6 +667,7 @@ async fn session_info(
             expires_ns: None,
             via: None,
             accounts_configured: configured,
+            public: s.public,
         },
     }))
 }
@@ -954,12 +989,16 @@ mod tests {
             recordings: false,
             audio: false,
         };
+        // (route, which column of `expect` applies). Routes guarded like
+        // status share its column.
         let routes = [
-            "/api/v1/status",
-            "/api/v1/recordings",
-            "/api/v1/recordings/{id}",
-            "/api/v1/recordings/{id}/audio",
-            "/api/v1/auth/tokens",
+            ("/api/v1/status", 0),
+            ("/api/v1/channels", 0),
+            ("/api/v1/live", 0),
+            ("/api/v1/recordings", 1),
+            ("/api/v1/recordings/{id}", 2),
+            ("/api/v1/recordings/{id}/audio", 3),
+            ("/api/v1/auth/tokens", 4),
         ];
         #[derive(Clone, Copy, Debug)]
         enum Who {
@@ -1020,15 +1059,21 @@ mod tests {
         for (public, who, expect) in cases {
             let (_dir, state, id, token) = setup(public);
             let cookie = login(&state, "masen", PASSWORD).await.cookie().unwrap();
-            for (route, want) in routes.iter().zip(expect) {
+            for (route, col) in routes {
+                let want = expect[col];
                 let uri = route.replace("{id}", &id.to_string());
-                let got = match who {
+                let mut got = match who {
                     Who::Nobody => get(&state, &uri, None, None).await.0,
                     Who::WrongToken => get(&state, &uri, Some("scn_wrong"), None).await.0,
                     Who::Token => get(&state, &uri, Some(&token), None).await.0,
                     Who::Session => get_with_cookie(&state, &uri, &cookie).await,
                     Who::ExpiredCookie => get_with_cookie(&state, &uri, "stale").await,
                 };
+                // A plain GET that passes the guard is then refused as a
+                // bad WebSocket handshake; that is the "allowed" answer.
+                if route == "/api/v1/live" && got == S::BAD_REQUEST {
+                    got = S::OK;
+                }
                 assert_eq!(got, want, "{uri} public={public:?} who={who:?}");
             }
         }
@@ -1338,5 +1383,91 @@ mod tests {
         assert_eq!(parse_range("bytes=10-", 10), None);
         assert_eq!(parse_range("bytes=1-2,4-5", 10), None);
         assert_eq!(parse_range("items=1-2", 10), None);
+    }
+
+    #[tokio::test]
+    async fn ui_is_served_with_security_headers_and_etags() {
+        let (_dir, state, _, _) = setup(Public::default());
+        for path in ui::paths() {
+            let r = send(&state, Request::get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(r.status, StatusCode::OK, "{path}");
+            assert!(!r.body.is_empty());
+            assert_eq!(r.headers[header::CONTENT_SECURITY_POLICY], ui::CSP);
+            assert_eq!(r.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(r.headers[header::X_FRAME_OPTIONS], "DENY");
+            let tag = r.headers[header::ETAG].clone();
+            let again = send(
+                &state,
+                Request::get(path)
+                    .header(header::IF_NONE_MATCH, tag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(again.status, StatusCode::NOT_MODIFIED, "{path}");
+            assert!(again.body.is_empty());
+        }
+        let html = send(&state, Request::get("/").body(Body::empty()).unwrap()).await;
+        let text = String::from_utf8(html.body).unwrap();
+        assert!(text.contains("/assets/app.js"));
+        assert!(
+            !text.contains("<script>"),
+            "no inline script (CSP forbids it)"
+        );
+        // API errors carry the headers too.
+        let r = send(
+            &state,
+            Request::get("/api/v1/recordings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    #[tokio::test]
+    async fn channels_and_session_report_what_the_ui_needs() {
+        let (_dir, state, _, _) = setup(Public::default());
+        state.channels.write().unwrap().push(ChannelInfo {
+            freq_hz: 146.52e6,
+            name: Some("Calling".into()),
+            kind: "channel",
+            mode: "nbfm".into(),
+            bandwidth_hz: 16e3,
+            priority: true,
+            locked_out: false,
+            pair_hz: None,
+        });
+        let (status, body) = get(&state, "/api/v1/channels", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v[0]["name"], "Calling");
+        assert_eq!(v[0]["kind"], "channel");
+        assert_eq!(v[0]["priority"], true);
+        let (_, body) = get(&state, "/api/v1/auth/session", None, None).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["role"], "anonymous");
+        assert_eq!(v["public"]["live"], true);
+        assert_eq!(v["public"]["recordings"], false);
+    }
+
+    #[tokio::test]
+    async fn live_socket_refuses_other_sites() {
+        let (_dir, state, _, token) = setup(Public::default());
+        let req = Request::get("/api/v1/live")
+            .header(header::HOST, "scanner.example")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&state, req).await.status, StatusCode::FORBIDDEN);
+        let req = Request::get("/api/v1/live")
+            .header(header::HOST, "scanner.example")
+            .header(header::ORIGIN, "https://scanner.example")
+            .body(Body::empty())
+            .unwrap();
+        // Past the origin check, refused only as a handshake without upgrade
+        // headers.
+        assert_eq!(send(&state, req).await.status, StatusCode::BAD_REQUEST);
     }
 }
