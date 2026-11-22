@@ -341,9 +341,12 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 rs.dropped_samples,
                 st.recorded,
                 active.join(", "),
-                match scanner.detector().burst_blocks() {
-                    0 => String::new(),
-                    n => format!(", burst guard held opens in {n} blocks"),
+                match (
+                    scanner.detector().burst_blocks(),
+                    scanner.detector().step_blocks()
+                ) {
+                    (0, 0) => String::new(),
+                    (b, s) => format!(", guard held opens in {b} burst and {s} noise-step blocks"),
                 },
                 radio_note
             );

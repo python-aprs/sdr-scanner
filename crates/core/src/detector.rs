@@ -147,6 +147,8 @@ pub struct Detector {
     blocks_seen: u64,
     /// Blocks in which the burst guard held slots back.
     burst_blocks: u64,
+    /// Blocks in which the noise floor rose across much of the band at once.
+    step_blocks: u64,
     /// Scratch: per slot, whether it may start or continue an attack.
     opens: Vec<bool>,
     /// Per grid slot: sum and count of the signal centre over the attack,
@@ -162,6 +164,13 @@ pub struct Detector {
 /// converts the per-segment median to a mean estimate. Measured by
 /// `idle_slots_read_zero_db` for the default smoothing at typical block rates.
 const MEDIAN_TO_MEAN: f32 = 1.2;
+/// Mean over median of one block's (unsmoothed, exponentially distributed)
+/// bin powers: 1 / ln 2.
+const RAW_MEDIAN_TO_MEAN: f32 = std::f32::consts::LOG2_E;
+/// A segment whose median power this block is this far above its floor has
+/// risen as a whole (a gain step or front-end overload), not because of a
+/// few signals in it.
+const STEP_RATIO: f32 = 2.0;
 
 impl Detector {
     /// Watch the slots of a channel plan that fall inside the capture.
@@ -264,6 +273,7 @@ impl Detector {
             seg_scratch: Vec::new(),
             blocks_seen: 0,
             burst_blocks: 0,
+            step_blocks: 0,
             opens: Vec::new(),
             attack_centre: Vec::new(),
             skipped,
@@ -411,7 +421,28 @@ impl Detector {
         } else {
             self.floor_alpha
         };
+        let mut risen = 0usize;
         for (i, &(a, b)) in self.seg_bounds.iter().enumerate() {
+            // The whole segment's level this block, from its median bin:
+            // signals occupy too few bins to move it.
+            self.seg_scratch.clear();
+            let stride = ((b - a) / 512).max(1);
+            self.seg_scratch
+                .extend(self.raw[a..b].iter().step_by(stride).copied());
+            let mid = self.seg_scratch.len() / 2;
+            let (_, m, _) = self.seg_scratch.select_nth_unstable_by(mid, f32::total_cmp);
+            let level = *m * RAW_MEDIAN_TO_MEAN;
+            {
+                let f = &mut self.seg_floor[i];
+                if *f > 0.0 && level > *f * STEP_RATIO {
+                    // Follow a broadband rise at once instead of over the
+                    // slow growth time, or every slot in the segment looks
+                    // busy until the floor catches up.
+                    risen += 1;
+                    *f = level;
+                    continue;
+                }
+            }
             self.seg_scratch.clear();
             let stride = ((b - a) / 512).max(1);
             self.seg_scratch
@@ -435,6 +466,12 @@ impl Detector {
             }
         }
         self.blocks_seen += 1;
+        // A broadband step across much of the band this block: nothing new
+        // may start (see the guard below).
+        let step = risen * 4 >= self.seg_bounds.len() && self.blocks_seen > 1;
+        if step {
+            self.step_blocks += 1;
+        }
 
         // SNR per slot.
         for (i, s) in self.slots.iter().enumerate() {
@@ -468,6 +505,15 @@ impl Detector {
                 !(dens(j) > snr || (other_owns && dens(j) >= snr - 3.0))
             });
             self.opens.push(snr >= self.params.open_db && wins);
+        }
+        if step {
+            // Hold every waiting slot back for this block; the floor has
+            // already moved up, so real signals still clear it next block.
+            for i in 0..self.slots.len() {
+                if matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. }) {
+                    self.opens[i] = false;
+                }
+            }
         }
         // Broadband-burst guard (see DetectorParams::burst_slots).
         if self.params.burst_slots > 0 {
@@ -593,6 +639,12 @@ impl Detector {
     /// Blocks in which the broadband-burst guard held slots back.
     pub fn burst_blocks(&self) -> u64 {
         self.burst_blocks
+    }
+
+    /// Blocks in which the noise floor stepped up across much of the band
+    /// (gain change, overload, a radio stream restart).
+    pub fn step_blocks(&self) -> u64 {
+        self.step_blocks
     }
 
     /// End of stream: close everything that is open.
@@ -841,6 +893,28 @@ mod tests {
             .filter(|e| matches!(e, Event::Open { .. }))
             .count();
         assert!(n >= 7, "{n}");
+    }
+
+    #[test]
+    fn broadband_noise_step_does_not_open_slots() {
+        // The noise level jumps 6 dB across the whole band (a gain step or a
+        // radio stream restart), with one real signal starting after it.
+        let mut x = scene(4.0, &[(100e3, 25.0, 2.5, 3.5)], 13);
+        let fs = params().sample_rate;
+        for v in &mut x[(1.5 * fs) as usize..] {
+            *v *= 2.0;
+        }
+        let plan: Vec<Slot> = (-20..=20).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let (det, events, _) = run(&x, &plan, DetectorParams::default());
+        let opened: Vec<f64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Open { slot, .. } => Some(det.slots()[*slot].slot.freq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, vec![100e3], "{opened:?}");
+        assert!(det.step_blocks() > 0);
     }
 
     #[test]
