@@ -1,0 +1,22 @@
+[package]
+name = "scanner-cli"
+description = "The sdr-scanner command line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scanner"
+path = "src/main.rs"
+
+[features]
+airspy = ["scanner-sources/airspy"]
+sdrplay = ["scanner-sources/sdrplay"]
+
+[dependencies]
+scanner-core.workspace = true
+scanner-sources.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+num-complex.workspace = true

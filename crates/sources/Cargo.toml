@@ -1,0 +1,24 @@
+[package]
+name = "scanner-sources"
+description = "IQ sample sources for sdr-scanner: files (SigMF), Airspy, SDRplay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Hardware backends land in Phase 2. They are feature-gated so the rest of the
+# workspace builds and tests without either vendor SDK installed.
+airspy = []
+sdrplay = []
+
+[dependencies]
+scanner-core.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

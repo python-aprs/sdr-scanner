@@ -1,0 +1,31 @@
+# Benchmark scenario: the whole 2 m band at 10 MS/s with many simultaneous
+# transmissions, impairments and a strong carrier. ~1.6 GB of ci16 at 20 s;
+# override --duration for quicker runs.
+description: Full 2 m band, busy, 10 MS/s
+sample_rate: 10e6
+center_freq: 146.0125 MHz   # LO nudged off any channel
+duration: 20.0
+seed: 7
+format: ci16
+adc_bits: 12
+noise_dbfs: -40
+start_time: "2026-11-22T06:54:03Z"
+impairments:
+  dc_offset: [0.002, -0.001]
+  iq_imbalance: {gain_db: 0.2, phase_deg: 1.0}
+  spurs:
+    - {freq: 145.0 MHz, level_dbfs: -55}
+signals:
+  - {label: r1-out, kind: nbfm, freq: 146.62 MHz, start: 0.5, duration: 12, snr_db: 25, audio: speechlike}
+  - {label: r1-in,  kind: nbfm, freq: 146.02 MHz, start: 0.5, duration: 12, snr_db: 8,  audio: speechlike}
+  - {label: r2-out, kind: nbfm, freq: 146.84 MHz, start: 2.0, duration: 6,  snr_db: 30, audio: speechlike, ctcss: 100.0}
+  - {label: r3-out, kind: nbfm, freq: 147.06 MHz, start: 1.0, duration: 15, snr_db: 18, audio: speechlike, ctcss: 123.0}
+  - {label: r3-in,  kind: nbfm, freq: 147.66 MHz, start: 1.0, duration: 15, snr_db: 6,  audio: speechlike}
+  - {label: simplex, kind: nbfm, freq: 146.52 MHz, start: 4.0, duration: 3, snr_db: 15, audio: {kind: tone, freq: 1000}}
+  - {label: narrow, kind: nbfm, freq: 145.2125 MHz, start: 3.0, duration: 8, snr_db: 12, deviation: 2.5 kHz, audio: speechlike}
+  - {label: low-1,  kind: nbfm, freq: 144.62 MHz, start: 0.0, duration: 20, snr_db: 20, audio: speechlike}
+  - {label: blip,   kind: nbfm, freq: 147.30 MHz, start: 9.0, duration: 0.15, snr_db: 20, audio: {kind: tone, freq: 800}}
+  - {label: strong, kind: nbfm, freq: 147.84 MHz, start: 5.0, duration: 10, level_dbfs: -6, audio: speechlike}
+  - {label: beacon, kind: carrier, freq: 144.28 MHz, start: 0.0, duration: 20, snr_db: 30}
+  - {label: edge-lo, kind: nbfm, freq: 144.0125 MHz, start: 10.0, duration: 5, snr_db: 15, audio: speechlike}
+  - {label: edge-hi, kind: nbfm, freq: 147.9875 MHz, start: 10.0, duration: 5, snr_db: 15, audio: speechlike}

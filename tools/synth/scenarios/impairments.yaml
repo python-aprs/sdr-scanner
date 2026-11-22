@@ -1,0 +1,17 @@
+# Receiver impairments around a weak signal: DC offset, IQ imbalance (which
+# creates a mirror image), a spur next to a channel, drift and 12-bit quantisation.
+description: Impairments
+sample_rate: 2.5e6
+center_freq: 146.5 MHz
+duration: 3.0
+seed: 3
+adc_bits: 12
+noise_dbfs: -50
+impairments:
+  dc_offset: [0.01, 0.005]
+  iq_imbalance: {gain_db: 0.5, phase_deg: 3.0}
+  spurs:
+    - {freq: 146.705 MHz, level_dbfs: -60}
+signals:
+  - {label: strong, kind: nbfm, freq: 146.9 MHz, start: 0.0, duration: 3.0, level_dbfs: -10, audio: speechlike}
+  - {label: weak-drift, kind: nbfm, freq: 146.70 MHz, start: 0.5, duration: 2.0, snr_db: 10, drift: 50, audio: {kind: tone, freq: 1000}}

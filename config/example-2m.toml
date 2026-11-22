@@ -1,0 +1,59 @@
+# Example band profiles for the 2 m band (PLAN.md 3.7).
+#
+# Check with:  scanner config check config/example-2m.toml --slots
+#
+# The repeater list for the Rainier, OR site (WWARA + ORRC coordinated
+# repeaters in range) is not filled in yet; it will be imported from a
+# CHIRP-style CSV. The entry below shows the shape only.
+
+[profiles.2m-25k]
+span       = { start = "144.000 MHz", stop = "148.000 MHz" }
+spacing    = "25 kHz"      # fallback grid for unlisted signals
+offset     = "0 kHz"
+bandwidth  = "16 kHz"      # channel filter passband
+deviation  = "5 kHz"
+audio_rate = 8000
+deemphasis = true
+
+[[profiles.2m-25k.channels]]
+freq     = "146.5200 MHz"
+name     = "National simplex calling"
+priority = true
+
+[[profiles.2m-25k.channels]]
+freq   = "144.3900 MHz"
+name   = "APRS"
+mode   = "afsk1200"
+record = false              # until the packet decoder lands (Phase 5)
+
+[[profiles.2m-25k.channels]]
+freq   = "144.9200 MHz"
+name   = "Packet"
+mode   = "afsk1200"
+record = false
+
+[[profiles.2m-25k.lockouts]]
+start  = "144.000 MHz"
+stop   = "144.300 MHz"
+reason = "CW, SSB and weak signal; not useful as NBFM (Phase 7)"
+
+# Shape of a repeater entry: creates the output slot and the input slot.
+# [[profiles.2m-25k.repeaters]]
+# name          = "CALLSIGN location"
+# output        = "146.xx MHz"
+# offset        = "-600 kHz"
+# tone          = 100.0
+# monitor_input = true
+
+[profiles.2m-12k5]
+inherit   = "2m-25k"
+spacing   = "12.5 kHz"
+bandwidth = "11 kHz"
+deviation = "2.5 kHz"
+
+# 70 cm does not inherit from 2 m: channel lists and lockouts are per band.
+[profiles.70cm-25k]
+span       = { start = "440.000 MHz", stop = "450.000 MHz" }
+spacing    = "25 kHz"
+bandwidth  = "16 kHz"
+deviation  = "5 kHz"

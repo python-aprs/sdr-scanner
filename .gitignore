@@ -1,0 +1,10 @@
+/target
+*.swp
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+/out/
+/captures/
+*.sigmf-data
+!tools/synth/tests/fixtures/*.sigmf-data
