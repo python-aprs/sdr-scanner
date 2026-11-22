@@ -104,6 +104,12 @@ struct ServeArgs {
     /// Hide live status from anonymous visitors.
     #[arg(long)]
     private_live: bool,
+    /// Monthly data budget (GB) for anonymous visitors: past 80 % their
+    /// spectrum slows to one frame a second, and once it is spent their
+    /// spectrum, live audio and recording audio stop until the month turns
+    /// (UTC). Admin traffic is counted but never held back. 0: no budget.
+    #[arg(long, default_value_t = 3.0)]
+    anon_egress_gb: f64,
     /// Accounts database (default: auth.sqlite in --out).
     #[arg(long)]
     auth_db: Option<PathBuf>,
@@ -357,6 +363,7 @@ fn main() -> Result<()> {
                 out: &a.tuning.out,
                 opus: !a.tuning.no_opus,
                 retention: a.tuning.retention(),
+                anon_egress_bytes: (a.anon_egress_gb.max(0.0) * 1e9) as u64,
                 status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
             })
         }

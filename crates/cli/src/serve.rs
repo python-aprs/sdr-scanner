@@ -127,6 +127,8 @@ pub struct ServeOptions<'a> {
     /// Also write Opus copies for the web UI.
     pub opus: bool,
     pub retention: scanner_store::retention::Policy,
+    /// Monthly budget for anonymous web traffic; 0 for none.
+    pub anon_egress_bytes: u64,
     pub status_every: Duration,
 }
 
@@ -366,6 +368,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let status: scanner_web::StatusHandle = Default::default();
     let audio_hub = scanner_web::audio::AudioHub::new();
     let mut live_tx = None;
+    let mut egress = None;
     let spectrum: scanner_web::SpectrumHandle = Default::default();
     // The spectrum shows the profile's span, inside what the radio delivers
     // cleanly.
@@ -400,6 +403,12 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         );
         state.audio = Some(audio_hub.clone());
         state.storage = disk_usage.clone();
+        let eg = Arc::new(scanner_web::egress::Egress::new(
+            o.anon_egress_bytes,
+            Some(settings.clone()),
+        ));
+        state.egress = Some(eg.clone());
+        egress = Some(eg);
         scanner_web::spawn(addr, state)
             .with_context(|| format!("starting the web API on {addr}"))?;
         eprintln!("web interface on http://{addr}/");
@@ -538,6 +547,9 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     drop(tx);
     let radio_result = radio.join().expect("radio thread panicked");
     let rec = writer.join().expect("recorder thread panicked")?;
+    if let Some(e) = &egress {
+        e.flush();
+    }
     eprintln!(
         "stopped: {} transmissions, {:.1} s of audio, {} samples dropped",
         rec.files,

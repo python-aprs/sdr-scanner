@@ -170,7 +170,17 @@ filesystem. Usage is the sum the index holds for finished recordings, so a
 pass never walks the folder; files added by hand and recordings still open
 don't count. A pass runs at startup and after each recording closes. The
 Admin page and `GET /api/v1/storage` show usage, free space and what was
-deleted. `--json` prints a machine-readable summary that
+deleted.
+
+Everything the web interface sends is counted per role and UTC calendar
+month (HTTP bodies and headers, and WebSocket messages; TCP/TLS overhead
+comes on top) and kept in `settings.sqlite`. Anonymous visitors get a
+monthly allowance, `--anon-egress-gb` (default 3, 0 for none): past 80 %
+their spectrum drops to one frame a second, and once it is spent their
+spectrum, live audio and recording audio stop until the month turns, with a
+banner saying when. Only a valid login counts as admin, and admin traffic is
+never held back. The Admin page and `GET /api/v1/egress` show this month
+and the ones before. `--json` prints a machine-readable summary that
 `synth score` reads.
 
 How the pipeline fits together (PLAN.md 3.2–3.4):
