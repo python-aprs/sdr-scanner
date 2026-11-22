@@ -82,6 +82,10 @@ struct RunArgs {
     /// Most transmissions recorded at once.
     #[arg(long, default_value_t = 32)]
     max_active: usize,
+    /// Half-width (Hz) of the notch over the tuner's DC residual. Zero-IF
+    /// radios (RSP1A) need a few kHz; 0 disables.
+    #[arg(long, default_value_t = 3000.0)]
+    dc_notch: f64,
     /// Pace reading at the recording's sample rate (like a live radio).
     #[arg(long)]
     realtime: bool,
@@ -312,6 +316,7 @@ fn run(a: RunArgs) -> Result<()> {
             close_db: a.close_db,
             hang: a.hang,
             max_active: a.max_active,
+            dc_notch_hz: a.dc_notch,
             grid_window_hz: profile.spacing.map(|s| s.0).unwrap_or(0.0),
             ..Default::default()
         },

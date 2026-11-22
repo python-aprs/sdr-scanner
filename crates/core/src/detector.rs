@@ -54,7 +54,8 @@ impl Default for DetectorParams {
             floor_segments: 64,
             usable: 0.9,
             max_active: 32,
-            dc_notch_hz: 500.0,
+            // Zero-IF tuners (RSP1A measured) leave a DC residual ~5 kHz wide.
+            dc_notch_hz: 3000.0,
             grid_window_hz: 0.0,
         }
     }
@@ -449,6 +450,11 @@ impl Detector {
                     if b + 1 - since >= self.attack_blocks
                         && (active < self.params.max_active || self.slots[i].slot.priority)
                     {
+                        // If the open was held back (max_active), only the
+                        // last attack's worth of blocks is still in the
+                        // consumer's history; start from there so signal
+                        // time is never counted from before the audio.
+                        let since = since.max(b + 1 - self.attack_blocks);
                         let start = since.saturating_sub(self.preroll_blocks);
                         events.push(Event::Open {
                             slot: i,

@@ -125,10 +125,19 @@ struct Chain {
     audio_t0: i64,
     iq: Vec<Complex32>,
     demod: Vec<f32>,
+    /// Squelch gain now (0 = muted, 1 = open), ramped between blocks.
+    squelch: f32,
 }
 
+/// Squelch ramp length in audio samples (5 ms at 8 kHz).
+const SQUELCH_RAMP: f32 = 40.0;
+
 impl Chain {
-    fn process(&mut self, block: &Block) {
+    /// Demodulate one block. `open` is the squelch: blocks where the slot is
+    /// below the close threshold (pre-roll noise, the hang time, fades,
+    /// zero-filled drops) are muted, with short ramps so there are no
+    /// clicks. Muting keeps the samples, so timing is unchanged.
+    fn process(&mut self, block: &Block, open: bool) {
         self.iq.clear();
         self.extractor.process(block, &mut self.iq);
         self.demod.clear();
@@ -147,8 +156,15 @@ impl Chain {
         if let Some(h) = &mut self.hp {
             h.process(new);
         }
+        let target = if open { 1.0 } else { 0.0 };
+        let step = 1.0 / SQUELCH_RAMP;
         for v in new {
-            *v = (*v * self.gain).clamp(-1.0, 1.0);
+            if self.squelch < target {
+                self.squelch = (self.squelch + step).min(1.0);
+            } else if self.squelch > target {
+                self.squelch = (self.squelch - step).max(0.0);
+            }
+            *v = (*v * self.gain * self.squelch).clamp(-1.0, 1.0);
         }
     }
 
@@ -173,7 +189,8 @@ pub struct Scanner {
     detector: Detector,
     clock: SampleClock,
     /// Recent blocks for pre-roll, oldest first.
-    history: VecDeque<Arc<Block>>,
+    /// Recent blocks with each watched slot's SNR in that block.
+    history: VecDeque<(Arc<Block>, Arc<[f32]>)>,
     history_len: usize,
     spare: Vec<Vec<Complex32>>,
     chains: Vec<Chain>,
@@ -265,28 +282,34 @@ impl Scanner {
     fn on_block(&mut self, block: Block, out: &mut Vec<Output>) {
         self.stats.blocks += 1;
         let block = Arc::new(block);
-        self.history.push_back(block.clone());
-        while self.history.len() > self.history_len {
-            let old = self.history.pop_front().unwrap();
-            if let Ok(b) = Arc::try_unwrap(old) {
-                self.spare.push(b.bins);
-            }
-        }
         self.last_block = Some(block.index);
 
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         self.detector.update(&block, &mut events);
+        let snrs: Arc<[f32]> = (0..self.detector.slots().len())
+            .map(|i| self.detector.snr_db(i))
+            .collect();
+        self.history.push_back((block.clone(), snrs.clone()));
+        while self.history.len() > self.history_len {
+            let (old, _) = self.history.pop_front().unwrap();
+            if let Ok(b) = Arc::try_unwrap(old) {
+                self.spare.push(b.bins);
+            }
+        }
 
         // Existing chains process this block (new chains catch up from
         // history when they open, below).
         // Each chain is ~50 µs of work per block; below a dozen chains the
         // fan-out costs more than it saves.
+        let close = self.cfg.detector.close_db;
         if self.cfg.parallel && self.chains.len() >= 12 {
-            self.chains.par_iter_mut().for_each(|c| c.process(&block));
+            self.chains
+                .par_iter_mut()
+                .for_each(|c| c.process(&block, snrs[c.slot] >= close));
         } else {
             for c in &mut self.chains {
-                c.process(&block);
+                c.process(&block, snrs[c.slot] >= close);
             }
         }
 
@@ -379,6 +402,7 @@ impl Scanner {
                 let first = self
                     .history
                     .iter()
+                    .map(|(b, _)| b)
                     .find(|b| b.index >= start_block)
                     .cloned();
                 let audio_t0 = match &first {
@@ -405,15 +429,17 @@ impl Scanner {
                     audio_t0,
                     iq: Vec::new(),
                     demod: Vec::new(),
+                    squelch: 0.0,
                     extractor: ex,
                 };
                 self.next_id += 1;
-                for b in self
+                let close = self.cfg.detector.close_db;
+                for (b, snrs) in self
                     .history
                     .iter()
-                    .filter(|b| b.index >= start_block && b.index <= block)
+                    .filter(|(b, _)| b.index >= start_block && b.index <= block)
                 {
-                    c.process(b);
+                    c.process(b, snrs[slot] >= close);
                 }
                 self.chains.push(c);
             }
@@ -590,6 +616,61 @@ mod tests {
                 .unwrap();
             assert!((close.signal_secs - (off - on)).abs() < 0.08, "{close:?}");
         }
+    }
+
+    #[test]
+    fn noise_outside_the_signal_is_muted() {
+        let x = scene(3.0, &[(100e3, 1000.0, 1.0, 2.0)]);
+        let plan = vec![slot(100e3)];
+        let (out, _) = collect(&x, &plan, ScannerConfig::default());
+        let Some(Output::Open(s)) = out.iter().find(|o| matches!(o, Output::Open(_))) else {
+            panic!("no transmission: {out:?}")
+        };
+        let audio = audio_of(&out, s.id);
+        let start = s.start_sample as f64 / params().sample_rate;
+        let rms = |a: &[f32]| (a.iter().map(|v| v * v).sum::<f32>() / a.len().max(1) as f32).sqrt();
+        // Pre-roll before key-up, and the tail after key-down, are silent.
+        let pre = &audio[..((1.0 - start - 0.03) * 8000.0) as usize];
+        let post = &audio[((2.0 - start + 0.05) * 8000.0) as usize..];
+        let mid = &audio[((1.2 - start) * 8000.0) as usize..((1.8 - start) * 8000.0) as usize];
+        assert!(!pre.is_empty() && !post.is_empty());
+        assert!(rms(pre) < 1e-3, "pre {}", rms(pre));
+        assert!(rms(post) < 1e-3, "post {}", rms(post));
+        assert!(rms(mid) > 0.05, "mid {}", rms(mid));
+    }
+
+    #[test]
+    fn zero_filled_gap_mid_transmission() {
+        // A 60 ms overrun gap (zeros) inside a transmission: one file, no
+        // NaN, no clicks, no false opens elsewhere.
+        let clean = scene(3.0, &[(100e3, 1000.0, 0.5, 2.5)]);
+        let mut x = clean.clone();
+        let fs = params().sample_rate;
+        for v in &mut x[(1.5 * fs) as usize..(1.56 * fs) as usize] {
+            *v = Complex32::default();
+        }
+        let plan: Vec<Slot> = (-8..=8).map(|k| slot(k as f64 * 25e3)).collect();
+        let worst_jump = |x: &[Complex32]| {
+            let (out, stats) = collect(x, &plan, ScannerConfig::default());
+            assert_eq!(stats.recorded, 1, "{stats:?}");
+            let audio: Vec<f32> = out
+                .iter()
+                .filter_map(|o| match o {
+                    Output::Audio { samples, .. } => Some(samples.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert!(audio.iter().all(|v| v.is_finite()));
+            audio
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let base = worst_jump(&clean);
+        let gap = worst_jump(&x);
+        // A click would jump far beyond the tone's own sample-to-sample step.
+        assert!(gap < base * 1.2, "gap {gap} vs clean {base}");
     }
 
     #[test]
