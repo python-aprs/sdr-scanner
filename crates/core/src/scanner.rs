@@ -89,6 +89,26 @@ pub enum Output {
     Close(TxEnd),
 }
 
+/// Audio for live listeners, sent as soon as it is demodulated (recordings
+/// hold audio back so a close can trim the hang time; live audio doesn't
+/// wait, and what it sends of the hang is already squelched to silence).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveAudio {
+    Start {
+        id: u64,
+        freq: f64,
+        priority: bool,
+        audio_rate: u32,
+    },
+    Audio {
+        id: u64,
+        samples: Vec<f32>,
+    },
+    End {
+        id: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScannerStats {
     pub blocks: u64,
@@ -119,6 +139,9 @@ struct Chain {
     pending: Vec<f32>,
     /// Audio samples emitted so far.
     emitted: usize,
+    /// Audio samples sent to live listeners so far (counted like `emitted`),
+    /// or `None` until the chain is announced to them.
+    live_sent: Option<usize>,
     confirmed: bool,
     /// Stream sample (input rate) of audio sample 0, may be negative at
     /// stream start.
@@ -251,6 +274,8 @@ pub struct Scanner {
     last_block: Option<u64>,
     /// Frequency ranges (Hz) never recorded, whichever slot hears them.
     lockouts: Vec<(f64, f64)>,
+    /// Live audio for listeners, when someone is listening.
+    live: Option<Vec<LiveAudio>>,
 }
 
 impl Scanner {
@@ -288,6 +313,7 @@ impl Scanner {
             stats: ScannerStats::default(),
             last_block: None,
             lockouts: Vec::new(),
+            live: None,
             cfg,
         }
     }
@@ -333,6 +359,69 @@ impl Scanner {
             .push(samples, || spare.pop(), |b| blocks.push(b));
         for b in blocks {
             self.on_block(b, out);
+        }
+    }
+
+    /// Turn live audio on or off. Off (the default) costs nothing; turning
+    /// it on picks up transmissions already open from where they are.
+    pub fn set_live(&mut self, on: bool) {
+        match (on, self.live.is_some()) {
+            (true, false) => {
+                // Join transmissions already open at their newest audio.
+                let rate = self.cfg.audio_rate;
+                let mut live = Vec::new();
+                for c in &mut self.chains {
+                    live.push(LiveAudio::Start {
+                        id: c.id,
+                        freq: c.tuned.freq,
+                        priority: c.tuned.priority,
+                        audio_rate: rate,
+                    });
+                    c.live_sent =
+                        Some(c.emitted + c.pending.len().saturating_sub(rate as usize / 5));
+                }
+                self.live = Some(live);
+            }
+            (false, true) => {
+                self.live = None;
+                for c in &mut self.chains {
+                    c.live_sent = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Live audio since the last call (empty while live audio is off).
+    pub fn take_live(&mut self, into: &mut Vec<LiveAudio>) {
+        if let Some(l) = &mut self.live {
+            into.append(l);
+        }
+    }
+
+    fn feed_live(&mut self) {
+        let Some(live) = &mut self.live else { return };
+        let rate = self.cfg.audio_rate;
+        for c in &mut self.chains {
+            let sent = *c.live_sent.get_or_insert_with(|| {
+                live.push(LiveAudio::Start {
+                    id: c.id,
+                    freq: c.tuned.freq,
+                    priority: c.tuned.priority,
+                    audio_rate: rate,
+                });
+                // Opened while live audio is on: from its first sample.
+                c.emitted
+            });
+            let total = c.emitted + c.pending.len();
+            if total > sent {
+                let from = sent.saturating_sub(c.emitted);
+                live.push(LiveAudio::Audio {
+                    id: c.id,
+                    samples: c.pending[from..].to_vec(),
+                });
+                c.live_sent = Some(total);
+            }
         }
     }
 
@@ -454,6 +543,8 @@ impl Scanner {
         }
         self.events = events;
 
+        self.feed_live();
+
         // Confirm transmissions that passed the minimum length, and stream
         // audio that can no longer be trimmed away by a close.
         let block_secs = self.bank.params().block_secs();
@@ -571,6 +662,7 @@ impl Scanner {
                     skip,
                     pending: Vec::new(),
                     emitted: 0,
+                    live_sent: None,
                     confirmed: false,
                     audio_t0,
                     iq: Vec::new(),
@@ -603,6 +695,9 @@ impl Scanner {
                     return;
                 };
                 let mut c = self.chains.swap_remove(pos);
+                if let (Some(live), Some(_)) = (&mut self.live, c.live_sent) {
+                    live.push(LiveAudio::End { id: c.id });
+                }
                 let p = *self.bank.params();
                 let end_sample = (end_block + 1) * p.hop as u64;
                 let signal_start =
@@ -973,6 +1068,58 @@ mod tests {
         let ends = closes(&out);
         assert_eq!(ends.len(), 1);
         assert!(ends[0].signal_secs < 1.1, "{}", ends[0].signal_secs);
+    }
+
+    #[test]
+    fn live_audio_matches_the_recording_and_ends() {
+        let x = scene(3.0, &[(100e3, 1000.0, 0.5, 2.0)]);
+        let mut s = Scanner::with_params(
+            ScannerConfig::default(),
+            params(),
+            0.0,
+            SystemTime::UNIX_EPOCH,
+            &[slot(100e3)],
+        );
+        s.set_live(true);
+        let (mut out, mut live) = (Vec::new(), Vec::new());
+        // When each live sample arrived vs when the recording got it.
+        let (mut live_at, mut rec_at) = (Vec::new(), Vec::new());
+        for (k, c) in x.chunks(20_000).enumerate() {
+            s.push(c, &mut out);
+            s.take_live(&mut live);
+            for o in out.drain(..) {
+                if let Output::Audio { samples, .. } = o {
+                    rec_at.extend(std::iter::repeat_n(k, samples.len()));
+                }
+            }
+            for l in &live {
+                if let LiveAudio::Audio { samples, .. } = l {
+                    live_at.extend(std::iter::repeat_n(k, samples.len()));
+                }
+            }
+            if k == 0 {
+                assert!(live.is_empty());
+            }
+            live.retain(|l| !matches!(l, LiveAudio::Audio { .. }));
+        }
+        s.finish(&mut out);
+        s.take_live(&mut live);
+        assert!(matches!(live[0], LiveAudio::Start { freq, .. } if freq == 100e3));
+        assert!(matches!(live.last(), Some(LiveAudio::End { .. })));
+        // Live audio arrives well before the recording's held-back copy.
+        let i = rec_at.len() / 2;
+        assert!(
+            live_at[i] < rec_at[i],
+            "live {} vs recorded {}",
+            live_at[i],
+            rec_at[i]
+        );
+        // Off: nothing more, and no cost.
+        s.set_live(false);
+        let mut more = Vec::new();
+        s.push(&x[..20_000], &mut out);
+        s.take_live(&mut more);
+        assert!(more.is_empty());
     }
 
     #[test]

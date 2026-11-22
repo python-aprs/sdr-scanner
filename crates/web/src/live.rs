@@ -98,7 +98,7 @@ pub fn encode_spectrum(s: &Spectrum) -> Vec<u8> {
 /// Refuse a WebSocket opened by a page on another site. Browsers send
 /// cookies with cross-site WebSocket handshakes unless SameSite stops them,
 /// so this is a second lock on the same door.
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         // Not a browser (scripts, tests): nothing to check.
         return true;

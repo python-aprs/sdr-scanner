@@ -225,6 +225,133 @@
     $('#brand-sub').textContent = st.profile || '';
   }
 
+  // ---------- live listening ----------
+  // Opus over /api/v1/audio, decoded with WebCodecs and scheduled on a Web
+  // Audio clock with a short jitter buffer. See crates/web/src/audio.rs.
+  const listen = {
+    supported: typeof AudioDecoder !== 'undefined' && typeof AudioContext !== 'undefined',
+    mode: 'off',            // off | follow | all | freqs
+    freqs: new Set(),       // Hz, for mode "freqs"
+    ws: null,
+    ctx: null,
+    master: null,
+    volume: 0.8,
+    streams: new Map(),     // id -> {freq, decoder, next}
+    retry: 1000,
+    listeners: new Set(),   // fn() on any change
+
+    set(mode) {
+      this.mode = mode;
+      if (mode !== 'off') {
+        if (!this.ctx) {
+          this.ctx = new AudioContext();
+          this.master = this.ctx.createGain();
+          this.master.gain.value = this.volume;
+          this.master.connect(this.ctx.destination);
+        }
+        this.ctx.resume();
+        this.connect();
+      }
+      this.send();
+      this.changed();
+    },
+    toggleFreq(hz) {
+      if (this.freqs.has(hz)) this.freqs.delete(hz); else this.freqs.add(hz);
+      this.set(this.freqs.size ? 'freqs' : 'off');
+    },
+    setVolume(v) { this.volume = v; if (this.master) this.master.gain.value = v; },
+    send() {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'listen', mode: this.mode, freqs: [...this.freqs] }));
+      }
+    },
+    connect() {
+      if (this.ws) return;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/api/v1/audio`);
+      ws.binaryType = 'arraybuffer';
+      this.ws = ws;
+      ws.onopen = () => { this.retry = 1000; this.send(); };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+          if (m.type === 'start') this.start(m);
+          else if (m.type === 'end') this.end(m.id);
+        } else {
+          const dv = new DataView(ev.data);
+          const st = this.streams.get(dv.getUint32(4, true));
+          if (!st || st.decoder.state !== 'configured') return;
+          const seq = dv.getUint32(8, true);
+          st.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: seq * 40000, data: new Uint8Array(ev.data, 12) }));
+        }
+      };
+      ws.onclose = () => {
+        this.ws = null;
+        for (const id of [...this.streams.keys()]) this.end(id);
+        if (this.mode !== 'off') {
+          setTimeout(() => { if (this.mode !== 'off') this.connect(); }, this.retry);
+          this.retry = Math.min(this.retry * 2, 30000);
+        }
+      };
+    },
+    start(m) {
+      const st = { freq: m.freq_hz, next: 0, decoder: null };
+      st.decoder = new AudioDecoder({
+        output: (data) => this.play(st, data),
+        error: () => {},
+      });
+      st.decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+      this.streams.set(m.id, st);
+      this.changed();
+    },
+    end(id) {
+      const st = this.streams.get(id);
+      if (!st) return;
+      this.streams.delete(id);
+      st.decoder.flush().catch(() => {}).finally(() => { try { st.decoder.close(); } catch (_) { /* closed */ } });
+      this.changed();
+    },
+    play(st, data) {
+      const n = data.numberOfFrames;
+      const buf = this.ctx.createBuffer(1, n, data.sampleRate);
+      data.copyTo(buf.getChannelData(0), { planeIndex: 0, format: 'f32-planar' });
+      data.close();
+      const now = this.ctx.currentTime;
+      // Late (start, or a network hiccup): restart a quarter second ahead.
+      if (st.next < now + 0.02) st.next = now + 0.25;
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(this.master);
+      src.start(st.next);
+      st.next += buf.duration;
+    },
+    playing() { return [...this.streams.values()].map((s) => s.freq); },
+    changed() { for (const fn of this.listeners) fn(); },
+  };
+
+  function listenControls() {
+    const wrap = h('div', { class: 'controls listen' });
+    function render() {
+      if (!canAudio()) { wrap.replaceChildren(h('span', { class: 'muted', title: 'Live audio is private on this scanner' }, 'Listening: log in')); return; }
+      if (!listen.supported) { wrap.replaceChildren(h('span', { class: 'muted' }, 'This browser can’t play live audio')); return; }
+      const titles = { off: 'Not listening', follow: 'One transmission at a time, priority channels first', all: 'Everything on the air, mixed' };
+      const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Listen' },
+        [['off', 'Off'], ['follow', 'Follow'], ['all', 'All']].map(([m, t]) =>
+          h('button', { type: 'button', 'aria-pressed': String(listen.mode === m), title: titles[m],
+            onclick: () => { listen.freqs.clear(); listen.set(m); } }, t)));
+      const vol = h('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(listen.volume), 'aria-label': 'Volume', class: 'vol' });
+      vol.oninput = () => listen.setVolume(Number(vol.value));
+      const now = listen.playing();
+      wrap.replaceChildren(h('span', { class: 'k', 'aria-hidden': 'true' }, '\u{1F50A}'), seg, vol,
+        listen.mode === 'freqs' ? h('span', { class: 'muted' }, `${listen.freqs.size} selected`) : null,
+        now.length ? h('span', { class: 'now-playing mono' }, now.map((f) => MHZ(f, 4)).join(', ')) : null);
+    }
+    render();
+    listen.listeners.add(render);
+    wrap.dispose = () => listen.listeners.delete(render);
+    return wrap;
+  }
+
   // ---------- player ----------
   const player = {
     list: [], index: -1,
@@ -316,6 +443,7 @@
     const scope = h('div', { class: 'scope' }, spec, fall, tip, empty);
 
     const activeList = h('ul', { class: 'active-list' });
+    const listenCtl = listenControls();
     const recentBody = h('div');
     const recentPanel = h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', {}, 'Latest recordings'), h('span', { class: 'spacer' }), h('a', { href: '#/recordings' }, 'All recordings')),
@@ -330,7 +458,7 @@
             h('div', { class: 'controls' }, h('label', {}, 'Range', rangeSel), h('label', {}, 'Rate', rateSel))),
           scope),
         h('div', { class: 'grid' },
-          h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', {}, 'On the air now')), activeList),
+          h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', {}, 'On the air now'), h('span', { class: 'spacer' }), listenCtl), activeList),
           recentPanel)));
 
     // --- drawing ---
@@ -508,7 +636,13 @@
         // A slot's own frequency, or (for a retuned grid signal) where it is.
         const target = c && c.kind !== 'grid' ? c.freq_hz : a.freq_hz;
         return h('li', { class: isAdmin() ? 'with-action' : '' },
-          h('span', { class: 'f' }, MHZ(a.freq_hz, 4)),
+          h('span', { class: 'f' },
+            canAudio() && listen.supported ? h('button', {
+              type: 'button', class: `icon-btn hp${listen.freqs.has(target) ? ' on' : ''}${listen.playing().some((f) => Math.abs(f - a.freq_hz) < 3e3) ? ' live' : ''}`,
+              title: listen.freqs.has(target) ? 'Stop listening to this channel' : 'Listen to this channel',
+              'aria-label': 'Listen', onclick: () => listen.toggleFreq(target),
+            }, '\u{1F3A7}') : null,
+            MHZ(a.freq_hz, 4)),
           h('span', { class: 'n' }, c && c.name ? c.name : (c ? kindLabel[c.kind] : '')),
           h('span', { class: 't' }, `${fmtDb(a.snr_db)} · ${fmtSecs(a.secs)}`),
           isAdmin() ? confirmButton('Lock out', 'Sure?', () => editChannel(target, { locked_out: true }), 'mini danger lock-btn') : null,
@@ -552,7 +686,9 @@
     const ro = new ResizeObserver(() => drawSpectrum());
     ro.observe(spec);
     rangeSel.onchange = () => drawSpectrum();
-    return () => { live.listeners.delete(listener); ro.disconnect(); };
+    const relisten = () => { if (state.status) onStatusView(state.status); };
+    listen.listeners.add(relisten);
+    return () => { live.listeners.delete(listener); listen.listeners.delete(relisten); listenCtl.dispose(); ro.disconnect(); };
   }
 
   /** 256-entry colour map for the waterfall: deep blue, teal, green, yellow, white. */

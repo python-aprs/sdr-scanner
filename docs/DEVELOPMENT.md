@@ -136,6 +136,19 @@ socket checks the same login as the API, and it refuses pages from other
 sites (`Origin` must match `Host`). A reverse proxy must therefore pass the
 original `Host` header and forward WebSocket upgrades.
 
+**Live listening.** The Live page's speaker controls play what is on the
+air: **Follow** plays one transmission at a time, priority channels first,
+like a hardware scanner. **All** mixes everything that is open. The
+headphone button on a row listens to just that channel (pick several to mix
+them). The audio is Opus at about 12 kb/s in 40 ms frames, sent over
+`/api/v1/audio` (format in `crates/web/src/audio.rs`) and decoded by the
+browser's WebCodecs. Squelched channels send nothing. The scanner encodes
+only while someone is listening, and it uses a tap that doesn't wait for
+the recordings' squelch-tail hold-back, so audio arrives about a quarter
+second after the air. Listening needs the same permission as recording
+audio (`--public-audio`, or a login). Building needs CMake, because libopus
+is compiled from source (`brew install cmake` or `apt install cmake`).
+
 Every response carries a strict Content Security Policy: same-origin
 scripts, styles and connections only, no inline script, and no framing.
 Static files are revalidated with ETags, so repeat visits cost a 304.
