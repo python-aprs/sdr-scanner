@@ -9,7 +9,7 @@ use crate::channelizer::{Analyzer, BankParams, Block, Extractor, FilterBank};
 use crate::clock::SampleClock;
 use crate::config::{Mode, Slot, SlotOrigin};
 use crate::detector::{Detector, DetectorParams, Event, SlotState};
-use crate::dsp::{Deemphasis, FmDiscriminator, HighPass, Resampler};
+use crate::dsp::{Agc, Deemphasis, FmDiscriminator, HighPass, Resampler, soft_limit};
 use num_complex::Complex32;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -25,12 +25,15 @@ pub struct ScannerConfig {
     /// 6 dB/octave pre-emphasis of NBFM transmitters.
     pub deemphasis_tau: f64,
     /// Transmissions shorter than this (signal time, without pre-roll or
-    /// tail) are dropped.
+    /// tail), or with less unmuted audio than this, are dropped.
     pub min_len: f64,
     /// Audio kept after the signal ends (squelch tail).
     pub tail: f64,
-    /// Audio level for full deviation (1.0 = full scale).
+    /// Audio level for full deviation (1.0 = full scale) when `agc` is off.
     pub audio_gain: f32,
+    /// Level recorded audio automatically (see [`Agc`]) instead of using
+    /// the fixed `audio_gain`.
+    pub agc: bool,
     /// High-pass corner for removing CTCSS tones; 0 disables.
     pub highpass_hz: f64,
     /// Lowest channel IQ rate.
@@ -52,6 +55,7 @@ impl Default for ScannerConfig {
             min_len: 0.3,
             tail: 0.2,
             audio_gain: 0.5,
+            agc: true,
             highpass_hz: 300.0,
             min_channel_rate: 25_000.0,
             parallel: true,
@@ -96,6 +100,10 @@ pub struct ScannerStats {
     pub opened: u64,
     pub recorded: u64,
     pub discarded_short: u64,
+    /// Transmissions dropped because their audio stayed muted: the slot
+    /// read just over the close threshold, but never steadily enough to
+    /// unmute (noise, not a signal).
+    pub discarded_silent: u64,
     pub not_recorded: u64,
     /// Grid detections that retuned onto a signal already being recorded.
     pub duplicates: u64,
@@ -113,6 +121,11 @@ struct Chain {
     resampler: Resampler,
     hp: Option<HighPass>,
     gain: f32,
+    agc: Option<Agc>,
+    /// Discriminator samples released unmuted so far.
+    played: u64,
+    /// Discriminator sample rate (the channel IQ rate).
+    rate: f64,
     /// Audio samples still to drop for the resampler's group delay.
     skip: usize,
     /// Audio not yet emitted.
@@ -181,6 +194,9 @@ impl Chain {
     /// Gate one block's discriminator output (in `demod`) and run it
     /// through the audio filters into `pending`.
     fn release(&mut self, play: bool) {
+        if play {
+            self.played += self.demod.len() as u64;
+        }
         let target = if play { 1.0 } else { 0.0 };
         let step = self.ramp_step;
         for v in &mut self.demod {
@@ -205,9 +221,18 @@ impl Chain {
         if let Some(h) = &mut self.hp {
             h.process(new);
         }
-        for v in new {
-            *v = (*v * self.gain).clamp(-1.0, 1.0);
+        if let Some(agc) = &mut self.agc {
+            agc.process(new, play);
+        } else {
+            for v in new {
+                *v = soft_limit(*v * self.gain);
+            }
         }
+    }
+
+    /// Seconds of audio released unmuted.
+    fn played_secs(&self) -> f64 {
+        self.played as f64 / self.rate
     }
 
     /// End of transmission: release the held block, muted.
@@ -354,8 +379,9 @@ impl Scanner {
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         self.detector.update(&block, &mut events);
+        // Per slot, the SNR that gates its audio (see Detector::squelch_db).
         let snrs: Arc<[f32]> = (0..self.detector.slots().len())
-            .map(|i| self.detector.snr_db(i))
+            .map(|i| self.detector.squelch_db(i))
             .collect();
         self.history.push_back((block.clone(), snrs.clone()));
         while self.history.len() > self.history_len {
@@ -395,7 +421,9 @@ impl Scanner {
             if !c.confirmed {
                 // Only time with the signal present counts, not hang time.
                 if let SlotState::Active { start } = self.detector.state(c.slot) {
-                    if block.index + 1 >= start + preroll + min_blocks {
+                    if block.index + 1 >= start + preroll + min_blocks
+                        && c.played_secs() >= self.cfg.min_len
+                    {
                         c.confirmed = true;
                         out.push(Output::Open(Self::tx_start(
                             &self.clock,
@@ -495,6 +523,9 @@ impl Scanner {
                     hp: (self.cfg.highpass_hz > 0.0)
                         .then(|| HighPass::new(audio_rate, self.cfg.highpass_hz)),
                     gain: self.cfg.audio_gain,
+                    agc: self.cfg.agc.then(|| Agc::new(audio_rate)),
+                    played: 0,
+                    rate,
                     skip,
                     pending: Vec::new(),
                     emitted: 0,
@@ -537,6 +568,10 @@ impl Scanner {
                 let signal_secs = end_sample.saturating_sub(signal_start) as f64 / p.sample_rate;
                 if !c.confirmed && signal_secs < self.cfg.min_len {
                     self.stats.discarded_short += 1;
+                    return;
+                }
+                if !c.confirmed && c.played_secs() < self.cfg.min_len {
+                    self.stats.discarded_silent += 1;
                     return;
                 }
                 if !c.confirmed {
@@ -599,6 +634,11 @@ mod tests {
 
     /// Clean FM tone transmissions plus a little deterministic noise.
     fn scene(secs: f64, sigs: &[(f64, f64, f64, f64)]) -> Vec<Complex32> {
+        scene_dev(secs, sigs, 3000.0)
+    }
+
+    /// Like `scene`, with the tone at `dev` Hz deviation.
+    fn scene_dev(secs: f64, sigs: &[(f64, f64, f64, f64)], dev: f64) -> Vec<Complex32> {
         let fs = params().sample_rate;
         let n = (secs * fs) as usize;
         let mut seed = 0x1234_5678_9abc_def0u64;
@@ -617,7 +657,7 @@ mod tests {
             for (i, v) in x.iter_mut().enumerate() {
                 let t = i as f64 / fs;
                 if t >= on && t < offt {
-                    let f = off + 3000.0 * (2.0 * PI * tone * t).sin();
+                    let f = off + dev * (2.0 * PI * tone * t).sin();
                     ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
                     *v += Complex32::from_polar(0.1, ph as f32);
                 }
@@ -681,9 +721,10 @@ mod tests {
             let zc = mid.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count() as f64;
             let f = zc / ((b - a) as f64 / 8000.0);
             assert!((f - tone).abs() < 10.0, "tone {f}");
-            // Level: 3 kHz of 5 kHz deviation, de-emphasised, gain 0.5.
+            // Level: the AGC puts a steady tone's peaks at its target.
             let rms = (mid.iter().map(|v| v * v).sum::<f32>() / mid.len() as f32).sqrt();
-            assert!(rms > 0.05 && rms < 0.3, "rms {rms}");
+            let want = Agc::TARGET * std::f32::consts::FRAC_1_SQRT_2;
+            assert!((rms / want - 1.0).abs() < 0.1, "rms {rms}");
             let close = out
                 .iter()
                 .find_map(|o| match o {
@@ -693,6 +734,36 @@ mod tests {
                 .unwrap();
             assert!((close.signal_secs - (off - on)).abs() < 0.08, "{close:?}");
         }
+    }
+
+    #[test]
+    fn light_and_full_deviation_record_at_the_same_level() {
+        // A handheld's voice can deviate ~300 Hz where a repeater's reaches
+        // 3 kHz: 20 dB apart with a fixed gain, level with the AGC.
+        let level = |dev: f64, agc: bool| {
+            let x = scene_dev(3.0, &[(100e3, 1000.0, 0.5, 2.5)], dev);
+            let cfg = ScannerConfig {
+                agc,
+                ..Default::default()
+            };
+            let (out, _) = collect(&x, &[slot(100e3)], cfg);
+            let Some(Output::Open(s)) = out.iter().find(|o| matches!(o, Output::Open(_))) else {
+                panic!("no transmission")
+            };
+            let audio = audio_of(&out, s.id);
+            let start = s.start_sample as f64 / params().sample_rate;
+            let mid = &audio[((1.0 - start) * 8000.0) as usize..((2.3 - start) * 8000.0) as usize];
+            let rms = (mid.iter().map(|v| v * v).sum::<f32>() / mid.len() as f32).sqrt();
+            20.0 * rms.log10()
+        };
+        let (light, full) = (level(300.0, false), level(3000.0, false));
+        assert!(
+            (full - light - 20.0).abs() < 1.0,
+            "fixed: {light} vs {full}"
+        );
+        let (light, full) = (level(300.0, true), level(3000.0, true));
+        assert!((full - light).abs() < 1.0, "agc: {light} vs {full}");
+        assert!(light > -12.0, "agc level {light} dBFS");
     }
 
     #[test]
