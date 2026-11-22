@@ -265,3 +265,6 @@ dl.kv dd { margin: 0; }
 .hp:hover, .hp.on { opacity: 1; border-color: var(--line); }
 .hp.on { background: var(--active); border-color: var(--active-edge); }
 .hp.live { box-shadow: 0 0 0 2px var(--accent); opacity: 1; }
+
+/* Storage use on the admin page. */
+meter.disk { display: block; width: 100%; max-width: 20rem; height: 0.6rem; margin-top: 0.3rem; }

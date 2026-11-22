@@ -3,6 +3,7 @@
 
 use crate::index::{Index, IndexError, NewRow};
 use crate::ogg::OggOpusWriter;
+use crate::retention::{DiskUsage, Policy, Retention};
 use crate::wav::WavWriter;
 use scanner_core::clock::compact_utc;
 use scanner_core::scanner::{Output, TxStart};
@@ -49,6 +50,7 @@ pub struct Recorder {
     open: HashMap<u64, Open>,
     stats: RecorderStats,
     opus: bool,
+    retention: Option<Retention>,
 }
 
 /// `146.5200_20261122T065403.123Z.wav` under `YYYY/MM/DD/`.
@@ -90,7 +92,25 @@ impl Recorder {
             open: HashMap::new(),
             stats: RecorderStats::default(),
             opus: true,
+            retention: None,
         })
+    }
+
+    /// Keep the recordings within `policy`, deleting the oldest. Runs a
+    /// pass now, then after each recording closes.
+    pub fn with_retention(mut self, policy: Policy) -> Result<Self, RecorderError> {
+        let mut r = Retention::new(policy, &self.index)?;
+        let n = r.run(&self.root, &self.index, true)?;
+        if n > 0 {
+            eprintln!("retention: deleted the {n} oldest recordings");
+        }
+        self.retention = Some(r);
+        Ok(self)
+    }
+
+    /// Disk usage for the API, when retention is on.
+    pub fn disk_usage(&self) -> Option<std::sync::Arc<DiskUsage>> {
+        self.retention.as_ref().map(Retention::usage)
     }
 
     /// Also write an Opus copy of each recording for the web UI (on by
@@ -187,14 +207,23 @@ impl Recorder {
                         &o.rel,
                         bytes,
                     )?;
+                    let mut opus_bytes = 0;
                     if let Some((orel, w)) = o.opus {
                         match w.finish() {
                             Ok((_, n)) => {
                                 self.index.set_opus(o.row, &orel, n)?;
                                 self.stats.opus_files += 1;
                                 self.stats.opus_bytes += n;
+                                opus_bytes = n;
                             }
                             Err(e) => self.opus_failed(&orel, e),
+                        }
+                    }
+                    if let Some(r) = &mut self.retention {
+                        r.added(bytes + opus_bytes);
+                        // A failed pass must not stop the recording.
+                        if let Err(e) = r.run(&self.root, &self.index, false) {
+                            eprintln!("retention: {e}");
                         }
                     }
                     self.stats.files += 1;

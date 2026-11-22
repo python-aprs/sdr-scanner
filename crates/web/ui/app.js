@@ -41,6 +41,13 @@
     return `${mm}m ${Math.floor(s % 60)}s`;
   };
   const fmtCount = (n) => new Intl.NumberFormat().format(n);
+  const fmtBytes = (n) => {
+    if (n === null || n === undefined) return '–';
+    const units = ['B', 'kB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
+    return `${n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)} ${units[i]}`;
+  };
   const fmtDb = (v) => `${Math.round(v) || 0} dB`;
   const timeFmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const dayFmt = new Intl.DateTimeFormat(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
@@ -943,6 +950,35 @@
           h('dt', {}, 'Recording audio'), h('dd', {}, yes(p.audio))),
         h('p', { class: 'muted' }, 'Set when starting the scanner with ', h('code', {}, '--public-recordings'), ', ', h('code', {}, '--public-audio'), ' and ', h('code', {}, '--private-live'), '.')));
 
+    // Storage: what the recordings use and what retention has deleted.
+    const storageBody = h('div', { class: 'panel-body' }, h('p', { class: 'muted' }, 'Loading…'));
+    const storage = h('section', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', {}, 'Storage')), storageBody);
+    api('/storage').then((st) => {
+      const r = st.retention;
+      const rows = [];
+      if (r && r.budget_bytes) {
+        rows.push(h('dt', {}, 'Recordings'), h('dd', {},
+          `${fmtBytes(r.used_bytes)} of ${fmtBytes(r.budget_bytes)}`,
+          h('meter', { class: 'disk', min: 0, max: r.budget_bytes, high: 0.95 * r.budget_bytes, low: 0.85 * r.budget_bytes, optimum: 0, value: r.used_bytes })));
+      } else {
+        rows.push(h('dt', {}, 'Recordings'), h('dd', {}, `${fmtBytes(st.used_bytes)}${r ? ', no budget' : ''}`));
+      }
+      if (r && r.free_bytes !== null) {
+        rows.push(h('dt', {}, 'Free on disk'), h('dd', {}, fmtBytes(r.free_bytes),
+          r.min_free_bytes ? h('span', { class: 'muted' }, ` (keeps ${fmtBytes(r.min_free_bytes)})`) : null));
+      }
+      if (st.oldest_ns) {
+        const t = nsDate(st.oldest_ns);
+        rows.push(h('dt', {}, 'Oldest recording'), h('dd', {}, `${dayLabel(t)} ${timeFmt.format(t)}`));
+      }
+      if (r) rows.push(h('dt', {}, 'Deleted to make room'), h('dd', {}, r.expired ? `${fmtCount(r.expired)} (${fmtBytes(r.expired_bytes)}) since the scanner started` : 'None since the scanner started'));
+      storageBody.replaceChildren(h('dl', { class: 'kv' }, rows),
+        h('p', { class: 'muted' }, r
+          ? ['Past 95 % of the budget the oldest recordings are deleted until under 85 %. Set with ', h('code', {}, '--disk-budget-gb'), ' and ', h('code', {}, '--min-free-gb'), '.']
+          : 'Retention is off: nothing is deleted.'));
+    }).catch((ex) => storageBody.replaceChildren(h('p', { class: 'error' }, ex.message)));
+
     // Password.
     const cur = h('input', { type: 'password', autocomplete: 'current-password', required: true });
     const nw = h('input', { type: 'password', autocomplete: 'new-password', required: true, minlength: 10 });
@@ -1015,7 +1051,7 @@
     }
     loadTokens();
 
-    root.append(h('div', { class: 'grid two-col' }, account, visitors, password, tokens));
+    root.append(h('div', { class: 'grid two-col' }, account, visitors, storage, password, tokens));
     return null;
   }
 

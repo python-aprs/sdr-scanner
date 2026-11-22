@@ -126,6 +126,7 @@ pub struct ServeOptions<'a> {
     pub out: &'a Path,
     /// Also write Opus copies for the web UI.
     pub opus: bool,
+    pub retention: scanner_store::retention::Policy,
     pub status_every: Duration,
 }
 
@@ -326,7 +327,10 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         bail!("no slots of the profile fall inside the capture");
     }
 
-    let recorder = Recorder::new(o.out)?.with_opus(o.opus);
+    let recorder = Recorder::new(o.out)?
+        .with_opus(o.opus)
+        .with_retention(o.retention)?;
+    let disk_usage = recorder.disk_usage();
     let (tx, writer) = recorder.spawn(256);
 
     // Lockout and priority edits made in the web UI, on top of the config.
@@ -395,6 +399,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 .context("starting the live audio thread")?,
         );
         state.audio = Some(audio_hub.clone());
+        state.storage = disk_usage.clone();
         scanner_web::spawn(addr, state)
             .with_context(|| format!("starting the web API on {addr}"))?;
         eprintln!("web interface on http://{addr}/");

@@ -159,7 +159,18 @@ transmission (via `.wav.part` and a rename) and one row per transmission in
 `out/index.sqlite`. Next to each WAV goes an Ogg Opus copy (`.opus`, mono,
 16 kb/s, 40 ms frames) for the web player: about an eighth of the size, and
 it decodes to exactly the WAV's length. `--no-opus` skips it; audio rates
-Opus can't take (anything but 8, 12, 16, 24 or 48 kHz) get no copy. `--json` prints a machine-readable summary that
+Opus can't take (anything but 8, 12, 16, 24 or 48 kHz) get no copy.
+
+Recordings are kept within a disk budget (`--disk-budget-gb`, default 8;
+0 for none). Past 95 % of it, the recorder deletes the oldest recordings
+(WAV, Opus copy and any `.part` a crash left) until usage is under 85 %, and
+marks their index rows `expired`, so the log of what was heard outlives the
+audio. It also deletes to keep `--min-free-gb` (default 1) free on the
+filesystem. Usage is the sum the index holds for finished recordings, so a
+pass never walks the folder; files added by hand and recordings still open
+don't count. A pass runs at startup and after each recording closes. The
+Admin page and `GET /api/v1/storage` show usage, free space and what was
+deleted. `--json` prints a machine-readable summary that
 `synth score` reads.
 
 How the pipeline fits together (PLAN.md 3.2–3.4):

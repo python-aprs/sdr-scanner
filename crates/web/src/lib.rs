@@ -9,6 +9,7 @@
 //! | `GET /api/v1/recordings/{id}` | same as the list |
 //! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin: the Opus copy, or the WAV with `?format=wav` or when there's no copy |
 //! | `GET /api/v1/channels` | same as status |
+//! | `GET /api/v1/storage` | admin: disk usage, budget, free space and what retention deleted |
 //! | `PATCH /api/v1/channels/{freq_hz}` | admin (+ CSRF): `{"locked_out": bool, "priority": bool}`, either or both |
 //! | `DELETE /api/v1/channels/{freq_hz}/override` | admin (+ CSRF): back to the config file |
 //! | `GET /api/v1/live` (WebSocket) | same as status; see [`live`] |
@@ -142,6 +143,8 @@ pub struct AppState {
     pub control: Option<ControlSender>,
     /// Live listening; `None` when the scanner offers none.
     pub audio: Option<Arc<audio::AudioHub>>,
+    /// Disk budget and usage; `None` when retention is off.
+    pub storage: Option<Arc<scanner_store::retention::DiskUsage>>,
 }
 
 /// A command for the running scanner.
@@ -175,6 +178,7 @@ impl AppState {
             settings: None,
             control: None,
             audio: None,
+            storage: None,
         }
     }
 }
@@ -367,6 +371,7 @@ pub fn router(state: AppState) -> Router {
     }
     r.route("/api/v1/status", get(status))
         .route("/api/v1/channels", get(channels))
+        .route("/api/v1/storage", get(storage))
         .route(
             "/api/v1/channels/{freq_hz}",
             axum::routing::patch(edit_channel),
@@ -935,6 +940,28 @@ async fn change_password(
     Ok(resp)
 }
 
+/// Disk usage of the recordings, and the retention budget when there is one.
+async fn storage(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.caller(&headers).await?.require(false)?;
+    let retention = s.storage.as_ref().map(|u| u.snapshot());
+    let (used, oldest) = blocking(move || {
+        let ix = s.index()?;
+        Ok((
+            ix.usage_bytes().map_err(db_err)?,
+            ix.oldest_complete_ns().map_err(db_err)?,
+        ))
+    })
+    .await?;
+    Ok(Json(serde_json::json!({
+        "used_bytes": used,
+        "oldest_ns": oldest,
+        "retention": retention,
+    })))
+}
+
 async fn list_tokens(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -1219,6 +1246,7 @@ mod tests {
             ("/api/v1/recordings/{id}/audio", 3),
             ("/api/v1/audio", 3),
             ("/api/v1/auth/tokens", 4),
+            ("/api/v1/storage", 4),
         ];
         #[derive(Clone, Copy, Debug)]
         enum Who {
@@ -1686,6 +1714,26 @@ mod tests {
         )
         .await;
         assert_eq!(r.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    #[tokio::test]
+    async fn storage_reports_usage_and_the_budget() {
+        let (_dir, mut state, _, token) = setup(Public::default());
+        let (st, body) = get(&state, "/api/v1/storage", Some(&token), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["used_bytes"], 14);
+        assert_eq!(v["oldest_ns"], 1_795_330_443_000_000_000i64);
+        assert!(v["retention"].is_null());
+
+        let ix = Index::open(&state.recordings.join("index.sqlite")).unwrap();
+        let r = scanner_store::retention::Retention::new(Default::default(), &ix).unwrap();
+        state.storage = Some(r.usage());
+        let (_, body) = get(&state, "/api/v1/storage", Some(&token), None).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["retention"]["budget_bytes"], 8_000_000_000u64);
+        assert_eq!(v["retention"]["used_bytes"], 14);
+        assert_eq!(v["retention"]["expired"], 0);
     }
 
     #[tokio::test]

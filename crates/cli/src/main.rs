@@ -215,6 +215,15 @@ struct Tuning {
     /// Skip the Opus copy of each recording (the web UI then plays the WAV).
     #[arg(long)]
     no_opus: bool,
+    /// Disk budget for the recordings in GB: past 95 % of it the oldest are
+    /// deleted until under 85 % (their index rows stay, marked expired).
+    /// 0 means no budget.
+    #[arg(long, default_value_t = 8.0)]
+    disk_budget_gb: f64,
+    /// Also delete the oldest recordings to keep this much free (GB) on
+    /// the filesystem; 0 turns it off.
+    #[arg(long, default_value_t = 1.0)]
+    min_free_gb: f64,
 }
 
 impl Tuning {
@@ -240,6 +249,15 @@ impl Tuning {
             eprintln!("warning: {w}");
         }
         Ok((profile, plan))
+    }
+
+    fn retention(&self) -> scanner_store::retention::Policy {
+        let gb = |v: f64| (v.max(0.0) * scanner_store::retention::GB as f64) as u64;
+        scanner_store::retention::Policy {
+            budget_bytes: gb(self.disk_budget_gb),
+            min_free_bytes: gb(self.min_free_gb),
+            ..Default::default()
+        }
     }
 
     fn scanner_config(
@@ -338,6 +356,7 @@ fn main() -> Result<()> {
                 span: (profile.span.start.0, profile.span.stop.0),
                 out: &a.tuning.out,
                 opus: !a.tuning.no_opus,
+                retention: a.tuning.retention(),
                 status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
             })
         }
@@ -547,7 +566,9 @@ fn run(a: RunArgs) -> Result<()> {
         );
     }
 
-    let recorder = Recorder::new(&a.tuning.out)?.with_opus(!a.tuning.no_opus);
+    let recorder = Recorder::new(&a.tuning.out)?
+        .with_opus(!a.tuning.no_opus)
+        .with_retention(a.tuning.retention())?;
     let (tx, writer) = recorder.spawn(64);
 
     // Reader thread: file I/O and sample conversion overlap with DSP.
