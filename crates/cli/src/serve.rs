@@ -114,7 +114,10 @@ pub struct ServeOptions<'a> {
     /// Serve the HTTP API here.
     pub http: Option<std::net::SocketAddr>,
     pub public: scanner_web::Public,
-    pub admin_token: Option<String>,
+    /// Accounts database (admins, sessions, API tokens).
+    pub auth_db: PathBuf,
+    /// Leave `Secure` off the session cookie (plain HTTP on a LAN).
+    pub insecure_cookies: bool,
     pub scanner: ScannerConfig,
     pub plan: &'a [scanner_core::config::Slot],
     pub out: &'a Path,
@@ -241,19 +244,24 @@ pub fn serve(o: ServeOptions) -> Result<()> {
 
     let status: scanner_web::StatusHandle = Default::default();
     if let Some(addr) = o.http {
-        if o.admin_token.is_none() {
-            eprintln!("note: no SCANNER_ADMIN_TOKEN set, so admin-only routes are closed");
+        let auth = scanner_web::auth::AuthStore::open(&o.auth_db)
+            .with_context(|| format!("opening {}", o.auth_db.display()))?;
+        if !auth.has_admins().unwrap_or(false) {
+            eprintln!(
+                "note: no admin accounts yet, so admin-only routes are closed; create one with \
+                 `scanner admin create <name> --db {}`",
+                o.auth_db.display()
+            );
         }
-        scanner_web::spawn(
-            addr,
-            scanner_web::AppState {
-                status: status.clone(),
-                recordings: o.out.to_owned(),
-                public: o.public,
-                admin_token: o.admin_token.as_deref().map(Into::into),
-            },
-        )
-        .with_context(|| format!("starting the web API on {addr}"))?;
+        let mut state = scanner_web::AppState::new(
+            status.clone(),
+            o.out.to_owned(),
+            o.public,
+            Some(Arc::new(auth)),
+        );
+        state.secure_cookies = !o.insecure_cookies;
+        scanner_web::spawn(addr, state)
+            .with_context(|| format!("starting the web API on {addr}"))?;
         eprintln!("web API on http://{addr}/api/v1/status");
     }
     let mut next_publish = Instant::now();

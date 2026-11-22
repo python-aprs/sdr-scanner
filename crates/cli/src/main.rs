@@ -18,6 +18,7 @@ use scanner_core::units::Hz;
 use scanner_sources::{FileSource, Source};
 use std::path::{Path, PathBuf};
 
+mod admin;
 mod serve;
 
 #[derive(Parser)]
@@ -52,6 +53,8 @@ enum Cmd {
     Run(RunArgs),
     /// List SDRplay radios the API can see.
     Devices,
+    /// Manage admin accounts, API tokens and sessions for the web API.
+    Admin(admin::AdminArgs),
     /// Run continuously from a source, recording until Ctrl-C.
     Serve(ServeArgs),
     /// Work with band-profile config files.
@@ -89,7 +92,7 @@ struct ServeArgs {
     #[arg(long, default_value_t = 10.0)]
     status_every: f64,
     /// Serve the HTTP API on this address ("off" to disable). Admin routes
-    /// need the token in the SCANNER_ADMIN_TOKEN environment variable.
+    /// need a login or an API token (see `scanner admin`).
     #[arg(long, default_value = "127.0.0.1:8080")]
     http: String,
     /// Let anonymous visitors list recordings.
@@ -101,6 +104,13 @@ struct ServeArgs {
     /// Hide live status from anonymous visitors.
     #[arg(long)]
     private_live: bool,
+    /// Accounts database (default: auth.sqlite in --out).
+    #[arg(long)]
+    auth_db: Option<PathBuf>,
+    /// Leave `Secure` off the session cookie, for plain HTTP on a trusted
+    /// LAN. (Browsers treat localhost as secure, so local use doesn't need it.)
+    #[arg(long)]
+    insecure_cookies: bool,
 }
 
 /// Radio settings for `serve --source sdrplay`.
@@ -279,6 +289,7 @@ fn main() -> Result<()> {
         } => peaks(recording, fft, threshold, merge, json),
         Cmd::Run(args) => run(args),
         Cmd::Devices => devices(),
+        Cmd::Admin(a) => admin::run(a),
         Cmd::Serve(a) => {
             let (profile, plan) = a.tuning.load()?;
             let sdrplay = a.radio.sdrplay(&profile);
@@ -314,9 +325,11 @@ fn main() -> Result<()> {
                     recordings: a.public_recordings,
                     audio: a.public_audio,
                 },
-                admin_token: std::env::var("SCANNER_ADMIN_TOKEN")
-                    .ok()
-                    .filter(|t| t.len() >= 16),
+                auth_db: a
+                    .auth_db
+                    .clone()
+                    .unwrap_or_else(|| a.tuning.out.join("auth.sqlite")),
+                insecure_cookies: a.insecure_cookies,
                 scanner: a.tuning.scanner_config(&profile),
                 plan: &plan.slots,
                 out: &a.tuning.out,

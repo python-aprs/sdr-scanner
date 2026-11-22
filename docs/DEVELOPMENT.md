@@ -52,14 +52,46 @@ to disable), routes under `/api/v1` (see `crates/web/src/lib.rs`):
 `recordings` (search by `freq_min`/`freq_max` Hz, `since`/`until` Unix s,
 `min_secs`; page with `before_id`), `recordings/{id}` and
 `recordings/{id}/audio` (WAV, HTTP range requests). Anonymous visitors see
-live status only unless `--public-recordings` / `--public-audio`; admin is
-`Authorization: Bearer $SCANNER_ADMIN_TOKEN` (16+ characters) until sessions
-and argon2id logins land.
+live status only unless `--public-recordings` / `--public-audio`.
+
+### Admin accounts
+
+Admin access is a password login (browser session) or an API token (scripts).
+Accounts live in `auth.sqlite` (default: in `--out`; `--auth-db` to move it),
+created owner-readable only. There is no default account:
 
 ```sh
-SCANNER_ADMIN_TOKEN=$(openssl rand -hex 16) scanner serve --source loop:out/ci_smoke \
-    --config config/example-2m.toml --profile 2m-25k --out out/live
+scanner admin create masen                 # prompts for a password (10+ characters)
+scanner admin token create backup --expires-days 90   # prints scn_... once
+scanner admin list | token list | token revoke 3 | passwd masen | delete masen
+scanner admin logout                       # end every browser session
+scanner admin audit                        # logins, failures, changes
+```
+
+(`--db` points the commands at another `auth.sqlite`; they are safe to run
+while `serve` is up.)
+
+- `POST /api/v1/auth/login` `{"username","password"}` sets an `HttpOnly`,
+  `SameSite=Strict`, `Secure` session cookie and returns a `csrf_token`.
+  Requests that change something and are authenticated by the cookie must
+  send it back in `X-CSRF-Token`. Bearer tokens don't need it.
+- `GET /api/v1/auth/session` says who you are (and returns the CSRF token);
+  `POST /api/v1/auth/logout`; `POST /api/v1/auth/password`
+  `{"current","new"}` ends every other session of the account.
+- `GET/POST /api/v1/auth/tokens`, `DELETE /api/v1/auth/tokens/{id}`.
+- Passwords are argon2id hashes; session cookies and tokens are stored only
+  as SHA-256 hashes. Sessions end after 24 h unused or 7 days in total.
+  After 5 failed logins from one address or for one username, each further
+  failure doubles a lockout (up to 15 minutes; `429` with `Retry-After`).
+- Browsers send `Secure` cookies only over HTTPS or to localhost. Put the
+  scanner behind a TLS reverse proxy when it is reachable from outside;
+  `--insecure-cookies` is for plain HTTP on a trusted LAN.
+
+```sh
+scanner serve --source loop:out/ci_smoke --config config/example-2m.toml \
+    --profile 2m-25k --out out/live
 curl localhost:8080/api/v1/status
+curl -H "Authorization: Bearer scn_..." localhost:8080/api/v1/recordings
 ```
 
 `scanner run` writes `out/YYYY/MM/DD/146.5200_20261122T065403.123Z.wav` per
