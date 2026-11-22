@@ -13,7 +13,7 @@ crates/
   sources/   Source trait, SigMF FileSource; Airspy/SDRplay stubs (Phase 2)
   store/     WAV writer, SQLite transmission index, recorder thread
   cli/       the `scanner` binary
-  web/       placeholder for the web UI and API (Phase 3)
+  web/       HTTP API (axum): status, recordings search, audio; role guards
 tools/synth/ Python synthetic IQ generator + reference DSP
 config/      example band profiles
 ```
@@ -36,6 +36,30 @@ scanner peaks <recording> [--json]   # averaged spectrum peaks, RF frequencies
 scanner config check config/example-2m.toml [--profile 2m-25k] [--slots]
 scanner run <recording> --config config/rainier.toml --profile rainier-2m \
     --out out/ [--open-db 6 --close-db 3 --hang 1.5 --min-len 0.3] [--json]
+```
+
+`scanner serve --source loop:<recording> --config ... --profile ...` is the
+long-running mode: a radio thread pushes samples into a lock-free ring
+(`scanner_sources::ring`, drops counted and zero-filled so timestamps never
+slip), the DSP thread scans, and the recorder thread writes. A recording
+replayed at its real rate stands in for a radio until the Phase 2 backends
+land; Ctrl-C closes open transmissions and exits. It prints a status line
+(DSP load, ring fill, drops, active channels) every `--status-every` seconds.
+
+`serve` also starts the HTTP API (`--http 127.0.0.1:8080` by default, `off`
+to disable), routes under `/api/v1` (see `crates/web/src/lib.rs`):
+`status` (live snapshot: active channels, noise floor, DSP load, drops),
+`recordings` (search by `freq_min`/`freq_max` Hz, `since`/`until` Unix s,
+`min_secs`; page with `before_id`), `recordings/{id}` and
+`recordings/{id}/audio` (WAV, HTTP range requests). Anonymous visitors see
+live status only unless `--public-recordings` / `--public-audio`; admin is
+`Authorization: Bearer $SCANNER_ADMIN_TOKEN` (16+ characters) until sessions
+and argon2id logins land.
+
+```sh
+SCANNER_ADMIN_TOKEN=$(openssl rand -hex 16) scanner serve --source loop:out/ci_smoke \
+    --config config/example-2m.toml --profile 2m-25k --out out/live
+curl localhost:8080/api/v1/status
 ```
 
 `scanner run` writes `out/YYYY/MM/DD/146.5200_20261122T065403.123Z.wav` per

@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "scanner"
@@ -21,4 +22,6 @@ clap.workspace = true
 anyhow.workspace = true
 num-complex.workspace = true
 scanner-store.workspace = true
+scanner-web.workspace = true
 serde_json.workspace = true
+ctrlc.workspace = true

@@ -7,6 +7,7 @@
 //! so the driver callback never blocks (PLAN.md 3.4).
 
 pub mod file;
+pub mod ring;
 pub mod sigmf;
 
 #[cfg(feature = "airspy")]
@@ -15,6 +16,7 @@ pub mod airspy;
 pub mod sdrplay;
 
 pub use file::FileSource;
+pub use ring::{RingProducer, RingSource, ring};
 
 use num_complex::Complex32;
 use std::time::SystemTime;
@@ -49,7 +51,8 @@ pub enum SourceError {
 pub struct SourceStats {
     /// Samples delivered to the caller.
     pub samples_read: u64,
-    /// Samples lost to overruns (always 0 for files).
+    /// Samples lost to overruns and replaced by zeros in the delivered
+    /// stream (always 0 for files). Included in `samples_read`.
     pub samples_dropped: u64,
 }
 
@@ -58,7 +61,8 @@ pub trait Source: Send {
 
     /// Fill `out` with up to `out.len()` samples. Returns the number written;
     /// `Ok(0)` means the stream has ended. The index of `out[0]` in the stream
-    /// is `stats().samples_read + stats().samples_dropped` before the call.
+    /// is `stats().samples_read` before the call: spans lost to overruns are
+    /// delivered as zeros, so positions (and timestamps) never slip.
     fn read(&mut self, out: &mut [Complex32]) -> Result<usize, SourceError>;
 
     fn stats(&self) -> SourceStats;
