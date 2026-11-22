@@ -143,6 +143,10 @@ pub struct DeviceEvents {
     pub gap_samples: AtomicU64,
     /// Counter jumps too large or backwards to be a gap; tracking restarted.
     pub counter_jumps: AtomicU64,
+    /// Stream callbacks, samples they carried, and how many showed a gap.
+    pub callbacks: AtomicU64,
+    pub samples_received: AtomicU64,
+    pub gap_events: AtomicU64,
 }
 
 impl DeviceEvents {
@@ -180,7 +184,11 @@ impl DeviceEvents {
         }
         let gaps = self.gap_samples.load(Ordering::Relaxed);
         if gaps > 0 {
-            parts.push(format!("{gaps} samples lost in the API"));
+            parts.push(format!(
+                "{gaps} samples lost in the API ({} gaps in {} callbacks)",
+                self.gap_events.load(Ordering::Relaxed),
+                self.callbacks.load(Ordering::Relaxed)
+            ));
         }
         let jumps = self.counter_jumps.load(Ordering::Relaxed);
         if jumps > 0 {
@@ -244,9 +252,24 @@ pub struct StreamState {
     block_len: usize,
     gaps: GapTracker,
     events: std::sync::Arc<DeviceEvents>,
+    /// Diagnostics (SCANNER_SDRPLAY_DEBUG=N prints the first N callbacks
+    /// and the first N gaps with their counter values).
+    debug_left: u32,
+    debug_gaps_left: u32,
+    last: (u32, u32),
+    /// SCANNER_SDRPLAY_IGNORE_GAPS=1 counts counter gaps but does not
+    /// zero-fill them (to tell real loss from a miscounted counter).
+    fill_gaps: bool,
 }
 
 const SCALE: f32 = 1.0 / 32768.0;
+
+fn debug_count() -> u32 {
+    std::env::var("SCANNER_SDRPLAY_DEBUG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
 
 impl StreamState {
     pub fn new(
@@ -261,6 +284,10 @@ impl StreamState {
             block_len,
             gaps: GapTracker::new(sample_rate),
             events,
+            debug_left: debug_count(),
+            debug_gaps_left: debug_count(),
+            last: (0, 0),
+            fill_gaps: std::env::var("SCANNER_SDRPLAY_IGNORE_GAPS").map_or(true, |v| v != "1"),
         }
     }
 
@@ -270,14 +297,34 @@ impl StreamState {
         if reset {
             self.events.resets.fetch_add(1, Ordering::Relaxed);
         }
-        match self.gaps.observe(first, n as u32, reset) {
+        self.events.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.events
+            .samples_received
+            .fetch_add(n as u64, Ordering::Relaxed);
+        if self.debug_left > 0 {
+            self.debug_left -= 1;
+            eprintln!("sdrplay debug: callback first={first} n={n} reset={reset}");
+        }
+        let c = self.gaps.observe(first, n as u32, reset);
+        if self.debug_gaps_left > 0 && !matches!(c, Continuity::Contiguous) {
+            self.debug_gaps_left -= 1;
+            eprintln!(
+                "sdrplay debug: {c:?}: previous first={} n={}, this first={first} n={n} reset={reset}",
+                self.last.0, self.last.1
+            );
+        }
+        self.last = (first, n as u32);
+        match c {
             Continuity::Contiguous => {}
             Continuity::Gap(g) => {
-                self.flush();
-                self.producer.skip(g as u64);
+                self.events.gap_events.fetch_add(1, Ordering::Relaxed);
                 self.events
                     .gap_samples
                     .fetch_add(g as u64, Ordering::Relaxed);
+                if self.fill_gaps {
+                    self.flush();
+                    self.producer.skip(g as u64);
+                }
             }
             Continuity::Restart => {
                 if !reset {

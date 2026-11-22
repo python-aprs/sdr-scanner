@@ -323,8 +323,14 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 .collect();
             let radio_note = device_events
                 .as_ref()
-                .and_then(|e| e.summary())
-                .map(|s| format!(", radio: {s}"))
+                .map(|e| {
+                    let got = e.samples_received.load(Ordering::Relaxed) as f64;
+                    format!(
+                        ", radio: received {:.3} MS/s{}",
+                        got / wall / 1e6,
+                        e.summary().map(|s| format!(", {s}")).unwrap_or_default()
+                    )
+                })
                 .unwrap_or_default();
             eprintln!(
                 "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}",
