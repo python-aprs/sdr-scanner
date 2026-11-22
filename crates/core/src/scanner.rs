@@ -127,21 +127,70 @@ struct Chain {
     demod: Vec<f32>,
     /// Squelch gain now (0 = muted, 1 = open), ramped between blocks.
     squelch: f32,
+    /// Ramp step per discriminator sample (a 5 ms ramp).
+    ramp_step: f32,
+    /// Discriminator output of the newest blocks, held until the squelch
+    /// state of the blocks after them is known.
+    held: VecDeque<Vec<f32>>,
+    /// Squelch state of recent blocks: the one before the oldest held block,
+    /// then one per held block.
+    gates: VecDeque<bool>,
 }
 
-/// Squelch ramp length in audio samples (5 ms at 8 kHz).
-const SQUELCH_RAMP: f32 = 40.0;
+/// Blocks of squelch look-ahead. A block plays only if it, the block before
+/// and the `SQUELCH_LOOKAHEAD` blocks after it are all open. The detector's
+/// FFT window reaches a few ms past a block's audio, so the block after a
+/// key-down can still read as open; two blocks of look-ahead mute the
+/// discriminator's key-down breakup anyway.
+const SQUELCH_LOOKAHEAD: usize = 2;
 
 impl Chain {
-    /// Demodulate one block. `open` is the squelch: blocks where the slot is
-    /// below the close threshold (pre-roll noise, the hang time, fades,
-    /// zero-filled drops) are muted, with short ramps so there are no
-    /// clicks. Muting keeps the samples, so timing is unchanged.
+    /// Demodulate one block. `open` is the squelch for this block: blocks
+    /// where the slot is below the close threshold (pre-roll noise, the hang
+    /// time, fades, zero-filled drops) are muted. Muting keeps the samples,
+    /// so timing is unchanged.
+    ///
+    /// The squelch acts on the discriminator output, before de-emphasis,
+    /// resampling and the high-pass, so those filters never ring on loud
+    /// FM noise. A block is gated one block late, once its neighbours are
+    /// known: it plays only if it and both neighbours are open, which keeps
+    /// the discriminator's settling at key-up and its breakup at key-down
+    /// out of the recording.
     fn process(&mut self, block: &Block, open: bool) {
         self.iq.clear();
         self.extractor.process(block, &mut self.iq);
-        self.demod.clear();
-        self.disc.process(&self.iq, &mut self.demod);
+        let mut d = self.spare_demod();
+        self.disc.process(&self.iq, &mut d);
+        self.held.push_back(d);
+        self.gates.push_back(open);
+        if self.held.len() > SQUELCH_LOOKAHEAD {
+            // gates: [before, oldest held, ..., newest]
+            let play = self.gates.iter().all(|&g| g);
+            self.demod = self.held.pop_front().unwrap();
+            self.gates.pop_front();
+            self.release(play);
+        }
+    }
+
+    fn spare_demod(&mut self) -> Vec<f32> {
+        let mut v = std::mem::take(&mut self.demod);
+        v.clear();
+        v
+    }
+
+    /// Gate one block's discriminator output (in `demod`) and run it
+    /// through the audio filters into `pending`.
+    fn release(&mut self, play: bool) {
+        let target = if play { 1.0 } else { 0.0 };
+        let step = self.ramp_step;
+        for v in &mut self.demod {
+            if self.squelch < target {
+                self.squelch = (self.squelch + step).min(1.0);
+            } else if self.squelch > target {
+                self.squelch = (self.squelch - step).max(0.0);
+            }
+            *v *= self.squelch;
+        }
         if let Some(d) = &mut self.deemph {
             d.process(&mut self.demod);
         }
@@ -156,22 +205,24 @@ impl Chain {
         if let Some(h) = &mut self.hp {
             h.process(new);
         }
-        let target = if open { 1.0 } else { 0.0 };
-        let step = 1.0 / SQUELCH_RAMP;
         for v in new {
-            if self.squelch < target {
-                self.squelch = (self.squelch + step).min(1.0);
-            } else if self.squelch > target {
-                self.squelch = (self.squelch - step).max(0.0);
-            }
-            *v = (*v * self.gain * self.squelch).clamp(-1.0, 1.0);
+            *v = (*v * self.gain).clamp(-1.0, 1.0);
         }
+    }
+
+    /// End of transmission: release the held block, muted.
+    fn flush(&mut self) {
+        while let Some(d) = self.held.pop_front() {
+            self.demod = d;
+            self.release(false);
+        }
+        self.demod.clear();
     }
 
     /// Emit everything except the last `holdback` samples.
     fn drain_ready(&mut self, holdback: usize, out: &mut Vec<Output>) {
-        if self.pending.len() > holdback {
-            let n = self.pending.len() - holdback;
+        let n = self.pending.len().saturating_sub(holdback);
+        if n > 0 {
             let samples: Vec<f32> = self.pending.drain(..n).collect();
             self.emitted += samples.len();
             out.push(Output::Audio {
@@ -430,6 +481,9 @@ impl Scanner {
                     iq: Vec::new(),
                     demod: Vec::new(),
                     squelch: 0.0,
+                    ramp_step: (1.0 / (0.005 * rate)) as f32,
+                    held: VecDeque::new(),
+                    gates: VecDeque::from([false]),
                     extractor: ex,
                 };
                 self.next_id += 1;
@@ -475,6 +529,7 @@ impl Scanner {
                 let keep_audio = ((keep_until - c.audio_t0 as f64) / p.sample_rate
                     * self.cfg.audio_rate as f64)
                     .max(0.0) as usize;
+                c.flush();
                 let total = c.emitted + c.pending.len();
                 if keep_audio < total {
                     let cut = keep_audio.saturating_sub(c.emitted);
@@ -637,6 +692,34 @@ mod tests {
         assert!(rms(pre) < 1e-3, "pre {}", rms(pre));
         assert!(rms(post) < 1e-3, "post {}", rms(post));
         assert!(rms(mid) > 0.05, "mid {}", rms(mid));
+    }
+
+    #[test]
+    fn no_transients_at_key_up_or_key_down() {
+        // Abrupt key-up/down at several block alignments: the loudest sample
+        // must be the tone itself, not a click at the squelch edges.
+        for (on, off) in [
+            (0.5, 1.5),
+            (0.5031, 1.5044),
+            (0.5077, 1.5103),
+            (0.5049, 1.5021),
+        ] {
+            let x = scene(2.5, &[(100e3, 400.0, on, off)]);
+            let (out, _) = collect(&x, &[slot(100e3)], ScannerConfig::default());
+            let Some(Output::Open(s)) = out.iter().find(|o| matches!(o, Output::Open(_))) else {
+                panic!("no transmission")
+            };
+            let audio = audio_of(&out, s.id);
+            let start = s.start_sample as f64 / params().sample_rate;
+            let a = ((on + 0.3 - start) * 8000.0) as usize;
+            let b = ((off - 0.3 - start) * 8000.0) as usize;
+            let steady = audio[a..b].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let worst = audio.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                worst <= steady * 1.1,
+                "on {on}: worst {worst} vs steady {steady}"
+            );
+        }
     }
 
     #[test]
