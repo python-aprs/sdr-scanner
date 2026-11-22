@@ -250,6 +250,22 @@ impl Scanner {
         self.stats
     }
 
+    /// Transmissions being recorded now: (frequency, current SNR dB,
+    /// seconds since the transmission started).
+    pub fn active(&self) -> Vec<(f64, f32, f64)> {
+        let now = self.stats.samples as f64 / self.bank.params().sample_rate;
+        self.chains
+            .iter()
+            .map(|c| {
+                (
+                    c.tuned.freq,
+                    self.detector.snr_db(c.slot),
+                    now - c.audio_t0 as f64 / self.bank.params().sample_rate,
+                )
+            })
+            .collect()
+    }
+
     pub fn clock(&self) -> &SampleClock {
         &self.clock
     }

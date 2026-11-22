@@ -396,6 +396,12 @@ impl Detector {
             // Grow slowly, fall fast: a burst of signals in a segment must not
             // drag the floor up, but a gain drop should be followed quickly.
             let f = &mut self.seg_floor[i];
+            // A block of zeros (a zero-filled overrun gap) says nothing about
+            // the noise floor; following it down would make every slot look
+            // busy once samples return.
+            if *f > 0.0 && est < *f * 1e-3 {
+                continue;
+            }
             if *f == 0.0 || est < *f {
                 *f += (falpha * 4.0).min(1.0) * (est - *f);
             } else {
@@ -701,6 +707,18 @@ mod tests {
     fn short_blip_below_attack_is_ignored() {
         let x = scene(1.5, &[(0.2e6, 20.0, 0.5, 0.52)], 5);
         let plan = vec![slot(0.2e6, 16e3)];
+        let (_, events, _) = run(&x, &plan, DetectorParams::default());
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn zero_filled_gap_does_not_cause_false_opens() {
+        let mut x = scene(3.0, &[], 9);
+        let fs = params().sample_rate;
+        for v in &mut x[(1.0 * fs) as usize..(1.6 * fs) as usize] {
+            *v = Complex32::default();
+        }
+        let plan: Vec<Slot> = (-20..=20).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
         let (_, events, _) = run(&x, &plan, DetectorParams::default());
         assert!(events.is_empty(), "{events:?}");
     }

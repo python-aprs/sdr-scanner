@@ -38,6 +38,14 @@ scanner run <recording> --config config/rainier.toml --profile rainier-2m \
     --out out/ [--open-db 6 --close-db 3 --hang 1.5 --min-len 0.3] [--json]
 ```
 
+`scanner serve --source loop:<recording> --config ... --profile ...` is the
+long-running mode: a radio thread pushes samples into a lock-free ring
+(`scanner_sources::ring`, drops counted and zero-filled so timestamps never
+slip), the DSP thread scans, and the recorder thread writes. A recording
+replayed at its real rate stands in for a radio until the Phase 2 backends
+land; Ctrl-C closes open transmissions and exits. It prints a status line
+(DSP load, ring fill, drops, active channels) every `--status-every` seconds.
+
 `scanner run` writes `out/YYYY/MM/DD/146.5200_20261122T065403.123Z.wav` per
 transmission (via `.wav.part` and a rename) and one row per transmission in
 `out/index.sqlite`. `--json` prints a machine-readable summary that

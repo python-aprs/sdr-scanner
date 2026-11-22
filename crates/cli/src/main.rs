@@ -18,6 +18,8 @@ use scanner_core::units::Hz;
 use scanner_sources::{FileSource, Source};
 use std::path::{Path, PathBuf};
 
+mod serve;
+
 #[derive(Parser)]
 #[command(name = "scanner", version, about = "Multi-channel NBFM scanner")]
 struct Cli {
@@ -48,6 +50,8 @@ enum Cmd {
     /// Scan a recording: detect transmissions and write one WAV per
     /// transmission, plus `index.sqlite`, under `--out`.
     Run(RunArgs),
+    /// Run continuously from a source, recording until Ctrl-C.
+    Serve(ServeArgs),
     /// Work with band-profile config files.
     Config {
         #[command(subcommand)]
@@ -58,10 +62,36 @@ enum Cmd {
 #[derive(clap::Args)]
 struct RunArgs {
     recording: PathBuf,
+    #[command(flatten)]
+    tuning: Tuning,
+    /// Pace reading at the recording's sample rate (like a live radio).
+    #[arg(long)]
+    realtime: bool,
+    /// Print a JSON summary instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// `replay:<recording>` or `loop:<recording>` (a recording played at its
+    /// real rate through the live path); radios arrive in Phase 2.
+    #[arg(long)]
+    source: serve::SourceSpec,
+    #[command(flatten)]
+    tuning: Tuning,
+    /// Seconds between status lines.
+    #[arg(long, default_value_t = 10.0)]
+    status_every: f64,
+}
+
+/// Options shared by `run` and `serve`.
+#[derive(clap::Args)]
+struct Tuning {
     /// Band-profile config file.
     #[arg(long)]
     config: PathBuf,
-    /// Profile to use (default: the only/first profile in the file).
+    /// Profile to use (default: the first profile in the file).
     #[arg(long)]
     profile: Option<String>,
     /// Output folder.
@@ -86,15 +116,58 @@ struct RunArgs {
     /// radios (RSP1A) need a few kHz; 0 disables.
     #[arg(long, default_value_t = 3000.0)]
     dc_notch: f64,
-    /// Pace reading at the recording's sample rate (like a live radio).
-    #[arg(long)]
-    realtime: bool,
     /// Run channels on one thread.
     #[arg(long)]
     serial: bool,
-    /// Print a JSON summary instead of a table.
-    #[arg(long)]
-    json: bool,
+}
+
+impl Tuning {
+    fn load(
+        &self,
+    ) -> Result<(
+        scanner_core::config::Profile,
+        scanner_core::config::ChannelPlan,
+    )> {
+        let cfg = ConfigFile::load(&self.config)?;
+        let name = match &self.profile {
+            Some(n) => n.clone(),
+            None => cfg
+                .profiles
+                .keys()
+                .next()
+                .cloned()
+                .context("config defines no profiles")?,
+        };
+        let profile = cfg.profile(&name)?;
+        let plan = profile.channel_plan();
+        for w in &plan.warnings {
+            eprintln!("warning: {w}");
+        }
+        Ok((profile, plan))
+    }
+
+    fn scanner_config(
+        &self,
+        profile: &scanner_core::config::Profile,
+    ) -> scanner_core::scanner::ScannerConfig {
+        use scanner_core::detector::DetectorParams;
+        scanner_core::scanner::ScannerConfig {
+            detector: DetectorParams {
+                open_db: self.open_db,
+                close_db: self.close_db,
+                hang: self.hang,
+                max_active: self.max_active,
+                dc_notch_hz: self.dc_notch,
+                grid_window_hz: profile.spacing.map(|s| s.0).unwrap_or(0.0),
+                ..Default::default()
+            },
+            audio_rate: profile.audio_rate,
+            deemphasis: profile.deemphasis,
+            min_len: self.min_len,
+            parallel: !self.serial,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -122,6 +195,16 @@ fn main() -> Result<()> {
             json,
         } => peaks(recording, fft, threshold, merge, json),
         Cmd::Run(args) => run(args),
+        Cmd::Serve(a) => {
+            let (profile, plan) = a.tuning.load()?;
+            serve::serve(serve::ServeOptions {
+                source: a.source,
+                scanner: a.tuning.scanner_config(&profile),
+                plan: &plan.slots,
+                out: &a.tuning.out,
+                status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
+            })
+        }
         Cmd::Config {
             cmd:
                 ConfigCmd::Check {
@@ -286,46 +369,15 @@ fn config_check(file: PathBuf, only: Option<String>, list_slots: bool) -> Result
 }
 
 fn run(a: RunArgs) -> Result<()> {
-    use scanner_core::detector::DetectorParams;
-    use scanner_core::scanner::{Output, Scanner, ScannerConfig};
+    use scanner_core::scanner::{Output, Scanner};
     use scanner_store::Recorder;
     use std::time::{Instant, SystemTime};
 
-    let cfg = ConfigFile::load(&a.config)?;
-    let name = match a.profile {
-        Some(n) => n,
-        None => cfg
-            .profiles
-            .keys()
-            .next()
-            .cloned()
-            .context("config defines no profiles")?,
-    };
-    let profile = cfg.profile(&name)?;
-    let plan = profile.channel_plan();
-    for w in &plan.warnings {
-        eprintln!("warning: {w}");
-    }
-
+    let (profile, plan) = a.tuning.load()?;
     let src = open(&a.recording)?.realtime(a.realtime);
     let info = src.info().clone();
     let t0 = info.start_time.unwrap_or(SystemTime::now());
-    let sc = ScannerConfig {
-        detector: DetectorParams {
-            open_db: a.open_db,
-            close_db: a.close_db,
-            hang: a.hang,
-            max_active: a.max_active,
-            dc_notch_hz: a.dc_notch,
-            grid_window_hz: profile.spacing.map(|s| s.0).unwrap_or(0.0),
-            ..Default::default()
-        },
-        audio_rate: profile.audio_rate,
-        deemphasis: profile.deemphasis,
-        min_len: a.min_len,
-        parallel: !a.serial,
-        ..Default::default()
-    };
+    let sc = a.tuning.scanner_config(&profile);
     let mut scanner = Scanner::new(sc, info.sample_rate, info.center_freq, t0, &plan.slots);
     let p = *scanner.params();
     if !a.json {
@@ -342,7 +394,7 @@ fn run(a: RunArgs) -> Result<()> {
         );
     }
 
-    let recorder = Recorder::new(&a.out)?;
+    let recorder = Recorder::new(&a.tuning.out)?;
     let (tx, writer) = recorder.spawn(64);
 
     // Reader thread: file I/O and sample conversion overlap with DSP.
@@ -388,7 +440,7 @@ fn run(a: RunArgs) -> Result<()> {
     let stats = scanner.stats();
     let secs = stats.samples as f64 / info.sample_rate;
 
-    let index = scanner_store::Index::open(&a.out.join("index.sqlite"))?;
+    let index = scanner_store::Index::open(&a.tuning.out.join("index.sqlite"))?;
     let mut ours = Vec::new();
     for id in &rec.rows {
         ours.extend(index.get(*id)?);
@@ -411,7 +463,7 @@ fn run(a: RunArgs) -> Result<()> {
                     "signal_s": r.signal_secs,
                     "peak_snr_db": r.peak_snr_db,
                     "mean_snr_db": r.mean_snr_db,
-                    "wav": a.out.join(&r.wav_path),
+                    "wav": a.tuning.out.join(&r.wav_path),
                 })
             })
             .collect();

@@ -22,3 +22,4 @@ anyhow.workspace = true
 num-complex.workspace = true
 scanner-store.workspace = true
 serde_json.workspace = true
+ctrlc.workspace = true
