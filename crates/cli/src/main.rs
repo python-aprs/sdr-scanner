@@ -83,6 +83,19 @@ struct ServeArgs {
     /// Seconds between status lines.
     #[arg(long, default_value_t = 10.0)]
     status_every: f64,
+    /// Serve the HTTP API on this address ("off" to disable). Admin routes
+    /// need the token in the SCANNER_ADMIN_TOKEN environment variable.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    http: String,
+    /// Let anonymous visitors list recordings.
+    #[arg(long)]
+    public_recordings: bool,
+    /// Let anonymous visitors download audio.
+    #[arg(long)]
+    public_audio: bool,
+    /// Hide live status from anonymous visitors.
+    #[arg(long)]
+    private_live: bool,
 }
 
 /// Options shared by `run` and `serve`.
@@ -197,8 +210,25 @@ fn main() -> Result<()> {
         Cmd::Run(args) => run(args),
         Cmd::Serve(a) => {
             let (profile, plan) = a.tuning.load()?;
+            let http = match a.http.as_str() {
+                "off" | "" => None,
+                s => Some(
+                    s.parse()
+                        .with_context(|| format!("--http {s:?} is not an address"))?,
+                ),
+            };
             serve::serve(serve::ServeOptions {
                 source: a.source,
+                profile_name: profile.name.clone(),
+                http,
+                public: scanner_web::Public {
+                    live: !a.private_live,
+                    recordings: a.public_recordings,
+                    audio: a.public_audio,
+                },
+                admin_token: std::env::var("SCANNER_ADMIN_TOKEN")
+                    .ok()
+                    .filter(|t| t.len() >= 16),
                 scanner: a.tuning.scanner_config(&profile),
                 plan: &plan.slots,
                 out: &a.tuning.out,

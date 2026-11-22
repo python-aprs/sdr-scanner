@@ -8,5 +8,5 @@ pub mod index;
 pub mod recorder;
 pub mod wav;
 
-pub use index::Index;
+pub use index::{Index, Query, Row};
 pub use recorder::{Recorder, RecorderStats};

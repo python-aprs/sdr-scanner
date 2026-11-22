@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS transmissions_freq ON transmissions(freq_hz, start_ns
 ";
 
 /// A finished or in-progress transmission row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Row {
     pub id: i64,
     pub freq_hz: f64,
@@ -48,6 +48,19 @@ pub struct Row {
     pub wav_path: String,
     pub wav_bytes: Option<i64>,
     pub status: String,
+}
+
+/// Filters for [`Index::search`]. `None` means no constraint.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Query {
+    pub freq_min: Option<f64>,
+    pub freq_max: Option<f64>,
+    pub since_ns: Option<i64>,
+    pub until_ns: Option<i64>,
+    pub min_secs: Option<f64>,
+    /// Paging: only rows with a smaller id.
+    pub before_id: Option<i64>,
+    pub limit: usize,
 }
 
 pub struct NewRow<'a> {
@@ -143,6 +156,32 @@ impl Index {
         st.query_map([limit as i64], row)?.collect()
     }
 
+    /// Completed transmissions matching `q`, newest first.
+    pub fn search(&self, q: &Query) -> Result<Vec<Row>, IndexError> {
+        let mut st = self.db.prepare(
+            "SELECT * FROM transmissions
+             WHERE status = 'complete'
+               AND (?1 IS NULL OR freq_hz >= ?1) AND (?2 IS NULL OR freq_hz <= ?2)
+               AND (?3 IS NULL OR start_ns >= ?3) AND (?4 IS NULL OR start_ns < ?4)
+               AND (?5 IS NULL OR audio_secs >= ?5)
+               AND (?6 IS NULL OR id < ?6)
+             ORDER BY start_ns DESC, id DESC LIMIT ?7",
+        )?;
+        st.query_map(
+            params![
+                q.freq_min,
+                q.freq_max,
+                q.since_ns,
+                q.until_ns,
+                q.min_secs,
+                q.before_id,
+                q.limit.clamp(1, 1000) as i64
+            ],
+            row,
+        )?
+        .collect()
+    }
+
     pub fn count(&self) -> Result<i64, IndexError> {
         self.db
             .query_row("SELECT COUNT(*) FROM transmissions", [], |r| r.get(0))
@@ -203,6 +242,52 @@ mod tests {
         assert_eq!(r.status, "complete");
         assert_eq!(r.wav_bytes, Some(113_644));
         assert_eq!(ix.recent(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_filters_and_pages() {
+        let ix = Index::in_memory().unwrap();
+        for (k, f) in [146.52e6, 146.84e6, 147.06e6, 146.52e6].iter().enumerate() {
+            let id = ix
+                .insert(&NewRow {
+                    freq_hz: *f,
+                    channel: None,
+                    origin: "grid",
+                    mode: "nbfm",
+                    start_ns: k as i64 * 1_000_000_000,
+                    audio_rate: 8000,
+                    wav_path: "x",
+                })
+                .unwrap();
+            ix.complete(id, 0, 1.0 + k as f64, 1.0, 20.0, 15.0, "x", 1)
+                .unwrap();
+        }
+        let all = ix
+            .search(&Query {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1]
+        );
+        let q = Query {
+            freq_min: Some(146.5e6),
+            freq_max: Some(146.6e6),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(ix.search(&q).unwrap().len(), 2);
+        let page = ix
+            .search(&Query {
+                before_id: Some(3),
+                min_secs: Some(2.0),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]

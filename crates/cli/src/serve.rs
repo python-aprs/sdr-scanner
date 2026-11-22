@@ -96,6 +96,11 @@ fn replay_thread(
 
 pub struct ServeOptions<'a> {
     pub source: SourceSpec,
+    pub profile_name: String,
+    /// Serve the HTTP API here.
+    pub http: Option<std::net::SocketAddr>,
+    pub public: scanner_web::Public,
+    pub admin_token: Option<String>,
     pub scanner: ScannerConfig,
     pub plan: &'a [scanner_core::config::Slot],
     pub out: &'a Path,
@@ -159,6 +164,25 @@ pub fn serve(o: ServeOptions) -> Result<()> {
 
     let recorder = Recorder::new(o.out)?;
     let (tx, writer) = recorder.spawn(256);
+
+    let status: scanner_web::StatusHandle = Default::default();
+    if let Some(addr) = o.http {
+        if o.admin_token.is_none() {
+            eprintln!("note: no SCANNER_ADMIN_TOKEN set, so admin-only routes are closed");
+        }
+        scanner_web::spawn(
+            addr,
+            scanner_web::AppState {
+                status: status.clone(),
+                recordings: o.out.to_owned(),
+                public: o.public,
+                admin_token: o.admin_token.as_deref().map(Into::into),
+            },
+        )
+        .with_context(|| format!("starting the web API on {addr}"))?;
+        eprintln!("web API on http://{addr}/api/v1/status");
+    }
+    let mut next_publish = Instant::now();
     let mut buf = vec![Complex32::default(); BLOCK];
     let mut out: Vec<Output> = Vec::new();
     let started = Instant::now();
@@ -185,6 +209,34 @@ pub fn serve(o: ServeOptions) -> Result<()> {
             tx.send(std::mem::take(&mut out))
                 .ok()
                 .context("recorder thread stopped")?;
+        }
+        if Instant::now() >= next_publish {
+            let wall = started.elapsed().as_secs_f64().max(1e-9);
+            let snap = scanner_web::LiveStatus {
+                source: info.description.clone(),
+                sample_rate: info.sample_rate,
+                center_freq_hz: info.center_freq,
+                profile: o.profile_name.clone(),
+                slots: scanner.detector().slots().len(),
+                uptime_s: wall,
+                dsp_load: busy.as_secs_f64() / wall,
+                samples_dropped: source.stats().samples_dropped,
+                recorded: scanner.stats().recorded,
+                active: scanner
+                    .active()
+                    .into_iter()
+                    .map(|(freq_hz, snr_db, secs)| scanner_web::ActiveChannel {
+                        freq_hz,
+                        snr_db,
+                        secs,
+                    })
+                    .collect(),
+                noise_floor_db: scanner.detector().floor_db(),
+            };
+            if let Ok(mut g) = status.write() {
+                *g = snap;
+            }
+            next_publish += Duration::from_millis(500);
         }
         if Instant::now() >= next_status {
             let wall = started.elapsed().as_secs_f64();

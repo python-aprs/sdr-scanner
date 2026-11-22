@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/masenf/sdr-scanner"
+repository = "https://github.com/python-aprs/sdr-scanner"
 
 [workspace.dependencies]
 scanner-core = { path = "crates/core" }
@@ -24,6 +24,9 @@ thiserror = "2"
 anyhow = "1"
 tempfile = "3"
 ctrlc = "3.4"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "signal"] }
+tower = { version = "0.5", features = ["util"] }
 rayon = "1.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
