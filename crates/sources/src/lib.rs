@@ -2,7 +2,7 @@
 //!
 //! Every source presents the same pull interface: the DSP thread calls
 //! [`Source::read`] to fill a buffer of normalised complex samples. File
-//! sources read on demand. Hardware sources (Phase 2) copy driver callbacks
+//! sources read on demand. Hardware sources copy driver callbacks
 //! into a lock-free ring and serve `read` from the consumer side of that ring,
 //! so the driver callback never blocks (PLAN.md 3.4).
 
@@ -12,7 +12,6 @@ pub mod sigmf;
 
 #[cfg(feature = "airspy")]
 pub mod airspy;
-#[cfg(feature = "sdrplay")]
 pub mod sdrplay;
 
 pub use file::FileSource;
@@ -44,6 +43,8 @@ pub enum SourceError {
     Meta(String),
     #[error("unsupported sample format {0:?}")]
     UnsupportedFormat(String),
+    #[error("radio: {0}")]
+    Device(String),
 }
 
 /// Counters every source keeps so drops are visible, never silent.

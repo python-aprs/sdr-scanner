@@ -50,6 +50,8 @@ enum Cmd {
     /// Scan a recording: detect transmissions and write one WAV per
     /// transmission, plus `index.sqlite`, under `--out`.
     Run(RunArgs),
+    /// List SDRplay radios the API can see.
+    Devices,
     /// Run continuously from a source, recording until Ctrl-C.
     Serve(ServeArgs),
     /// Work with band-profile config files.
@@ -74,12 +76,15 @@ struct RunArgs {
 
 #[derive(clap::Args)]
 struct ServeArgs {
-    /// `replay:<recording>` or `loop:<recording>` (a recording played at its
-    /// real rate through the live path); radios arrive in Phase 2.
+    /// `sdrplay` (the first SDRplay radio), `sdrplay:<serial>`, or
+    /// `replay:<recording>` / `loop:<recording>` (a recording played at its
+    /// real rate through the live path).
     #[arg(long)]
     source: serve::SourceSpec,
     #[command(flatten)]
     tuning: Tuning,
+    #[command(flatten)]
+    radio: RadioArgs,
     /// Seconds between status lines.
     #[arg(long, default_value_t = 10.0)]
     status_every: f64,
@@ -96,6 +101,71 @@ struct ServeArgs {
     /// Hide live status from anonymous visitors.
     #[arg(long)]
     private_live: bool,
+}
+
+/// Radio settings for `serve --source sdrplay`.
+#[derive(clap::Args)]
+struct RadioArgs {
+    /// Tuner frequency in MHz (default: the middle of the profile's span plus
+    /// 12.5 kHz, so the DC residual sits between 25 kHz channels).
+    #[arg(long)]
+    center_mhz: Option<f64>,
+    /// Sample rate in S/s (2 to 10.66 MS/s).
+    #[arg(long, default_value_t = 8e6)]
+    rate: f64,
+    /// LNA state: 0 is the most gain (0 to 9 for an RSP1A on 2 m).
+    #[arg(long, default_value_t = 3)]
+    lna: u8,
+    /// IF gain reduction in dB, 20 to 59 (more is less gain).
+    #[arg(long, default_value_t = 40)]
+    gr: u8,
+    /// IF filter bandwidth in kHz (8000, 7000, 6000, 5000, 1536, ...).
+    #[arg(long, default_value_t = 8000)]
+    if_bw_khz: u32,
+    /// Turn on the radio's AGC with this set point in dBFS (e.g. -30).
+    /// Off by default: fixed gain keeps the noise floor steady.
+    #[arg(long, allow_hyphen_values = true)]
+    agc: Option<i32>,
+    /// Frequency correction in parts per million.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    ppm: f64,
+    /// Power an LNA or preamp over the coax.
+    #[arg(long)]
+    bias_t: bool,
+    /// Switch in the RSP1A's broadcast FM band-stop filter.
+    #[arg(long)]
+    fm_notch: bool,
+    /// Switch in the RSP1A's DAB band-stop filter.
+    #[arg(long)]
+    dab_notch: bool,
+    /// Use USB bulk transfers instead of isochronous.
+    #[arg(long)]
+    usb_bulk: bool,
+}
+
+impl RadioArgs {
+    fn sdrplay(
+        &self,
+        profile: &scanner_core::config::Profile,
+    ) -> scanner_sources::sdrplay::SdrplayConfig {
+        scanner_sources::sdrplay::SdrplayConfig {
+            serial: None,
+            sample_rate: self.rate,
+            center_hz: self
+                .center_mhz
+                .map(|m| m * 1e6)
+                .unwrap_or(profile.span.center() + 12.5e3),
+            bandwidth_khz: self.if_bw_khz,
+            lna_state: self.lna,
+            gr_db: self.gr,
+            agc_setpoint_dbfs: self.agc,
+            ppm: self.ppm,
+            bias_t: self.bias_t,
+            rf_notch: self.fm_notch,
+            dab_notch: self.dab_notch,
+            usb_bulk: self.usb_bulk,
+        }
+    }
 }
 
 /// Options shared by `run` and `serve`.
@@ -127,7 +197,7 @@ struct Tuning {
     max_active: usize,
     /// Half-width (Hz) of the notch over the tuner's DC residual. Zero-IF
     /// radios (RSP1A) need a few kHz; 0 disables.
-    #[arg(long, default_value_t = 3000.0)]
+    #[arg(long, default_value_t = 6000.0)]
     dc_notch: f64,
     /// Run channels on one thread.
     #[arg(long)]
@@ -208,8 +278,25 @@ fn main() -> Result<()> {
             json,
         } => peaks(recording, fft, threshold, merge, json),
         Cmd::Run(args) => run(args),
+        Cmd::Devices => devices(),
         Cmd::Serve(a) => {
             let (profile, plan) = a.tuning.load()?;
+            let sdrplay = a.radio.sdrplay(&profile);
+            if matches!(a.source, serve::SourceSpec::Sdrplay { .. }) {
+                sdrplay
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("radio settings: {e}"))?;
+                let half = sdrplay.sample_rate / 2.0;
+                if profile.span.start.0 < sdrplay.center_hz - half
+                    || profile.span.stop.0 > sdrplay.center_hz + half
+                {
+                    eprintln!(
+                        "warning: {} S/s at {} covers only part of the profile's span",
+                        sdrplay.sample_rate,
+                        Hz(sdrplay.center_hz)
+                    );
+                }
+            }
             let http = match a.http.as_str() {
                 "off" | "" => None,
                 s => Some(
@@ -219,6 +306,7 @@ fn main() -> Result<()> {
             };
             serve::serve(serve::ServeOptions {
                 source: a.source,
+                sdrplay,
                 profile_name: profile.name.clone(),
                 http,
                 public: scanner_web::Public {
@@ -244,6 +332,23 @@ fn main() -> Result<()> {
                 },
         } => config_check(file, profile, slots),
     }
+}
+
+#[cfg(feature = "sdrplay")]
+fn devices() -> Result<()> {
+    let devs = scanner_sources::sdrplay::list_devices()?;
+    if devs.is_empty() {
+        println!("no SDRplay radios found");
+    }
+    for d in devs {
+        println!("sdrplay:{}  {}", d.serial, d.model);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "sdrplay"))]
+fn devices() -> Result<()> {
+    bail!("this scanner was built without SDRplay support; rebuild with `--features sdrplay`")
 }
 
 fn open(path: &Path) -> Result<FileSource> {

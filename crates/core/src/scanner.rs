@@ -450,6 +450,12 @@ impl Scanner {
                     let snapped = (rf / self.cfg.grid_tune_step).round() * self.cfg.grid_tune_step;
                     offset += snapped - ws.slot.freq;
                     tuned.freq = snapped;
+                    // A grid slot pulled onto the tuner's DC residual (the
+                    // notch's skirt) is not a transmission.
+                    if offset.abs() < self.cfg.detector.dc_notch_hz {
+                        self.stats.not_recorded += 1;
+                        return;
+                    }
                 }
                 // A signal between two grid windows can open both; once
                 // retuned they land on the same frequency. Keep the first.
@@ -687,6 +693,25 @@ mod tests {
                 .unwrap();
             assert!((close.signal_secs - (off - on)).abs() < 0.08, "{close:?}");
         }
+    }
+
+    #[test]
+    fn off_grid_signals_retune_to_their_own_frequency() {
+        // 5 kHz off the 25 kHz grid (like 147.520 between 147.500 and
+        // 147.525), modulated by a slow tone so single blocks are lopsided.
+        let sigs = [(120e3, 40.0, 0.5, 1.5), (-205e3, 55.0, 0.5, 1.5)];
+        let x = scene(2.0, &sigs);
+        let plan: Vec<Slot> = (-16..=16).map(|k| slot(k as f64 * 25e3)).collect();
+        let (out, _) = collect(&x, &plan, ScannerConfig::default());
+        let mut tuned: Vec<f64> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Open(s) => Some(s.slot.freq),
+                _ => None,
+            })
+            .collect();
+        tuned.sort_by(f64::total_cmp);
+        assert_eq!(tuned, vec![-205e3, 120e3]);
     }
 
     #[test]
