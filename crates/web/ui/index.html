@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Scanner</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/live">
+    <img src="/assets/icon.svg" alt="" width="22" height="22">
+    <span class="brand-name">Scanner</span>
+    <span class="brand-sub" id="brand-sub"></span>
+  </a>
+  <nav class="tabs" aria-label="Sections">
+    <a href="#/live" data-view="live">Live</a>
+    <a href="#/recordings" data-view="recordings">Recordings</a>
+    <a href="#/channels" data-view="channels">Channels</a>
+    <a href="#/admin" data-view="admin">Admin</a>
+  </nav>
+  <div class="top-right">
+    <span class="link-state" id="link-state" title="Live connection"><i></i><span>Connecting</span></span>
+    <a class="who" id="who" href="#/admin">Log in</a>
+  </div>
+</header>
+<main id="view" tabindex="-1"></main>
+<footer class="player" id="player" hidden>
+  <div class="player-info">
+    <span class="player-freq mono" id="player-freq"></span>
+    <span class="player-meta" id="player-meta"></span>
+  </div>
+  <div class="player-controls">
+    <button type="button" class="icon-btn" id="player-prev" title="Previous (older)" aria-label="Previous">&#x23EE;</button>
+    <audio id="audio" controls preload="none"></audio>
+    <button type="button" class="icon-btn" id="player-next" title="Next (newer)" aria-label="Next">&#x23ED;</button>
+    <label class="check"><input type="checkbox" id="player-auto"> Play next</label>
+    <button type="button" class="icon-btn" id="player-close" title="Close player" aria-label="Close player">&#x2715;</button>
+  </div>
+</footer>
+<noscript><p class="notice">The scanner's web interface needs JavaScript. The API is at <code>/api/v1</code>.</p></noscript>
+</body>
+</html>

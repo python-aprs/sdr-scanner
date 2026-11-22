@@ -313,6 +313,7 @@ impl Profile {
                     record: c.record.unwrap_or(true),
                     name: c.name.clone(),
                     origin: SlotOrigin::Listed,
+                    pair: None,
                 },
                 &mut warnings,
             );
@@ -327,11 +328,13 @@ impl Profile {
                 record: r.record.unwrap_or(true),
                 name: Some(r.name.clone()),
                 origin: SlotOrigin::RepeaterOutput,
+                pair: r.monitor_input.then_some(r.output.0 + r.offset.0),
             };
             if r.monitor_input {
                 let input = Slot {
                     freq: r.output.0 + r.offset.0,
                     origin: SlotOrigin::RepeaterInput,
+                    pair: Some(r.output.0),
                     ..base.clone()
                 };
                 push(base, &mut warnings);
@@ -362,6 +365,7 @@ impl Profile {
                         record: true,
                         name: None,
                         origin: SlotOrigin::Grid,
+                        pair: None,
                     });
                 }
             }
@@ -404,6 +408,9 @@ pub struct Slot {
     pub record: bool,
     pub name: Option<String>,
     pub origin: SlotOrigin,
+    /// For a repeater with its input monitored too: the other half's
+    /// frequency (the input for an output slot, and the reverse).
+    pub pair: Option<f64>,
 }
 
 impl Slot {

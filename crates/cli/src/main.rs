@@ -332,6 +332,7 @@ fn main() -> Result<()> {
                 insecure_cookies: a.insecure_cookies,
                 scanner: a.tuning.scanner_config(&profile),
                 plan: &plan.slots,
+                span: (profile.span.start.0, profile.span.stop.0),
                 out: &a.tuning.out,
                 status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
             })

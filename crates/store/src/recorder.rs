@@ -190,6 +190,7 @@ mod tests {
                 record: true,
                 name: Some("Calling".into()),
                 origin: SlotOrigin::Listed,
+                pair: None,
             },
             start_sample: 0,
             start_time: UNIX_EPOCH + Duration::from_millis(1_795_330_443_123),
