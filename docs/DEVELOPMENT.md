@@ -41,9 +41,9 @@ scanner run <recording> --config config/rainier.toml --profile rainier-2m \
 `scanner serve --source loop:<recording> --config ... --profile ...` is the
 long-running mode: a radio thread pushes samples into a lock-free ring
 (`scanner_sources::ring`, drops counted and zero-filled so timestamps never
-slip), the DSP thread scans, and the recorder thread writes. A recording
-replayed at its real rate stands in for a radio until the Phase 2 backends
-land; Ctrl-C closes open transmissions and exits. It prints a status line
+slip), the DSP thread scans, and the recorder thread writes. The source is a
+radio (`--source sdrplay`, below) or a recording replayed at its real rate
+(`replay:` once, `loop:` forever). Ctrl-C closes open transmissions and exits. It prints a status line
 (DSP load, ring fill, drops, active channels) every `--status-every` seconds.
 
 `serve` also starts the HTTP API (`--http 127.0.0.1:8080` by default, `off`
@@ -90,9 +90,43 @@ cargo bench -p scanner-core --bench pipeline
 
 A recording path can be given as `name`, `name.sigmf-meta` or `name.sigmf-data`.
 
-Hardware backends are behind cargo features so nothing needs a vendor SDK
-until Phase 2: `--features airspy` (libairspy) and `--features sdrplay`
-(SDRplay API 3.x, not redistributable, so CI never enables it for real).
+### SDRplay (RSP1A)
+
+The SDRplay backend is behind the `sdrplay` cargo feature, because it needs
+the vendor's SDRplay API 3.x, which can't be redistributed. Install the API
+from sdrplay.com (it puts `sdrplay_api.h` in `/usr/local/include` and starts
+the `sdrplay_apiService` daemon), then:
+
+```sh
+cargo build --release -p scanner-cli --features sdrplay
+target/release/scanner devices        # lists sdrplay:<serial>  <model>
+target/release/scanner serve --source sdrplay --config config/rainier.toml \
+    --out out/live [--lna 3 --gr 40 --rate 8e6 --center-mhz 146.0125]
+```
+
+Set `SDRPLAY_API_INCLUDE` if the header is somewhere else. The library is
+opened at run time (`SDRPLAY_API_LIB` overrides where), so the binary starts
+and explains what is missing on a machine without the API. Only another
+program holding the radio (SDRconnect, SDRuno) stops it from opening.
+
+Radio options: `--lna` (LNA state, 0 is the most gain), `--gr` (IF gain
+reduction 20–59 dB), `--rate` (2–10.66 MS/s), `--center-mhz` (default: middle
+of the profile's span plus 12.5 kHz), `--if-bw-khz` (8000), `--agc <dBFS>`
+(off by default, because AGC steps make the noise floor jump), `--ppm`,
+`--bias-t`, `--fm-notch`, `--dab-notch`. Overload warnings, samples the API
+reports lost (zero-filled, so timestamps hold) and unplugging show up in the
+status line; unplugging ends the run after the open recordings are written.
+
+How it fits: `crates/sources/sdrplay/shim.c` is the only code that sees the
+vendor header; it gives Rust a small interface (`scanner_sdrplay.h`).
+`scanner_sources::sdrplay::StreamState` (plain Rust, unit tested without the
+API) interleaves each callback's I and Q arrays into full ring blocks and
+turns jumps in the API's sample counter into zero-filled gaps.
+`crates/sources/sdrplay/fake/run-e2e.sh` builds the feature against a
+stand-in header and runs `serve` against a fake API library that streams a
+keyed carrier, so the whole path can be exercised without the SDK or a radio.
+
+The Airspy backend (`--features airspy`, libairspy) is next.
 
 ## Synthetic captures (`tools/synth`)
 

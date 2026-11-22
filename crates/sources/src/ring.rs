@@ -208,6 +208,12 @@ impl RingSource {
         self
     }
 
+    /// Replace the description the consumer reports (a driver fills in the
+    /// device name and start time once streaming has begun).
+    pub fn set_info(&mut self, info: SourceInfo) {
+        self.info = info;
+    }
+
     fn position(&self) -> u64 {
         self.stats.samples_read
     }
