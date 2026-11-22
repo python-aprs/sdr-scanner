@@ -295,7 +295,9 @@ impl AppState {
     }
 
     fn index(&self) -> Result<Index, ApiError> {
-        Index::open(&self.recordings.join("index.sqlite"))
+        // The recorder owns the index; reading must not migrate it or mark
+        // rows being recorded as interrupted.
+        Index::open_reader(&self.recordings.join("index.sqlite"))
             .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "index unavailable".into()))
     }
 }
@@ -303,7 +305,7 @@ impl AppState {
 fn auth_err(e: auth::AuthError) -> ApiError {
     match e {
         auth::AuthError::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, m.into()),
-        auth::AuthError::Db(_) => ApiError(
+        auth::AuthError::Db(_) | auth::AuthError::Schema(_) => ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "auth database error".into(),
         ),

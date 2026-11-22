@@ -22,6 +22,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, params};
+use scanner_store::migrate::{self, MigrateError, Migration, Schema, Up};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -41,6 +42,8 @@ pub const TOKEN_PREFIX: &str = "scn_";
 pub enum AuthError {
     #[error("database: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Schema(#[from] MigrateError),
     #[error("{0}")]
     Invalid(String),
 }
@@ -175,7 +178,19 @@ pub struct AuthStore {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA: &str = "
+/// The accounts database's migrations; see [`scanner_store::migrate`] for
+/// the rules. Version 1 is the schema from before versioning, so it keeps
+/// `IF NOT EXISTS`; later steps must not.
+pub static SCHEMA: Schema = Schema {
+    name: "accounts database",
+    application_id: 0x5343_4E41, // "SCNA"
+    migrations: &[Migration {
+        description: "admins, sessions, api_tokens and audit tables",
+        up: Up::Sql(V1),
+    }],
+};
+
+const V1: &str = "
 CREATE TABLE IF NOT EXISTS admins (
     id INTEGER PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
@@ -234,9 +249,9 @@ impl AuthStore {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
-        conn.execute_batch(SCHEMA)?;
+        migrate::migrate(&mut conn, &SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -699,5 +714,46 @@ mod tests {
         assert_eq!(l.check(&["ip:5.6.7.8".into(), "user:bob".into()], 0), None);
         l.succeeded(&keys);
         assert_eq!(l.check(&keys, 0), None);
+    }
+
+    /// The schema every migration adds up to. A change here should come
+    /// with a new migration, never an edit to an old one.
+    #[test]
+    fn schema_snapshot() {
+        let a = AuthStore::in_memory().unwrap();
+        assert_eq!(
+            migrate::schema_sql(&a.db()).unwrap(),
+            include_str!("../schema/auth.sql")
+        );
+    }
+
+    #[test]
+    fn adopts_accounts_from_before_migrations_and_refuses_newer() {
+        // What PR 5 created: the tables at user_version 0.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("auth.sqlite");
+        let a = AuthStore::open(&p).unwrap();
+        let id = a.create_admin("masen", "correct horse battery", 0).unwrap();
+        a.db()
+            .execute_batch("PRAGMA user_version = 0; PRAGMA application_id = 0;")
+            .unwrap();
+        drop(a);
+
+        let a = AuthStore::open(&p).unwrap();
+        assert_eq!(
+            a.verify_password("masen", "correct horse battery").unwrap(),
+            Some(id)
+        );
+        let v: i64 = a
+            .db()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA.version());
+        a.db()
+            .pragma_update(None, "user_version", SCHEMA.version() + 1)
+            .unwrap();
+        drop(a);
+        let err = AuthStore::open(&p).err().unwrap().to_string();
+        assert!(err.contains("newer scanner"), "{err}");
     }
 }

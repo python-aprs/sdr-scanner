@@ -5,6 +5,7 @@
 //! (Phase 3).
 
 pub mod index;
+pub mod migrate;
 pub mod recorder;
 pub mod wav;
 
