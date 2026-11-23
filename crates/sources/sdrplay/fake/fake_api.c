@@ -1,3 +1,4 @@
+#include <unistd.h>
 /* Fake SDRplay API (built against the stand-in header next to it) for an end-to-end test: streams a 147.52 MHz carrier
  * keyed on/off, 1008-sample callbacks, with one injected counter gap.
  * FAKE_STALL_AFTER=<s>: the first stream stops delivering samples after that many seconds (like a USB failure), and the
@@ -17,7 +18,8 @@ static double stall_after(void){ const char *s=getenv("FAKE_STALL_AFTER"); retur
 sdrplay_api_ErrT sdrplay_api_Open(void){return 0;}
 sdrplay_api_ErrT sdrplay_api_Close(void){return 0;}
 sdrplay_api_ErrT sdrplay_api_ApiVersion(float *v){*v=3.15f;return 0;}
-sdrplay_api_ErrT sdrplay_api_LockDeviceApi(void){return 0;}
+/* FAKE_HANG_LOCK=1: another program holds the API lock, so this never returns. */
+sdrplay_api_ErrT sdrplay_api_LockDeviceApi(void){ if(getenv("FAKE_HANG_LOCK")) for(;;) sleep(1000); return 0;}
 sdrplay_api_ErrT sdrplay_api_UnlockDeviceApi(void){return 0;}
 sdrplay_api_ErrT sdrplay_api_GetDevices(sdrplay_api_DeviceT *d, unsigned int *n, unsigned int m){memset(d,0,sizeof *d);strcpy(d->SerNo,"FAKE0001");d->hwVer=SDRPLAY_RSP1A_ID;d->dev=(HANDLE)1;*n=1;return 0;}
 sdrplay_api_ErrT sdrplay_api_SelectDevice(sdrplay_api_DeviceT *d){

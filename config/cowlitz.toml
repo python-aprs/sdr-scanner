@@ -1,0 +1,161 @@
+# Cowlitz County, WA public safety, VHF high band (~150 MHz).
+#
+# Analog narrowband FM channels from a county frequency list, for testing
+# against busy channels with strong signals. Only the listed channels are
+# watched (grid = false): the span also covers marine VHF and other services
+# we do not want filling the recordings.
+#
+# Check with:  scanner config check config/cowlitz.toml --slots
+# Run with:    scanner serve --source sdrplay --config config/cowlitz.toml \
+#                --profile cowlitz-vhf
+#
+# The span is 7 MHz so it fits inside an RSP1A at 8 MS/s (the usable part is
+# about 0.9 x the sample rate). The default tuner frequency is the span centre
+# plus 12.5 kHz, 156.5125 MHz, which is clear of every listed channel.
+#
+# Left out of this profile:
+#   151.085      County Roads: below the span; 151.085 to 159.42 MHz is 8.3 MHz,
+#                more than 8 MS/s covers cleanly. Make a second profile
+#                (or move the span down and drop 158.925 and up) to hear it.
+#   157.740      CresComm paging, Cowlitz County: digital paging, no decoder.
+#   168-172 MHz  Federal IWN site 114: P25, and outside the span.
+#   453.150      Lower Columbia College security (UHF, trunked).
+#   440.375      AB7F repeater (70 cm; see config/rainier.toml).
+#   122-135 MHz  Kelso and Woodland airports: AM aircraft band.
+#   T 40912      Sheriff drug task force talkgroup (trunked).
+#
+# `tone` is the CTCSS tone the channel is listed with. It is informational:
+# compare it with the tone the scanner tags on each recording.
+
+[profiles.cowlitz-vhf]
+span       = { start = "153.000 MHz", stop = "160.000 MHz" }
+grid       = false
+bandwidth  = "11 kHz"       # 12.5 kHz narrowband
+deviation  = "2.5 kHz"
+audio_rate = 8000
+deemphasis = true
+
+# ---------------------------------------------------------------- fire
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "153.9200 MHz"
+name = "Kalama Fire Tac"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.0250 MHz"
+name = "Fire Tac"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.1150 MHz"
+name = "County Fire Tac Yellow"
+
+[[profiles.cowlitz-vhf.channels]]
+freq   = "154.1825 MHz"
+name   = "Fire Dispatch NXDN (patched to 154.235)"
+mode   = "nxdn"
+record = false             # digital; no decoder yet
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.2350 MHz"
+name = "Fire Dispatch"
+tone = 156.7
+
+[[profiles.cowlitz-vhf.channels]]
+freq   = "154.3175 MHz"
+name   = "Fire Dispatch NXDN RAN 42 (patched to 154.235)"
+mode   = "nxdn"
+record = false             # digital; no decoder yet
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.3700 MHz"
+name = "County Fire Tac Red"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.4150 MHz"
+name = "County Fire Longview Area Tac"
+
+# ---------------------------------------------------------------- law
+
+# Listed for the Sheriff and for Castle Rock, Kalama and Woodland police.
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.8150 MHz"
+name = "Sheriff / Castle Rock, Kalama, Woodland PD Dispatch"
+tone = 156.7
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.9500 MHz"
+name = "Sheriff Car to Car"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "155.0850 MHz"
+name = "Sheriff Tac"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "159.3900 MHz"
+name = "Sheriff Search and Rescue"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "155.5350 MHz"
+name = "Longview PD Dispatch"
+tone = 156.7
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "155.9400 MHz"
+name = "Longview PD Tac"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "156.0900 MHz"
+name = "Kelso PD Dispatch"
+tone = 156.7
+
+# Output 155.670, input 154.725: both slots are watched.
+[[profiles.cowlitz-vhf.repeaters]]
+name   = "Kelso City PD Dispatch"
+output = "155.6700 MHz"
+offset = "-945 kHz"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "154.7700 MHz"
+name = "WSP Dispatch"
+
+# ---------------------------------------------------------------- EMS
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "155.2200 MHz"
+name = "EMS"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "155.3250 MHz"
+name = "EMS Dispatch (AMR)"
+tone = 107.2
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "155.3400 MHz"
+name = "St Johns Medical Center"
+tone = 156.7
+
+# ---------------------------------------------------------------- other
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "153.6500 MHz"
+name = "County Utilities District"
+tone = 151.4
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "153.7250 MHz"
+name = "PUD #1 of Cowlitz County ch 2"
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "158.9250 MHz"
+name = "County Voice Paging (WQJ342)"
+tone = 156.7
+
+[[profiles.cowlitz-vhf.channels]]
+freq = "159.3000 MHz"
+name = "WS DNR Cascade, Signal Peak (WPYT851)"
+tone = 136.5
+
+# Listed with DCS 031; the scanner tags DCS as D031N.
+[[profiles.cowlitz-vhf.channels]]
+freq = "159.4200 MHz"
+name = "WS DNR State Cowlitz, Abernathy Mtn (DCS 031)"

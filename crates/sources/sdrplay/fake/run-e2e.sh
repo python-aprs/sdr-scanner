@@ -40,3 +40,18 @@ grep -q "radio reopened" "$work/log2"
 n2=$(find "$work/out2" -name '147.5200_*.wav' | wc -l)
 echo "recorded $n2 transmissions on 147.52 MHz around a reopen"
 [ "$n2" -ge 4 ]
+
+# Another program holds the API lock: serve says what it is waiting on after
+# 10 s, and Ctrl-C gets it out without a second Ctrl-C.
+FAKE_HANG_LOCK=1 "$root/target/release/scanner" serve --source sdrplay \
+    --config "$root/config/rainier.toml" --out "$work/out3" --http off 2>"$work/log3" &
+pid=$!
+sleep 12
+kill -INT $pid
+rc=0
+wait $pid || rc=$?
+cat "$work/log3"
+grep -q "still waiting for the SDRplay API" "$work/log3"
+grep -q "stopped while waiting" "$work/log3"
+[ "$rc" -ne 0 ]
+echo "a held radio is reported and Ctrl-C quits"
