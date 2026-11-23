@@ -43,6 +43,7 @@ Useful `serve` flags:
 | `--public-recordings`, `--public-audio` | off | let visitors who aren't logged in browse and play |
 | `--disk-budget-gb` | 8 | oldest recordings are deleted past 95 % |
 | `--anon-egress-gb` | 3 | monthly data allowance for visitors |
+| `--noise-squelch` | 8 | dB of quieting needed to play audio; 0 for power squelch only |
 | `--lna`, `--gr` | 3, 40 | RSP1A gain; use 9 and 59 near a strong transmitter |
 
 `scanner <command> --help` lists the rest.

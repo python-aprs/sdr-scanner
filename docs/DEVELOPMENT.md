@@ -38,6 +38,14 @@ scanner run <recording> --config config/rainier.toml --profile rainier-2m \
     --out out/ [--open-db 6 --close-db 3 --hang 1.5 --min-len 0.3] [--json]
 ```
 
+Audio plays only while two squelches agree: the power squelch (slot SNR over
+`--close-db`) and the noise squelch (`--noise-squelch`, 8 dB by default,
+`dsp::NoiseSquelch`). The noise squelch measures the discriminator output
+between 5 and 9 kHz, above any voice audio, and compares it with what pure
+noise gives. An FM signal quiets that band by about its SNR plus 4 dB; noise
+and switching-supply hash that lift a slot's power leave it loud, so their
+transmissions stay muted and are dropped as silent.
+
 `scanner serve --source loop:<recording> --config ... --profile ...` is the
 long-running mode: a radio thread pushes samples into a lock-free ring
 (`scanner_sources::ring`, drops counted and zero-filled so timestamps never

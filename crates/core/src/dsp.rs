@@ -227,6 +227,19 @@ impl Biquad {
         }
     }
 
+    fn lowpass(rate: f64, cutoff: f64, q: f64) -> Self {
+        let w0 = 2.0 * PI * cutoff / rate;
+        let alpha = w0.sin() / (2.0 * q);
+        let cw = w0.cos();
+        let a0 = 1.0 + alpha;
+        let b1 = (1.0 - cw) / a0;
+        Biquad {
+            b: [(b1 / 2.0) as f32, b1 as f32, (b1 / 2.0) as f32],
+            a: [(-2.0 * cw / a0) as f32, ((1.0 - alpha) / a0) as f32],
+            z: [0.0; 2],
+        }
+    }
+
     fn process(&mut self, buf: &mut [f32]) {
         let [b0, b1, b2] = self.b;
         let [a1, a2] = self.a;
@@ -261,6 +274,101 @@ impl HighPass {
         for s in &mut self.stages {
             s.process(buf);
         }
+    }
+}
+
+/// Noise squelch: mutes a channel whose discriminator output is full of
+/// noise above the voice band, the way FM radios do it.
+///
+/// An FM signal "quiets" the discriminator: the stronger the carrier, the
+/// less noise there is between the top of the voice band (transmitters cut
+/// audio off near 3 kHz) and the channel edge. Wideband noise and
+/// interference that lift the power in a slot, without being an FM signal,
+/// leave that band loud. This measures the band's power per block and
+/// compares it with what pure noise gives, as dB of quieting.
+#[derive(Debug, Clone)]
+pub struct NoiseSquelch {
+    hp: [HighPass; 2],
+    lp: [Biquad; 2],
+    /// Band power (deviation units squared) with no signal at all.
+    noise_ms: f64,
+    open_db: f32,
+    close_db: f32,
+    open: bool,
+    quieting_db: f32,
+    scratch: Vec<f32>,
+}
+
+impl NoiseSquelch {
+    /// The measured band (Hz): above the loudest voice audio (transmitters
+    /// cut off near 3 kHz), below where the channel filter has taken the
+    /// noise away. The high-pass is 8th order, so a full-deviation 3 kHz
+    /// tone still reads as quiet.
+    pub const BAND_LO: f64 = 5000.0;
+    pub const BAND_HI: f64 = 9000.0;
+    /// Hysteresis: once open, it stays open down to this much less quieting.
+    pub const HYSTERESIS_DB: f32 = 3.0;
+
+    /// `rate` is the discriminator's sample rate, `deviation_hz` its scale
+    /// (output 1.0) and `bandwidth_hz` the channel filter's width. Opens at
+    /// `open_db` of quieting.
+    pub fn new(rate: f64, deviation_hz: f64, bandwidth_hz: f64, open_db: f32) -> Self {
+        let lo = Self::BAND_LO;
+        let hi = Self::BAND_HI.min(0.42 * rate).max(lo + 1000.0);
+        // Pure noise through the discriminator is close to white with an RMS
+        // of pi/sqrt(3) radians a sample; the band holds its share of that,
+        // less in a channel narrower than the band's top edge.
+        let gain = rate / (2.0 * PI * deviation_hz);
+        let noise_ms = PI * PI / 3.0 * gain * gain * (hi - lo) / (rate / 2.0)
+            * (bandwidth_hz / 2.0 / hi).min(1.0);
+        NoiseSquelch {
+            hp: [HighPass::new(rate, lo), HighPass::new(rate, lo)],
+            lp: [
+                Biquad::lowpass(rate, hi, 0.541_196_1),
+                Biquad::lowpass(rate, hi, 1.306_563),
+            ],
+            noise_ms,
+            open_db,
+            close_db: open_db - Self::HYSTERESIS_DB,
+            open: false,
+            quieting_db: 0.0,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Measure one block of discriminator output; true if the squelch is
+    /// open for it.
+    pub fn update(&mut self, d: &[f32]) -> bool {
+        if d.is_empty() {
+            return self.open;
+        }
+        self.scratch.clear();
+        self.scratch.extend_from_slice(d);
+        for s in &mut self.hp {
+            s.process(&mut self.scratch);
+        }
+        for s in &mut self.lp {
+            s.process(&mut self.scratch);
+        }
+        let ms = self
+            .scratch
+            .iter()
+            .map(|&v| v as f64 * v as f64)
+            .sum::<f64>()
+            / d.len() as f64;
+        self.quieting_db = (10.0 * (self.noise_ms / ms.max(1e-20)).log10()) as f32;
+        let t = if self.open {
+            self.close_db
+        } else {
+            self.open_db
+        };
+        self.open = self.quieting_db >= t;
+        self.open
+    }
+
+    /// Quieting of the last block (dB below pure noise).
+    pub fn quieting_db(&self) -> f32 {
+        self.quieting_db
     }
 }
 
