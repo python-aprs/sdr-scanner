@@ -8,6 +8,7 @@
 //! | `GET /api/v1/recordings` | anonymous if `public.recordings` (default off), else admin |
 //! | `GET /api/v1/recordings/{id}` | same as the list |
 //! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin: the Opus copy, or the WAV with `?format=wav` or when there's no copy |
+//! | `GET /api/v1/packets` | same as the recordings list: decoded AX.25 frames, newest first (`before_id`, `limit`) |
 //! | `GET /api/v1/channels` | same as status |
 //! | `GET /api/v1/storage` | admin: disk usage, budget, free space and what retention deleted |
 //! | `GET /api/v1/egress` | admin: bytes sent per role this month and earlier ones (see [`egress`]) |
@@ -401,6 +402,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/live", get(live::live_ws))
         .route("/api/v1/audio", get(audio::audio_ws))
         .route("/api/v1/recordings", get(list_recordings))
+        .route("/api/v1/packets", get(list_packets))
         .route("/api/v1/recordings/{id}", get(get_recording))
         .route("/api/v1/recordings/{id}/audio", get(get_audio))
         .route("/api/v1/auth/login", post(login))
@@ -704,6 +706,28 @@ async fn list_recordings(
     let items: Vec<Recording> = rows.into_iter().map(recording).collect();
     Ok(Json(
         serde_json::json!({ "items": items, "next_before_id": next }),
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PacketParams {
+    before_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn list_packets(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    UrlQuery(p): UrlQuery<PacketParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.caller(&headers).await?.require(s.public.recordings)?;
+    let limit = p.limit.unwrap_or(100);
+    let rows = blocking(move || s.index()?.packets(p.before_id, limit).map_err(db_err)).await?;
+    let next = (rows.len() == limit.clamp(1, 1000))
+        .then(|| rows.last().map(|r| r.id))
+        .flatten();
+    Ok(Json(
+        serde_json::json!({ "items": rows, "next_before_id": next }),
     ))
 }
 
@@ -1367,6 +1391,7 @@ mod tests {
             ("/api/v1/channels", 0),
             ("/api/v1/live", 0),
             ("/api/v1/recordings", 1),
+            ("/api/v1/packets", 1),
             ("/api/v1/recordings/{id}", 2),
             ("/api/v1/recordings/{id}/audio", 3),
             ("/api/v1/audio", 3),

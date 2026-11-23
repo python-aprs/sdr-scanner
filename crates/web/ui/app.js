@@ -434,7 +434,7 @@
     const hash = location.hash.replace(/^#\/?/, '') || 'live';
     const [name, query] = hash.split('?');
     const params = new URLSearchParams(query || '');
-    const views = { live: viewLive, recordings: viewRecordings, channels: viewChannels, admin: viewAdmin };
+    const views = { live: viewLive, recordings: viewRecordings, packets: viewPackets, channels: viewChannels, admin: viewAdmin };
     const fn = views[name] || viewLive;
     state.view = views[name] ? name : 'live';
     document.querySelectorAll('.tabs a').forEach((a) => {
@@ -840,6 +840,57 @@
     more.onclick = load;
     load();
     return null;
+  }
+
+  // ----- Packets -----
+  function viewPackets(root) {
+    root.append(h('div', { class: 'page-title' }, h('h1', {}, 'Packets'), h('span', { class: 'muted', id: 'pk-count' })));
+    if (!canRecordings()) {
+      root.append(notice('Packets are private', 'The operator hasn’t made recordings public on this scanner.', h('a', { href: '#/admin' }, 'Log in')));
+      return null;
+    }
+    const tbody = h('tbody');
+    const status = h('div', { class: 'empty', hidden: true });
+    const more = h('button', { type: 'button' }, 'Load older');
+    root.append(h('section', { class: 'panel' },
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Time'), h('th', {}, 'Frequency'), h('th', {}, 'Packet'))),
+        tbody)),
+      status, h('div', { class: 'more' }, more)));
+    let newest = 0, oldest = null;
+    const row = (p) => {
+      const when = nsDate(p.time_ns);
+      return h('tr', {},
+        h('td', { class: 'mono' }, `${dayLabel(when)} ${timeFmt.format(when)}`),
+        h('td', { class: 'mono' }, MHZ(p.freq_hz, 4)),
+        h('td', { class: 'grow mono packet' }, p.text));
+    };
+    async function load(older) {
+      const q = new URLSearchParams({ limit: '100' });
+      if (older && oldest !== null) q.set('before_id', String(oldest));
+      try {
+        const res = await api(`/packets?${q}`);
+        if (older || newest === 0) {
+          tbody.append(...res.items.map(row));
+          if (res.items.length) oldest = res.items[res.items.length - 1].id;
+          more.hidden = res.next_before_id === null;
+        } else {
+          const fresh = res.items.filter((p) => p.id > newest);
+          tbody.prepend(...fresh.map(row));
+        }
+        if (res.items.length) newest = Math.max(newest, res.items[0].id);
+        const n = tbody.children.length;
+        $('#pk-count').textContent = n ? `${fmtCount(n)} shown` : '';
+        status.hidden = n > 0;
+        status.textContent = 'No packets decoded yet. Channels with mode afsk1200 (144.390 APRS, 144.920) decode them.';
+      } catch (e) {
+        status.hidden = false; status.textContent = e.message;
+      }
+    }
+    more.onclick = () => load(true);
+    load(false);
+    const timer = setInterval(() => load(false), 5000);
+    return () => clearInterval(timer);
   }
 
   // ----- Channels -----

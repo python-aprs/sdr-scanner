@@ -65,6 +65,19 @@ out. `serve` saves the lockout as a channel override by `spur detector`,
 so it survives restarts and shows as "Spur" on the Channels page until an
 admin unlocks or resets it.
 
+Channels with `mode = "afsk1200"` (144.390 APRS and 144.920 in
+`config/rainier.toml`) decode AX.25 packets instead of recording audio
+(`afsk::AfskDecoder`). The discriminator output goes, without
+de-emphasis, into mark and space correlators over one bit. Five slicers
+then weigh space against mark from -6 to +6 dB, to cope with
+pre-emphasis tilt, and each has its own clock recovery, NRZI and HDLC
+deframer. Frames with a good FCS are kept once. Each packet lands in the
+`packets` table of `index.sqlite` (index migration 4) as monitor text
+(`SRC>DEST,PATH:info`), plus the raw frame. The web UI's Packets page
+lists them, through `GET /api/v1/packets`. `serve --kiss 127.0.0.1:8001`
+also serves them as KISS over TCP, so APRS software can treat the scanner
+as a receive-only TNC. No APRS field parsing happens here.
+
 `scanner serve --source loop:<recording> --config ... --profile ...` is the
 long-running mode: a radio thread pushes samples into a lock-free ring
 (`scanner_sources::ring`, drops counted and zero-filled so timestamps never

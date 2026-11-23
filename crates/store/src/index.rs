@@ -35,6 +35,23 @@ pub static SCHEMA: Schema = Schema {
             description: "CTCSS/DCS tone tags",
             up: Up::Sql("ALTER TABLE transmissions ADD COLUMN tone TEXT;"),
         },
+        Migration {
+            description: "AX.25 packets",
+            up: Up::Sql(
+                "CREATE TABLE packets (
+                    id      INTEGER PRIMARY KEY,
+                    time_ns INTEGER NOT NULL,
+                    freq_hz REAL    NOT NULL,
+                    channel TEXT,
+                    source  TEXT    NOT NULL,
+                    dest    TEXT    NOT NULL,
+                    path    TEXT    NOT NULL,
+                    text    TEXT    NOT NULL,
+                    raw     BLOB    NOT NULL
+                 );
+                 CREATE INDEX packets_time ON packets(time_ns);",
+            ),
+        },
     ],
 };
 
@@ -98,6 +115,24 @@ pub struct Query {
     /// Paging: only rows with a smaller id.
     pub before_id: Option<i64>,
     pub limit: usize,
+}
+
+/// A decoded AX.25 frame.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PacketRow {
+    pub id: i64,
+    pub time_ns: i64,
+    pub freq_hz: f64,
+    pub channel: Option<String>,
+    pub source: String,
+    pub dest: String,
+    /// Digipeaters, comma-separated, `*` on those that repeated it.
+    pub path: String,
+    /// `SRC>DEST,PATH:info` (non-printable bytes as `<0xNN>`).
+    pub text: String,
+    /// The frame without its FCS, as KISS carries it.
+    #[serde(skip)]
+    pub raw: Vec<u8>,
 }
 
 pub struct NewRow<'a> {
@@ -194,6 +229,44 @@ impl Index {
             params![id, path, bytes as i64],
         )?;
         Ok(())
+    }
+
+    pub fn insert_packet(&self, p: &PacketRow) -> Result<i64, IndexError> {
+        self.db.execute(
+            "INSERT INTO packets (time_ns, freq_hz, channel, source, dest, path, text, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                p.time_ns, p.freq_hz, p.channel, p.source, p.dest, p.path, p.text, p.raw
+            ],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Packets newest first, optionally only those with a smaller id.
+    pub fn packets(
+        &self,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PacketRow>, IndexError> {
+        let mut st = self.db.prepare(
+            "SELECT * FROM packets WHERE (?1 IS NULL OR id < ?1)
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        st.query_map(params![before_id, limit.clamp(1, 1000) as i64], |r| {
+            Ok(PacketRow {
+                id: r.get("id")?,
+                time_ns: r.get("time_ns")?,
+                freq_hz: r.get("freq_hz")?,
+                channel: r.get("channel")?,
+                source: r.get("source")?,
+                dest: r.get("dest")?,
+                path: r.get("path")?,
+                text: r.get("text")?,
+                raw: r.get("raw")?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Into::into)
     }
 
     /// Remove a row (a recording that was thrown away).

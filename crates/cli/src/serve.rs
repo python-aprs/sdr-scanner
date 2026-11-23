@@ -132,6 +132,8 @@ pub struct ServeOptions<'a> {
     /// Monthly budget for anonymous web traffic; 0 for none.
     pub anon_egress_bytes: u64,
     pub status_every: Duration,
+    /// Serve decoded AX.25 frames as KISS over TCP on this address.
+    pub kiss: Option<std::net::SocketAddr>,
 }
 
 type Started = (
@@ -223,6 +225,61 @@ fn start_sdrplay(
     bail!(
         "this scanner was built without SDRplay support; rebuild with `--features sdrplay` (needs the SDRplay API 3.x installed)"
     )
+}
+
+/// A KISS data frame (port 0) for an AX.25 frame without its FCS.
+pub fn kiss_frame(raw: &[u8]) -> Vec<u8> {
+    const FEND: u8 = 0xc0;
+    const FESC: u8 = 0xdb;
+    let mut f = Vec::with_capacity(raw.len() + 4);
+    f.extend([FEND, 0x00]);
+    for &b in raw {
+        match b {
+            FEND => f.extend([FESC, 0xdc]),
+            FESC => f.extend([FESC, 0xdd]),
+            _ => f.push(b),
+        }
+    }
+    f.push(FEND);
+    f
+}
+
+/// Receive-only KISS-over-TCP server: every connected client gets every
+/// decoded frame; anything clients send is ignored. Frames go through a
+/// channel so a slow client never holds up the DSP thread.
+fn start_kiss(addr: std::net::SocketAddr) -> Result<std::sync::mpsc::Sender<Vec<u8>>> {
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    let listener = TcpListener::bind(addr).with_context(|| format!("KISS: listening on {addr}"))?;
+    let clients: Arc<std::sync::Mutex<Vec<TcpStream>>> = Default::default();
+    let c2 = clients.clone();
+    std::thread::Builder::new()
+        .name("kiss-accept".into())
+        .spawn(move || {
+            for s in listener.incoming().flatten() {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                if let Ok(peer) = s.peer_addr() {
+                    eprintln!("KISS client connected: {peer}");
+                }
+                if let Ok(mut g) = c2.lock() {
+                    g.push(s);
+                }
+            }
+        })?;
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name("kiss-send".into())
+        .spawn(move || {
+            for raw in rx {
+                let f = kiss_frame(&raw);
+                if let Ok(mut g) = clients.lock() {
+                    g.retain_mut(|c| c.write_all(&f).is_ok());
+                }
+            }
+        })?;
+    eprintln!("KISS over TCP on {addr} (receive only)");
+    Ok(tx)
 }
 
 fn now_ns() -> i64 {
@@ -413,6 +470,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         .with_retention(o.retention)?;
     let disk_usage = recorder.disk_usage();
     let (tx, writer) = recorder.spawn(256);
+    let kiss = o.kiss.map(start_kiss).transpose()?;
 
     // Lockout and priority edits made in the web UI, on top of the config.
     let settings_path = o.out.join("settings.sqlite");
@@ -610,12 +668,19 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         }
         if !out.is_empty() {
             for o in &out {
-                if let Output::Open(s) = o {
-                    eprintln!(
+                match o {
+                    Output::Open(s) => eprintln!(
                         "  open  {} {}",
                         Hz(s.slot.freq),
                         s.slot.name.as_deref().unwrap_or("")
-                    );
+                    ),
+                    Output::Packet(p) => {
+                        eprintln!("  packet {} {}", Hz(p.slot.freq), p.frame.tnc2());
+                        if let Some(k) = &kiss {
+                            let _ = k.send(p.frame.raw.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
             tx.send(std::mem::take(&mut out))
@@ -730,4 +795,15 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         eprintln!("radio: {note}");
     }
     radio_result
+}
+
+#[cfg(test)]
+mod kiss_tests {
+    #[test]
+    fn kiss_escapes_frame_bytes() {
+        assert_eq!(
+            super::kiss_frame(&[0x01, 0xc0, 0xdb, 0x02]),
+            vec![0xc0, 0x00, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0x02, 0xc0]
+        );
+    }
 }
