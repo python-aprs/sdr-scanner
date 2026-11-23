@@ -809,11 +809,15 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 },
                 {
                     let d = scanner.detector();
+                    let pulses = match d.comb_events() {
+                        0 => String::new(),
+                        n => format!(", {n} comb pulses"),
+                    };
                     match (d.background_slots(), d.comb()) {
                         (0, _) => String::new(),
-                        (n, None) => format!(", {n} channels raised over steady interference"),
+                        (n, None) => format!(", {n} channels raised over interference{pulses}"),
                         (n, Some((spacing, teeth))) => format!(
-                            ", {n} channels raised over steady interference (comb: {teeth} lines every {:.0} kHz)",
+                            ", {n} channels raised over interference (comb: {teeth} lines every {:.0} kHz{pulses})",
                             spacing / 1e3
                         ),
                     }

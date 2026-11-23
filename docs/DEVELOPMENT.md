@@ -79,6 +79,19 @@ raised unless it is on more than 90% of the time. The serve status line
 reports how many channels are raised and, when the raised ones are evenly
 spaced, the comb (`comb: 6 lines every 260 kHz`): `Detector::comb`.
 
+Many supplies cycle, though: on Masen's RSP1A (Nov 2026) the whole comb,
+lines every ~262 kHz at 5-8 dB, came up together for tens of seconds and
+then went away, so no channel sat on a line most of the time and the
+background stayed at zero. The pulsed comb guard catches that from the
+coincidence instead: when four or more slots cross the open threshold
+within one second, none over 15 dB, and at least four of them lie on one
+evenly spaced grid (`comb_members`), they are comb lines. Their attacks are
+cancelled, and for the next 30 minutes each must clear the level it rose
+to by 6 dB to open (and stays open only that far up). Every later cycle of
+the comb refreshes that. Linked repeaters keying up together are not
+evenly spaced and are usually stronger, so they get through. The status
+line counts the comb pulses seen.
+
 Channels with `mode = "afsk1200"` (144.390 APRS and 144.920 in
 `config/rainier.toml`) decode AX.25 packets instead of recording audio
 (`afsk::AfskDecoder`). The discriminator output goes, without
