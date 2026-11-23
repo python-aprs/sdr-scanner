@@ -277,6 +277,29 @@ impl HighPass {
     }
 }
 
+/// Fourth-order Butterworth low-pass (two biquads).
+#[derive(Debug, Clone)]
+pub struct LowPass {
+    stages: [Biquad; 2],
+}
+
+impl LowPass {
+    pub fn new(rate: f64, cutoff: f64) -> Self {
+        LowPass {
+            stages: [
+                Biquad::lowpass(rate, cutoff, 0.541_196_1),
+                Biquad::lowpass(rate, cutoff, 1.306_563),
+            ],
+        }
+    }
+
+    pub fn process(&mut self, buf: &mut [f32]) {
+        for s in &mut self.stages {
+            s.process(buf);
+        }
+    }
+}
+
 /// Noise squelch: mutes a channel whose discriminator output is full of
 /// noise above the voice band, the way FM radios do it.
 ///
@@ -289,7 +312,7 @@ impl HighPass {
 #[derive(Debug, Clone)]
 pub struct NoiseSquelch {
     hp: [HighPass; 2],
-    lp: [Biquad; 2],
+    lp: LowPass,
     /// Band power (deviation units squared) with no signal at all.
     noise_ms: f64,
     open_db: f32,
@@ -323,10 +346,7 @@ impl NoiseSquelch {
             * (bandwidth_hz / 2.0 / hi).min(1.0);
         NoiseSquelch {
             hp: [HighPass::new(rate, lo), HighPass::new(rate, lo)],
-            lp: [
-                Biquad::lowpass(rate, hi, 0.541_196_1),
-                Biquad::lowpass(rate, hi, 1.306_563),
-            ],
+            lp: LowPass::new(rate, hi),
             noise_ms,
             open_db,
             close_db: open_db - Self::HYSTERESIS_DB,
@@ -347,9 +367,7 @@ impl NoiseSquelch {
         for s in &mut self.hp {
             s.process(&mut self.scratch);
         }
-        for s in &mut self.lp {
-            s.process(&mut self.scratch);
-        }
+        self.lp.process(&mut self.scratch);
         let ms = self
             .scratch
             .iter()

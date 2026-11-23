@@ -86,3 +86,9 @@ def test_scanner_run_records_ci_smoke(tmp_path):
         # Python reference demod gets 29, 15 and 28 dB on these.
         assert m.audio_snr_db is not None and m.audio_snr_db > 12, m
     assert (tmp_path / "out" / "index.sqlite").exists()
+    # The CTCSS tone of the simplex transmission is tagged, and only that.
+    import sqlite3
+
+    db = sqlite3.connect(tmp_path / "out" / "index.sqlite")
+    tones = {round(f / 1e3): t for f, t in db.execute("SELECT freq_hz, tone FROM transmissions")}
+    assert tones == {146520: "100.0", 146840: None, 145612: None}, tones

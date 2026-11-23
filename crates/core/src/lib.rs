@@ -10,6 +10,7 @@ pub mod detector;
 pub mod dsp;
 pub mod psd;
 pub mod scanner;
+pub mod tone;
 pub mod units;
 
 pub use num_complex::Complex32;

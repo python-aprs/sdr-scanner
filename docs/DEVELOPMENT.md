@@ -46,6 +46,15 @@ noise gives. An FM signal quiets that band by about its SNR plus 4 dB; noise
 and switching-supply hash that lift a slot's power leave it loud, so their
 transmissions stay muted and are dropped as silent.
 
+Each recording is tagged with the CTCSS tone or DCS code it carried
+(`tone` in the index and API: `100.0`, `D023N`), from `tone::ToneDetector`.
+It reads the unmuted audio below 270 Hz before the voice high-pass removes
+it: Goertzel filters at the 51 standard tones over 1 s windows, and for DCS
+the 134.4 bit/s stream sliced at 8 clock phases with every 23-bit window
+checked against the Golay code and the 104 standard codes. A DCS code and
+its inverted partner are the same waveform (023 N is 047 I); the
+normal-polarity name wins.
+
 `scanner serve --source loop:<recording> --config ... --profile ...` is the
 long-running mode: a radio thread pushes samples into a lock-free ring
 (`scanner_sources::ring`, drops counted and zero-filled so timestamps never
@@ -58,7 +67,7 @@ radio (`--source sdrplay`, below) or a recording replayed at its real rate
 to disable), routes under `/api/v1` (see `crates/web/src/lib.rs`):
 `status` (live snapshot: active channels, noise floor, DSP load, drops),
 `recordings` (search by `freq_min`/`freq_max` Hz, `since`/`until` Unix s,
-`min_secs`; page with `before_id`), `recordings/{id}` and
+`min_secs`, `tone`; page with `before_id`), `recordings/{id}` and
 `recordings/{id}/audio` (the Opus copy if there is one, else the WAV;
 `?format=wav` or `?format=opus` to choose; HTTP range requests). Anonymous visitors see
 live status only unless `--public-recordings` / `--public-audio`.
