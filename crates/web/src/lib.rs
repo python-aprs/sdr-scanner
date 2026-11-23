@@ -525,7 +525,7 @@ impl AppState {
     fn channel_at(&self, freq_hz: i64) -> Option<ChannelInfo> {
         self.channels.read().ok().and_then(|g| {
             g.iter()
-                .find(|c| (c.freq_hz - freq_hz as f64).abs() < 1.0)
+                .find(|c| scanner_core::config::same_freq(c.freq_hz, freq_hz as f64))
                 .cloned()
         })
     }

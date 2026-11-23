@@ -5,13 +5,12 @@ use crate::index::{Index, IndexError, NewRow};
 use crate::ogg::OggOpusWriter;
 use crate::retention::{DiskUsage, Policy, Retention};
 use crate::wav::WavWriter;
-use scanner_core::clock::compact_utc;
+use scanner_core::clock::{compact_utc, unix_ns};
 use scanner_core::scanner::{Output, TxStart};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
-use std::time::UNIX_EPOCH;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecorderError {
@@ -78,12 +77,6 @@ pub fn opus_path(wav_rel: &str) -> String {
         Some(stem) => format!("{stem}.opus"),
         None => format!("{wav_rel}.opus"),
     }
-}
-
-fn unix_ns(t: std::time::SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 impl Recorder {
@@ -165,8 +158,8 @@ impl Recorder {
                 let row = self.index.insert(&NewRow {
                     freq_hz: start.slot.freq,
                     channel: start.slot.name.as_deref(),
-                    origin: &format!("{:?}", start.slot.origin).to_lowercase(),
-                    mode: &format!("{:?}", start.slot.mode).to_lowercase(),
+                    origin: start.slot.origin.as_str(),
+                    mode: start.slot.mode.as_str(),
                     start_ns: unix_ns(start.start_time),
                     audio_rate: start.audio_rate,
                     wav_path: &rel,
@@ -302,7 +295,7 @@ mod tests {
     use super::*;
     use scanner_core::config::{Mode, Slot, SlotOrigin};
     use scanner_core::scanner::TxEnd;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn writes_file_and_row() {

@@ -822,10 +822,7 @@ fn run(a: RunArgs) -> Result<()> {
         ours.extend(index.get(*id)?);
     }
     ours.sort_by_key(|r| (r.start_ns, r.id));
-    let t0_ns = t0
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let t0_ns = scanner_core::clock::unix_ns(t0);
     if a.json {
         let txs: Vec<serde_json::Value> = ours
             .iter()

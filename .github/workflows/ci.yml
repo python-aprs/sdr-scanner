@@ -28,8 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
-      # Hardware backends compile as stubs until Phase 2; keep them building.
-      - run: cargo clippy -p scanner-sources --all-targets --features airspy,sdrplay
+      # The SDRplay backend builds against a stand-in header; keep it building.
+      - run: cargo clippy -p scanner-sources --all-targets --features sdrplay
       - run: cargo test --workspace
       - run: cargo build --release -p scanner-cli
       - run: target/release/scanner config check config/example-2m.toml

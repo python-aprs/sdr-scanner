@@ -8,6 +8,8 @@
 
 use anyhow::{Context, Result, bail};
 use num_complex::Complex32;
+use scanner_core::clock::now_ns;
+use scanner_core::config::same_freq;
 use scanner_core::scanner::{Output, Scanner, ScannerConfig};
 use scanner_core::units::Hz;
 use scanner_sources::{FileSource, Source, SourceInfo, ring};
@@ -325,13 +327,6 @@ fn start_kiss(addr: std::net::SocketAddr) -> Result<std::sync::mpsc::Sender<Vec<
     Ok(tx)
 }
 
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
 /// The watched slots as the web channel list shows them.
 /// Half-width of a lockout placed on a frequency that isn't a watched slot
 /// (an off-grid signal a grid slot retunes onto, or a birdie).
@@ -350,14 +345,14 @@ fn apply_overrides(
 ) {
     let mut ranges = Vec::new();
     for &(freq, record, priority) in base {
-        let o = list.iter().find(|o| (o.freq_hz as f64 - freq).abs() < 1.0);
+        let o = list.iter().find(|o| same_freq(o.freq_hz as f64, freq));
         let record = o.and_then(|o| o.locked_out).map_or(record, |l| !l);
         let priority = o.and_then(|o| o.priority).unwrap_or(priority);
         scanner.set_slot_flags(freq, record, priority, out);
     }
     for o in list {
         let freq = o.freq_hz as f64;
-        let on_slot = base.iter().any(|&(f, _, _)| (f - freq).abs() < 1.0);
+        let on_slot = base.iter().any(|&(f, _, _)| same_freq(f, freq));
         if !on_slot && o.locked_out == Some(true) {
             ranges.push((freq - LOCKOUT_HALF_HZ, freq + LOCKOUT_HALF_HZ));
         }
@@ -371,7 +366,7 @@ fn channel_list(
 ) -> Vec<scanner_web::ChannelInfo> {
     use scanner_core::config::SlotOrigin;
     // Only link to a half that is actually watched (inside the capture).
-    let watched = |f: f64| slots.iter().any(|w| (w.slot.freq - f).abs() < 1.0);
+    let watched = |f: f64| slots.iter().any(|w| same_freq(w.slot.freq, f));
     slots
         .iter()
         .map(|w| {
@@ -385,17 +380,17 @@ fn channel_list(
                     SlotOrigin::RepeaterInput => "repeater_input",
                     SlotOrigin::Grid => "grid",
                 },
-                mode: format!("{:?}", s.mode).to_lowercase(),
+                mode: s.mode.as_str().into(),
                 bandwidth_hz: s.bandwidth,
                 priority: s.priority,
                 locked_out: !s.record,
                 pair_hz: s.pair.filter(|&f| watched(f)),
                 overridden: overrides
                     .iter()
-                    .any(|o| (o.freq_hz as f64 - s.freq).abs() < 1.0),
-                spur: overrides.iter().any(|o| {
-                    (o.freq_hz as f64 - s.freq).abs() < 1.0 && o.updated_by == SPUR_DETECTOR
-                }),
+                    .any(|o| same_freq(o.freq_hz as f64, s.freq)),
+                spur: overrides
+                    .iter()
+                    .any(|o| same_freq(o.freq_hz as f64, s.freq) && o.updated_by == SPUR_DETECTOR),
             }
         })
         .chain(

@@ -7,7 +7,7 @@
 //! turns that into transmission open/close events.
 
 use crate::channelizer::{BankParams, Block};
-use crate::config::{Slot, SlotOrigin};
+use crate::config::{Slot, SlotOrigin, same_freq};
 use num_complex::Complex32;
 use std::collections::VecDeque;
 
@@ -402,6 +402,11 @@ impl Detector {
 
     pub fn slots(&self) -> &[WatchedSlot] {
         &self.slots
+    }
+
+    /// The watched slot at `freq` (Hz, see [`same_freq`]).
+    pub fn slot_at(&self, freq: f64) -> Option<usize> {
+        self.slots.iter().position(|w| same_freq(w.slot.freq, freq))
     }
 
     pub fn state(&self, i: usize) -> SlotState {

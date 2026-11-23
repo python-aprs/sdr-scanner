@@ -12,7 +12,6 @@ name = "scanner"
 path = "src/main.rs"
 
 [features]
-airspy = ["scanner-sources/airspy"]
 sdrplay = ["scanner-sources/sdrplay"]
 
 [dependencies]

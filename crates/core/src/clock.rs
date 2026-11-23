@@ -60,6 +60,18 @@ impl SampleClock {
     }
 }
 
+/// Nanoseconds since the Unix epoch (0 for times before it).
+pub fn unix_ns(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// [`unix_ns`] of now.
+pub fn now_ns() -> i64 {
+    unix_ns(SystemTime::now())
+}
+
 /// Format a timestamp as compact ISO 8601 UTC with milliseconds,
 /// e.g. `20261122T065403.123Z`, as used in recording file names.
 pub fn compact_utc(t: SystemTime) -> String {

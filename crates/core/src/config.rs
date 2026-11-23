@@ -33,6 +33,30 @@ pub enum Mode {
     Cw,
 }
 
+/// Whether two frequencies (Hz) name the same channel. Channels are
+/// configured and overridden in whole Hz; within 1 Hz is a match.
+pub fn same_freq(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1.0
+}
+
+impl Mode {
+    /// The name used in config files, the index and the API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Nbfm => "nbfm",
+            Mode::Afsk1200 => "afsk1200",
+            Mode::Dmr => "dmr",
+            Mode::Ysf => "ysf",
+            Mode::Dstar => "dstar",
+            Mode::P25 => "p25",
+            Mode::Nxdn => "nxdn",
+            Mode::Usb => "usb",
+            Mode::Lsb => "lsb",
+            Mode::Cw => "cw",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Span {
@@ -293,7 +317,7 @@ impl Profile {
                 ));
                 return;
             }
-            if let Some(existing) = explicit.iter().find(|e| (e.freq - slot.freq).abs() < 1.0) {
+            if let Some(existing) = explicit.iter().find(|e| same_freq(e.freq, slot.freq)) {
                 warnings.push(format!(
                     "{} at {} duplicates {}; keeping the first",
                     slot.label(),
@@ -399,6 +423,18 @@ pub enum SlotOrigin {
     Grid,
 }
 
+impl SlotOrigin {
+    /// The name stored in the recordings index.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotOrigin::Listed => "listed",
+            SlotOrigin::RepeaterOutput => "repeateroutput",
+            SlotOrigin::RepeaterInput => "repeaterinput",
+            SlotOrigin::Grid => "grid",
+        }
+    }
+}
+
 /// One frequency the detector watches.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slot {
@@ -440,6 +476,25 @@ pub struct ChannelPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_match_the_stored_and_parsed_forms() {
+        // The index has always stored lowercase Debug names; keep them.
+        use SlotOrigin::*;
+        for o in [Listed, RepeaterOutput, RepeaterInput, Grid] {
+            assert_eq!(o.as_str(), format!("{o:?}").to_lowercase());
+        }
+        use Mode::*;
+        for m in [Nbfm, Afsk1200, Dmr, Ysf, Dstar, P25, Nxdn, Usb, Lsb, Cw] {
+            assert_eq!(m.as_str(), format!("{m:?}").to_lowercase());
+            #[derive(Deserialize)]
+            struct W {
+                mode: Mode,
+            }
+            let w: W = toml::from_str(&format!("mode = \"{}\"", m.as_str())).unwrap();
+            assert_eq!(w.mode, m);
+        }
+    }
 
     const EXAMPLE: &str = r#"
 [profiles.2m-25k]
@@ -490,7 +545,7 @@ deviation = "2.5 kHz"
     fn slot_at(p: &ChannelPlan, f: f64) -> &Slot {
         p.slots
             .iter()
-            .find(|s| (s.freq - f).abs() < 1.0)
+            .find(|s| same_freq(s.freq, f))
             .unwrap_or_else(|| panic!("no slot at {f}"))
     }
 
