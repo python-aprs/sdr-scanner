@@ -7,12 +7,14 @@
 //! so the driver callback never blocks (PLAN.md 3.4).
 
 pub mod file;
+pub mod radio;
 pub mod ring;
 pub mod sigmf;
 
 pub mod sdrplay;
 
 pub use file::FileSource;
+pub use radio::{Health, Radio, Replay, SdrplayRadio, Session, reopen};
 pub use ring::{RingProducer, RingSource, ring};
 
 use num_complex::Complex32;
@@ -43,6 +45,15 @@ pub enum SourceError {
     UnsupportedFormat(String),
     #[error("radio: {0}")]
     Device(String),
+}
+
+impl SourceError {
+    /// Whether this means the radio stopped delivering samples (a ring
+    /// that waited too long for its producer).
+    pub fn is_stall(&self) -> bool {
+        matches!(self, SourceError::Io(io)
+            if io.get_ref().is_some_and(|r| r.is::<ring::Stalled>()))
+    }
 }
 
 /// Counters every source keeps so drops are visible, never silent.
