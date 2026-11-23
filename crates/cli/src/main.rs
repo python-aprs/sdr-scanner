@@ -57,6 +57,9 @@ enum Cmd {
     Admin(admin::AdminArgs),
     /// Run continuously from a source, recording until Ctrl-C.
     Serve(ServeArgs),
+    /// Sweep the SDRplay radio's gain over the profile's band and suggest
+    /// gain and detection thresholds for `serve`.
+    Calibrate(CalibrateArgs),
     /// Work with band-profile config files.
     Config {
         #[command(subcommand)]
@@ -73,6 +76,30 @@ struct RunArgs {
     #[arg(long)]
     realtime: bool,
     /// Print a JSON summary instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct CalibrateArgs {
+    /// `sdrplay` or `sdrplay:<serial>`.
+    #[arg(long, default_value = "sdrplay")]
+    source: serve::SourceSpec,
+    #[command(flatten)]
+    tuning: Tuning,
+    /// Radio settings; --lna and --gr are ignored (they are swept).
+    #[command(flatten)]
+    radio: RadioArgs,
+    /// Seconds measured at each step (after 0.3 s to settle).
+    #[arg(long, default_value_t = 2.0)]
+    dwell: f64,
+    /// LNA states to try.
+    #[arg(long, value_delimiter = ',', default_value = "0,1,2,3,4,5,6,7,8,9")]
+    lna_states: Vec<u8>,
+    /// IF gain reductions (dB) to try at each LNA state.
+    #[arg(long, value_delimiter = ',', default_value = "59,50,40,30,20")]
+    gr_steps: Vec<u8>,
+    /// Print JSON (every step and the suggestion) instead of a table.
     #[arg(long)]
     json: bool,
 }
@@ -331,6 +358,7 @@ fn main() -> Result<()> {
         Cmd::Run(args) => run(args),
         Cmd::Devices => devices(),
         Cmd::Admin(a) => admin::run(a),
+        Cmd::Calibrate(a) => calibrate(a),
         Cmd::Serve(a) => {
             let (profile, plan) = a.tuning.load()?;
             let sdrplay = a.radio.sdrplay(&profile);
@@ -402,6 +430,146 @@ fn devices() -> Result<()> {
         println!("sdrplay:{}  {}", d.serial, d.model);
     }
     Ok(())
+}
+
+/// Print the sweep and what it suggests.
+#[cfg_attr(not(feature = "sdrplay"), allow(dead_code))]
+fn report_calibration(
+    steps: &[scanner_core::calibrate::Step],
+    json: bool,
+) -> Option<scanner_core::calibrate::Suggestion> {
+    let s = scanner_core::calibrate::suggest(steps);
+    if json {
+        println!("{}", serde_json::json!({ "steps": steps, "suggestion": s }));
+        return s;
+    }
+    println!(
+        "{:>3} {:>3} {:>6} {:>7} {:>7} {:>8} {:>7} {:>5} {:>6}",
+        "LNA", "GR", "gain", "rms", "peak", "clip ppm", "floor", "peaks", "idle99.9"
+    );
+    for x in steps {
+        println!(
+            "{:>3} {:>3} {:>6.0} {:>7.1} {:>7.1} {:>8.1} {:>7.1} {:>5} {:>6.1}{}",
+            x.lna,
+            x.gr,
+            x.gain_db,
+            x.rms_dbfs,
+            x.peak_dbfs,
+            x.clip_ppm,
+            x.floor_db,
+            x.peaks,
+            x.idle_snr_p999_db,
+            if x.overload { "  overload" } else { "" }
+        );
+    }
+    match &s {
+        Some(g) => {
+            println!("\n{}", g.reason);
+            println!(
+                "\nsuggested: --lna {} --gr {} --open-db {} --close-db {}",
+                g.lna, g.gr, g.open_db, g.close_db
+            );
+        }
+        None => println!("\nno step was clean enough to suggest (all clipped or overloaded?)"),
+    }
+    s
+}
+
+#[cfg(feature = "sdrplay")]
+fn calibrate(a: CalibrateArgs) -> Result<()> {
+    use scanner_core::calibrate::{StepMeter, rsp1a_gain_db};
+    use scanner_sources::sdrplay::Sdrplay;
+    use std::sync::atomic::Ordering;
+    let serve::SourceSpec::Sdrplay { serial } = &a.source else {
+        bail!("calibrate needs a radio: --source sdrplay");
+    };
+    let (profile, plan) = a.tuning.load()?;
+    let detector = a.tuning.scanner_config(&profile).detector;
+    let mut steps_todo = Vec::new();
+    for &lna in &a.lna_states {
+        for &gr in &a.gr_steps {
+            steps_todo.push((lna, gr));
+        }
+    }
+    // Least gain first, so the radio never starts out overloaded.
+    steps_todo.sort_by(|x, y| rsp1a_gain_db(x.0, x.1).total_cmp(&rsp1a_gain_db(y.0, y.1)));
+    let Some(&(lna0, gr0)) = steps_todo.first() else {
+        bail!("nothing to sweep");
+    };
+    let cfg = scanner_sources::sdrplay::SdrplayConfig {
+        serial: serial.clone(),
+        lna_state: lna0,
+        gr_db: gr0,
+        agc_setpoint_dbfs: None,
+        ..a.radio.sdrplay(&profile)
+    };
+    cfg.validate()
+        .map_err(|e| anyhow::anyhow!("radio settings: {e}"))?;
+    let (mut device, mut source) = Sdrplay::start(&cfg, 64, 1 << 16)?;
+    let rate = cfg.sample_rate;
+    let events = device.events().clone();
+    eprintln!(
+        "{}: sweeping {} gain steps, {:.1} s each",
+        source.info().description,
+        steps_todo.len(),
+        a.dwell
+    );
+    let mut buf = vec![Complex32::default(); 1 << 16];
+    let mut read_for = |source: &mut scanner_sources::RingSource,
+                        secs: f64,
+                        f: &mut dyn FnMut(&[Complex32])|
+     -> Result<()> {
+        let mut left = (secs * rate) as usize;
+        while left > 0 {
+            let k = source.read(&mut buf[..left.min(1 << 16)])?;
+            if k == 0 {
+                bail!("the radio stopped streaming");
+            }
+            f(&buf[..k]);
+            left -= k;
+        }
+        Ok(())
+    };
+    let mut steps = Vec::new();
+    for (i, &(lna, gr)) in steps_todo.iter().enumerate() {
+        if i > 0 {
+            device.set_gain(lna, gr)?;
+        }
+        read_for(&mut source, 0.3, &mut |_| {})?;
+        let overloads = events.overloads.load(Ordering::Relaxed);
+        let mut meter = StepMeter::new(rate, cfg.center_hz, &plan.slots, &detector);
+        read_for(&mut source, a.dwell, &mut |x| meter.push(x))?;
+        let overload = events.overloads.load(Ordering::Relaxed) > overloads
+            || events.overloaded.load(Ordering::Relaxed);
+        // The radio reports its actual LNA reduction; trust it over the
+        // table when it has said something.
+        let lna_db = events.lna_gr_db.load(Ordering::Relaxed);
+        let gain_db = if events.gain_changes.load(Ordering::Relaxed) > 0 && lna_db > 0 {
+            -(lna_db as f32 + gr as f32 - 20.0)
+        } else {
+            rsp1a_gain_db(lna, gr)
+        };
+        let step = meter.finish(lna, gr, gain_db, overload);
+        eprintln!(
+            "  LNA {lna} GR {gr}: floor {:.1} dB, rms {:.1} dBFS{}",
+            step.floor_db,
+            step.rms_dbfs,
+            if step.clip_ppm > 0.0 || overload {
+                ", clipping"
+            } else {
+                ""
+            }
+        );
+        steps.push(step);
+    }
+    drop(device);
+    report_calibration(&steps, a.json);
+    Ok(())
+}
+
+#[cfg(not(feature = "sdrplay"))]
+fn calibrate(_: CalibrateArgs) -> Result<()> {
+    bail!("this scanner was built without SDRplay support; rebuild with `--features sdrplay`")
 }
 
 #[cfg(not(feature = "sdrplay"))]

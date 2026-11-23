@@ -3,6 +3,7 @@
 //!
 //! See `docs/PLAN.md` for the overall design.
 
+pub mod calibrate;
 pub mod channelizer;
 pub mod clock;
 pub mod config;

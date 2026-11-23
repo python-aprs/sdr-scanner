@@ -35,6 +35,8 @@ Or scan a recording as fast as possible and exit:
 scanner run captures/x.sigmf-meta --config config/rainier.toml --out out
 ```
 
+To pick gain and thresholds for your antenna, stop `serve` and run `scanner calibrate --config config/rainier.toml`. It sweeps the radio's gain for about two minutes and prints the flags to use.
+
 Useful `serve` flags:
 
 | Flag | Default | |
