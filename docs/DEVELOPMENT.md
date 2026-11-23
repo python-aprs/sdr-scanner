@@ -303,6 +303,26 @@ keyed carrier, so the whole path can be exercised without the SDK or a radio.
 
 The Airspy backend (`--features airspy`, libairspy) is next.
 
+
+#### Calibrating gain
+
+Needs a `--features sdrplay` build:
+
+```sh
+scanner calibrate --config config/rainier.toml [--dwell 2] [--lna-states 0,2,4] [--gr-steps 59,40,20] [--json]
+```
+
+It steps the radio from least gain to most (LNA states x IF gain
+reductions, 50 steps by default, about two minutes) and measures at each:
+mean and peak level, clipping, the noise floor, narrow peaks over floor +
+10 dB, and the SNR idle slots read on noise. `calibrate::suggest` then
+drops steps that clip, overload or grow new peaks (intermod), finds where
+the floor starts rising dB for dB with the gain (the antenna's noise taking
+over from the radio's), and suggests 5 dB above that, plus open/close
+thresholds that noise alone reaches 0.1 % of the time. A noisy site or a
+small antenna gets less gain than a quiet one; nothing is tuned to one
+setup. Stop `serve` first: both want the radio.
+
 ## Synthetic captures (`tools/synth`)
 
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
