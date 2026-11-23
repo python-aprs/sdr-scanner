@@ -204,6 +204,12 @@ impl OggOpusWriter {
 
     /// Pad with silence to cover the encoder's look-ahead, end the stream and rename into place. Returns the path
     /// and size in bytes.
+    /// Abandon the file (deletes the `.part`).
+    pub fn abort(self) -> io::Result<()> {
+        drop(self.file);
+        fs::remove_file(&self.part)
+    }
+
     pub fn finish(mut self) -> io::Result<(PathBuf, u64)> {
         // Encode just enough frames that the decoder's output, delayed by
         // the look-ahead, reaches the last real sample.

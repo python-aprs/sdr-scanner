@@ -196,6 +196,13 @@ impl Index {
         Ok(())
     }
 
+    /// Remove a row (a recording that was thrown away).
+    pub fn delete(&self, id: i64) -> Result<(), IndexError> {
+        self.db
+            .execute("DELETE FROM transmissions WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// Record the tone a transmission carried.
     pub fn set_tone(&self, id: i64, tone: &str) -> Result<(), IndexError> {
         self.db.execute(
