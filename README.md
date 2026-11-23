@@ -47,6 +47,7 @@ Useful `serve` flags:
 | `--anon-egress-gb` | 3 | monthly data allowance for visitors |
 | `--noise-squelch` | 8 | dB of quieting needed to play audio; 0 for power squelch only |
 | `--spur-secs` | 300 | a carrier steady this long is dropped and locked out; 0 to turn off |
+| `--background-secs` | 300 | comb guard: channels learn steady interference over this long and must rise above it to open; 0 to turn off |
 | `--kiss` | off | e.g. `127.0.0.1:8001`: decoded APRS/packet frames as KISS over TCP |
 | `--lna`, `--gr` | 3, 40 | RSP1A gain; use 9 and 59 near a strong transmitter |
 

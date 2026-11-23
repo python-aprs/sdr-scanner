@@ -749,7 +749,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 })
                 .unwrap_or_default();
             eprintln!(
-                "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}{}",
+                "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}{}{}",
                 wall,
                 busy.as_secs_f64() / wall * 100.0,
                 rs.blocks_written - rs.blocks_read,
@@ -763,6 +763,17 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 ) {
                     (0, 0) => String::new(),
                     (b, s) => format!(", guard held opens in {b} burst and {s} noise-step blocks"),
+                },
+                {
+                    let d = scanner.detector();
+                    match (d.background_slots(), d.comb()) {
+                        (0, _) => String::new(),
+                        (n, None) => format!(", {n} channels raised over steady interference"),
+                        (n, Some((spacing, teeth))) => format!(
+                            ", {n} channels raised over steady interference (comb: {teeth} lines every {:.0} kHz)",
+                            spacing / 1e3
+                        ),
+                    }
                 },
                 radio_note,
                 match reopened {

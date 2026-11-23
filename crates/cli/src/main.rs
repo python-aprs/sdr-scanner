@@ -249,6 +249,12 @@ struct Tuning {
     /// until reviewed on the Channels page. 0 turns it off.
     #[arg(long, default_value_t = 300.0)]
     spur_secs: f64,
+    /// Comb guard: each channel learns the steady level it sits at over
+    /// this many seconds (interference such as the comb of lines from a
+    /// switching power supply), and must rise above that, not just the
+    /// noise, to open. 0 turns it off.
+    #[arg(long, default_value_t = 300.0)]
+    background_secs: f64,
     /// Drop transmissions shorter than this (seconds).
     #[arg(long, default_value_t = 0.3)]
     min_len: f64,
@@ -323,6 +329,7 @@ impl Tuning {
                 max_active: self.max_active,
                 dc_notch_hz: self.dc_notch,
                 grid_window_hz: profile.spacing.map(|s| s.0).unwrap_or(0.0),
+                background_secs: self.background_secs,
                 ..Default::default()
             },
             audio_rate: profile.audio_rate,

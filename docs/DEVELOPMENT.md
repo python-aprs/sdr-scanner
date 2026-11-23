@@ -65,6 +65,20 @@ out. `serve` saves the lockout as a channel override by `spur detector`,
 so it survives restarts and shows as "Spur" on the Channels page until an
 admin unlocks or resets it.
 
+Comb guard (`--background-secs`, 300 by default): a switching power
+supply near the antenna puts a comb of steady lines across the band, one
+every multiple of its switching frequency, each a few dB over the noise.
+On a grid scan every line used to open as a station. The detector now
+learns a background per slot: the 10th percentile of its 1 s mean SNR over
+the last `--background-secs` (from 10 s on). A background of 1.5 to 15 dB
+raises that slot's open and close thresholds by as much, so a line closes
+and stops opening, while a station on the same channel still opens once
+it clears the line by the usual margin. A steady level over 15 dB is taken
+for a real carrier and left to the spur detector. A busy channel is not
+raised unless it is on more than 90% of the time. The serve status line
+reports how many channels are raised and, when the raised ones are evenly
+spaced, the comb (`comb: 6 lines every 260 kHz`): `Detector::comb`.
+
 Channels with `mode = "afsk1200"` (144.390 APRS and 144.920 in
 `config/rainier.toml`) decode AX.25 packets instead of recording audio
 (`afsk::AfskDecoder`). The discriminator output goes, without

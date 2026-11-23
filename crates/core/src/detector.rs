@@ -9,6 +9,7 @@
 use crate::channelizer::{BankParams, Block};
 use crate::config::{Slot, SlotOrigin};
 use num_complex::Complex32;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectorParams {
@@ -46,6 +47,20 @@ pub struct DetectorParams {
     /// strongest signal (open or not) may open. 0 disables.
     pub burst_slots: usize,
     pub burst_margin_db: f32,
+    /// Per-slot background, for steady interference such as the comb of
+    /// lines a switching power supply puts across the band: each slot
+    /// learns the level it sits at most of the time (the `background_pct`
+    /// quantile of its 1 s mean SNR over the last `background_secs`), and a
+    /// background of `background_min_db` to `background_max_db` raises
+    /// that slot's open and close thresholds by as much. A real signal on
+    /// such a line must then clear the line, not just the noise. 0
+    /// disables.
+    pub background_secs: f64,
+    pub background_pct: f32,
+    pub background_min_db: f32,
+    /// A steady level above this is a real carrier (a beacon, a weather
+    /// broadcast), not a comb line; it is left alone.
+    pub background_max_db: f32,
 }
 
 impl Default for DetectorParams {
@@ -67,6 +82,10 @@ impl Default for DetectorParams {
             grid_window_hz: 0.0,
             burst_slots: 6,
             burst_margin_db: 10.0,
+            background_secs: 300.0,
+            background_pct: 0.1,
+            background_min_db: 1.5,
+            background_max_db: 15.0,
         }
     }
 }
@@ -180,6 +199,17 @@ pub struct Detector {
     hang_blocks: u64,
     preroll_blocks: u64,
     skipped: Vec<String>,
+    /// Per slot: 1 s means of the linear SNR, newest last, for the
+    /// background (see `DetectorParams::background_secs`).
+    bg_hist: Vec<VecDeque<f32>>,
+    /// Per slot: the linear SNR summed over the current second.
+    bg_acc: Vec<f64>,
+    /// Blocks summed into `bg_acc` so far, and per second.
+    bg_n: u32,
+    bg_blocks: u32,
+    /// Per slot: the learned background (dB), 0 until enough is held.
+    bg_db: Vec<f32>,
+    bg_scratch: Vec<f32>,
 }
 
 /// Median of an exponential-ish smoothed noise PSD sits below its mean; this
@@ -329,6 +359,12 @@ impl Detector {
             opens: Vec::new(),
             attack_centre: Vec::new(),
             skipped,
+            bg_hist: vec![VecDeque::new(); count],
+            bg_acc: vec![0.0; count],
+            bg_n: 0,
+            bg_blocks: (1.0 / block).round().max(1.0) as u32,
+            bg_db: vec![0.0; count],
+            bg_scratch: Vec::new(),
         }
     }
 
@@ -598,6 +634,9 @@ impl Detector {
                 0.0
             };
             self.stats[i].snr_db = snr as f32;
+            if !(step || interfered) && noise > 0.0 {
+                self.bg_acc[i] += p / noise;
+            }
             let lin = 10f32.powf(snr as f32 / 10.0);
             let a = if self.blocks_seen <= 1 {
                 1.0
@@ -605,6 +644,13 @@ impl Detector {
                 self.smooth_alpha
             };
             self.smooth[i] += a * (lin - self.smooth[i]);
+        }
+
+        if self.params.background_secs > 0.0 && !(step || interfered) {
+            self.bg_n += 1;
+            if self.bg_n >= self.bg_blocks {
+                self.learn_background();
+            }
         }
 
         let b = block.index;
@@ -626,7 +672,8 @@ impl Detector {
                 );
                 !(dens(j) > snr || (other_owns && dens(j) >= snr - 3.0))
             });
-            self.opens.push(snr >= self.params.open_db && wins);
+            self.opens
+                .push(snr >= self.params.open_db + self.background_db(i) && wins);
         }
         if step || interfered {
             // Hold every waiting slot back for this block; after a step the
@@ -653,7 +700,9 @@ impl Detector {
             let idle =
                 |i: usize| matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. });
             let hot = (0..self.slots.len())
-                .filter(|&i| idle(i) && self.stats[i].snr_db >= self.params.close_db)
+                .filter(|&i| {
+                    idle(i) && self.stats[i].snr_db >= self.params.close_db + self.background_db(i)
+                })
                 .count();
             if hot >= self.params.burst_slots {
                 // The reference is the strongest signal anywhere, including
@@ -683,7 +732,7 @@ impl Detector {
             // attack, because FM speech is lopsided from block to block.
             let start =
                 open && (self.slots[i].slot.origin == SlotOrigin::Grid || self.is_centred(i));
-            let stay = self.squelch_db(i) >= self.params.close_db;
+            let stay = self.squelch_db(i) >= self.params.close_db + self.background_db(i);
             let st = &mut self.stats[i];
             let next = match self.states[i] {
                 SlotState::Idle if start => SlotState::Attack { since: b },
@@ -823,6 +872,109 @@ impl Detector {
             median(&mut self.seg_power)
         };
         by_median.max(by_mean).max(1.0)
+    }
+
+    /// Close out a second of the per-slot background: push each slot's
+    /// mean, drop what is older than `background_secs`, and take the
+    /// quantile once enough is held.
+    fn learn_background(&mut self) {
+        let n = self.bg_n as f64;
+        let cap = self.params.background_secs.ceil().max(1.0) as usize;
+        let need = cap.div_ceil(2).min(10);
+        let pct = self.params.background_pct.clamp(0.0, 1.0);
+        for i in 0..self.slots.len() {
+            let h = &mut self.bg_hist[i];
+            h.push_back((self.bg_acc[i] / n) as f32);
+            while h.len() > cap {
+                h.pop_front();
+            }
+            self.bg_acc[i] = 0.0;
+            self.bg_db[i] = if h.len() >= need {
+                self.bg_scratch.clear();
+                self.bg_scratch.extend(h.iter().copied());
+                let k =
+                    ((self.bg_scratch.len() as f32 * pct) as usize).min(self.bg_scratch.len() - 1);
+                let (_, q, _) = self.bg_scratch.select_nth_unstable_by(k, f32::total_cmp);
+                (10.0 * q.max(1e-12).log10()).max(0.0)
+            } else {
+                0.0
+            };
+        }
+        self.bg_n = 0;
+    }
+
+    /// How far slot `i`'s open and close thresholds are raised for steady
+    /// interference under it (dB; see `DetectorParams::background_secs`).
+    pub fn background_db(&self, i: usize) -> f32 {
+        let bg = self.bg_db[i];
+        if bg >= self.params.background_min_db && bg <= self.params.background_max_db {
+            bg
+        } else {
+            0.0
+        }
+    }
+
+    /// Slots whose thresholds are raised for steady interference.
+    pub fn background_slots(&self) -> usize {
+        (0..self.slots.len())
+            .filter(|&i| self.background_db(i) > 0.0)
+            .count()
+    }
+
+    /// The comb pattern in the steady interference, if there is one: the
+    /// commonest spacing (Hz, to 5 kHz) between neighbouring raised slots,
+    /// and how many times it occurs. A switching power supply puts lines
+    /// at multiples of its switching frequency, so evenly spaced raised
+    /// slots point at one. Diagnostic only: the thresholds are raised per
+    /// slot either way.
+    pub fn comb(&self) -> Option<(f64, usize)> {
+        // Centres of raised runs (neighbouring raised slots within 30 kHz
+        // are one line).
+        let mut raised: Vec<f64> = (0..self.slots.len())
+            .filter(|&i| self.background_db(i) >= 3.0)
+            .map(|i| self.slots[i].offset_hz)
+            .collect();
+        raised.sort_by(f64::total_cmp);
+        let mut lines: Vec<(f64, usize)> = Vec::new();
+        for f in raised {
+            match lines.last_mut() {
+                Some((sum, n)) if f - *sum / *n as f64 <= 30e3 => {
+                    *sum += f;
+                    *n += 1;
+                }
+                _ => lines.push((f, 1)),
+            }
+        }
+        let centres: Vec<f64> = lines.iter().map(|&(s, n)| s / n as f64).collect();
+        let mut counts: Vec<(i64, usize)> = Vec::new();
+        for w in centres.windows(2) {
+            let d = ((w[1] - w[0]) / 5e3).round() as i64;
+            match counts.iter_mut().find(|(k, _)| (*k - d).abs() <= 1) {
+                Some(c) => c.1 += 1,
+                None => counts.push((d, 1)),
+            }
+        }
+        let (d, c) = counts.into_iter().max_by_key(|&(_, c)| c)?;
+        if c < 3 {
+            return None;
+        }
+        let spacing = d as f64 * 5e3;
+        // Lines on that comb (within 10 kHz of a multiple of the spacing
+        // from the first line on it).
+        let teeth = centres
+            .iter()
+            .map(|&f| {
+                centres
+                    .iter()
+                    .filter(|&&g| {
+                        let k = (g - f) / spacing;
+                        (k - k.round()).abs() * spacing <= 10e3
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        Some((spacing, teeth))
     }
 
     /// Blocks in which the broadband-burst guard held slots back.
@@ -1199,6 +1351,56 @@ mod tests {
             assert!(g.1 >= on - 0.05 && g.1 < on + 0.25, "{got:?}");
             assert!((g.2 - end).abs() < 0.1, "{got:?}");
         }
+    }
+
+    #[test]
+    fn steady_comb_lines_stop_opening_but_signals_on_them_still_do() {
+        // A switching-supply comb: steady lines every 125 kHz, ~9 dB in a
+        // slot, and a real 20 dB signal right next to one of them later.
+        let mut sigs: Vec<(f64, f64, f64, f64)> = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
+            .iter()
+            .map(|k| (k * 125e3, 11.0, 0.0, 9.0))
+            .collect();
+        sigs.push((255e3, 20.0, 5.0, 7.0));
+        let x = scene(8.0, &sigs, 31);
+        let plan: Vec<Slot> = (-16..=16).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let dp = DetectorParams {
+            grid_window_hz: 25e3,
+            background_secs: 4.0,
+            ..DetectorParams::default()
+        };
+        let (det, events, _) = run(&x, &plan, dp);
+        let block = params().block_secs();
+        let t = |b: u64| b as f64 * block;
+        let mut real = Vec::new();
+        for e in &events {
+            match *e {
+                Event::Open { slot, block, .. } => {
+                    let off = det.slots()[slot].offset_hz;
+                    if t(block) > 4.0 {
+                        // Only the real signal may open once the lines are
+                        // learned.
+                        assert!((off - 250e3).abs() < 1.0, "{off} at {}", t(block));
+                        real.push(t(block));
+                    }
+                }
+                Event::Close {
+                    slot, end_block, ..
+                } => {
+                    let off = det.slots()[slot].offset_hz;
+                    if (off - 250e3).abs() > 1.0 {
+                        // The lines close once learned instead of holding
+                        // their slots open for good.
+                        assert!(t(end_block) < 4.0, "{off} held to {}", t(end_block));
+                    }
+                }
+            }
+        }
+        assert_eq!(real.len(), 1, "{events:?}");
+        assert!((real[0] - 5.0).abs() < 0.2, "{real:?}");
+        let raised = det.background_slots();
+        assert!((6..=12).contains(&raised), "{raised} slots raised");
+        assert_eq!(det.comb(), Some((125e3, 6)));
     }
 
     #[test]
