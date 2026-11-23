@@ -8,6 +8,7 @@ pub mod calibrate;
 pub mod channelizer;
 pub mod clock;
 pub mod config;
+pub mod demod;
 pub mod detector;
 pub mod dsp;
 pub mod psd;
