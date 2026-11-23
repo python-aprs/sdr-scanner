@@ -39,8 +39,8 @@ pub struct DetectorParams {
     /// so the grid tiles the band with no gaps for off-raster signals to
     /// fall through. 0 uses the slot bandwidth.
     pub grid_window_hz: f64,
-    /// Broadband-burst guard: when at least this many idle slots cross the
-    /// open threshold in the same block, it is front-end overload or
+    /// Broadband-burst guard: when at least this many idle slots read over
+    /// the close threshold in the same block, it is front-end overload or
     /// intermod (a strong nearby transmitter), not that many new
     /// transmissions. Then only slots within `burst_margin_db` of the
     /// strongest signal (open or not) may open. 0 disables.
@@ -584,7 +584,17 @@ impl Detector {
                 matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. })
                     && self.opens[i]
             };
-            let hot = (0..self.slots.len()).filter(|&i| waiting(i)).count();
+            // Counted against the close threshold, not the open one:
+            // overload products sit a few dB lower once band-wide rises are
+            // taken out of the SNR (`common_ratio`), and an RSP1A at LNA 3
+            // keyed up against by a nearby handheld then put only four or
+            // five of them over the open threshold at once, too few to arm
+            // the guard, so they opened one by one.
+            let idle =
+                |i: usize| matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. });
+            let hot = (0..self.slots.len())
+                .filter(|&i| idle(i) && self.stats[i].snr_db >= self.params.close_db)
+                .count();
             if hot >= self.params.burst_slots {
                 // The reference is the strongest signal anywhere, including
                 // one already open: the transmitter causing the overload is
@@ -700,18 +710,34 @@ impl Detector {
     }
 
     /// How far the whole band's noise sits above the smoothed floor this
-    /// block: the median over segments of this block's level over the
-    /// floor, at least 1.
+    /// block, at least 1: the median over segments of this block's level
+    /// over the floor, measured two ways (below), whichever is higher.
     ///
-    /// The floor follows the noise over seconds, but the noise itself can
-    /// swell by several dB for a few hundred ms at a time across the whole
-    /// band (seen live on an RSP1A at LNA 3 / GR 40, Nov 2026: every slot
-    /// rose 2-6 dB together, several times a second). Against the slow
-    /// floor alone that reads as a weak signal in every slot, which opened
-    /// dozens of empty recordings and then held them open for minutes. A
-    /// rise shared by most segments is noise, not signals: a signal
-    /// occupies a few segments at most, so the median ignores it.
+    /// The floor follows the noise over seconds, but interference can lift
+    /// the whole band for a block or a few hundred ms at a time. Seen live
+    /// on an RSP1A at LNA 3 / GR 40 (Nov 2026): swells of 2-6 dB several
+    /// times a second, and a 20-50 ms burst every 1.2 s that read 5-11 dB
+    /// in every slot. Against the slow floor alone that reads as a weak
+    /// signal in every slot, which opened dozens of empty recordings and
+    /// held them open for minutes. A rise shared by most segments is
+    /// interference, not signals: a signal occupies a few segments at most,
+    /// so the median over segments ignores it.
+    ///
+    /// Each segment's level is measured from its median bin and from its
+    /// mean power. The median bin follows broadband noise, including the
+    /// non-Gaussian kind from front-end overload, without being pulled up
+    /// by the signals in the segment. The mean (the same statistic as slot
+    /// power) also follows interference that is spiky across frequency,
+    /// like the comb from a pulse train, which lifts a band's power
+    /// without moving its median bin.
     fn common_ratio(&mut self) -> f32 {
+        let median = |v: &mut Vec<f32>| -> f32 {
+            if v.is_empty() {
+                return 1.0;
+            }
+            let mid = v.len() / 2;
+            *v.select_nth_unstable_by(mid, f32::total_cmp).1
+        };
         self.seg_scratch.clear();
         self.seg_scratch.extend(
             self.seg_level
@@ -720,12 +746,16 @@ impl Detector {
                 .filter(|&(&l, &f)| f > 0.0 && l > 0.0)
                 .map(|(&l, &f)| l / f),
         );
-        if self.seg_scratch.is_empty() {
-            return 1.0;
+        let by_median = median(&mut self.seg_scratch);
+        self.seg_scratch.clear();
+        for (&(a, b), &f) in self.seg_bounds.iter().zip(&self.seg_floor) {
+            let mean = (self.cumsum[b] - self.cumsum[a]) / (b - a) as f64;
+            if f > 0.0 && mean > 0.0 {
+                self.seg_scratch.push(mean as f32 / f);
+            }
         }
-        let mid = self.seg_scratch.len() / 2;
-        let (_, m, _) = self.seg_scratch.select_nth_unstable_by(mid, f32::total_cmp);
-        m.max(1.0)
+        let by_mean = median(&mut self.seg_scratch);
+        by_median.max(by_mean).max(1.0)
     }
 
     /// Blocks in which the broadband-burst guard held slots back.
@@ -983,6 +1013,44 @@ mod tests {
             })
             .expect("closed");
         assert!((end - 5.0).abs() < 0.1, "ended at {end}");
+    }
+
+    /// Add a burst of clicks (a pulse every ms, so a 1 kHz comb across the
+    /// band) lasting `len` seconds every `period` seconds.
+    fn clicks(x: &mut [Complex32], period: f64, len: f64, amp: f32) {
+        let fs = params().sample_rate;
+        let every = (fs / 1000.0) as usize;
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = i as f64 / fs;
+            if t % period < len && i % every == 0 {
+                *v += Complex32::new(amp, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_click_bursts_open_nothing() {
+        // Live RSP1A at LNA 3 / GR 40: a 20-50 ms burst every 1.2 s read
+        // 5-11 dB in every slot without moving the segments' median bins;
+        // it opened recordings and, coming sooner than the hang time,
+        // never let them close. These clicks add ~9 dB to the band's mean
+        // power while they last.
+        let mut x = scene(8.0, &[], 13);
+        clicks(&mut x, 1.2, 0.04, 1.0);
+        let plan: Vec<Slot> = (-30..=30).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let (_, events, snrs) = run(&x, &plan, DetectorParams::default());
+        let opens = events
+            .iter()
+            .filter(|e| matches!(e, Event::Open { .. }))
+            .count();
+        // The slots' mean SNR in the loudest block.
+        let worst = snrs[snrs.len() / 8..]
+            .iter()
+            .map(|row| row.iter().sum::<f32>() / row.len() as f32)
+            .fold(f32::MIN, f32::max);
+        eprintln!("clicks: {opens} opens, worst block mean {worst} dB");
+        assert_eq!(opens, 0, "{events:?}");
+        assert!(worst < 1.5, "worst {worst}");
     }
 
     #[test]
