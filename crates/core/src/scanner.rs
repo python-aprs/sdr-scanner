@@ -371,6 +371,17 @@ impl Scanner {
             .collect()
     }
 
+    /// The id the next transmission will get.
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Number transmissions from `id` on, so a scanner that replaces
+    /// another (after the radio is reopened) never reuses an id.
+    pub fn set_next_id(&mut self, id: u64) {
+        self.next_id = self.next_id.max(id);
+    }
+
     pub fn clock(&self) -> &SampleClock {
         &self.clock
     }

@@ -69,6 +69,7 @@ fn replay_thread(
     looped: bool,
     mut producer: scanner_sources::RingProducer,
     stop: Arc<AtomicBool>,
+    halt: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut buf = vec![Complex32::default(); 1 << 14];
     let mut sent = 0u64;
@@ -82,7 +83,7 @@ fn replay_thread(
             rate
         };
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || halt.load(Ordering::Relaxed) {
                 producer.close();
                 return Ok(());
             }
@@ -137,8 +138,9 @@ type Started = (
     Option<Arc<scanner_sources::sdrplay::DeviceEvents>>,
 );
 
-/// Start the radio (or replay) thread feeding a ring.
-fn start_source(o: &ServeOptions, stop: Arc<AtomicBool>) -> Result<Started> {
+/// Start the radio (or replay) thread feeding a ring. The thread stops when
+/// `stop` (Ctrl-C) or `halt` (this session is being replaced) is set.
+fn start_source(o: &ServeOptions, stop: Arc<AtomicBool>, halt: Arc<AtomicBool>) -> Result<Started> {
     match &o.source {
         SourceSpec::Replay { path, looped } => {
             let f =
@@ -159,10 +161,10 @@ fn start_source(o: &ServeOptions, stop: Arc<AtomicBool>) -> Result<Started> {
             let (path, looped) = (path.clone(), *looped);
             let radio = std::thread::Builder::new()
                 .name("radio".into())
-                .spawn(move || replay_thread(path, looped, producer, stop))?;
+                .spawn(move || replay_thread(path, looped, producer, stop, halt))?;
             Ok((info, source, radio, None))
         }
-        SourceSpec::Sdrplay { serial } => start_sdrplay(o, serial.clone(), stop),
+        SourceSpec::Sdrplay { serial } => start_sdrplay(o, serial.clone(), stop, halt),
     }
 }
 
@@ -171,6 +173,7 @@ fn start_sdrplay(
     o: &ServeOptions,
     serial: Option<String>,
     stop: Arc<AtomicBool>,
+    halt: Arc<AtomicBool>,
 ) -> Result<Started> {
     use scanner_sources::sdrplay::Sdrplay;
     let cfg = scanner_sources::sdrplay::SdrplayConfig {
@@ -187,7 +190,7 @@ fn start_sdrplay(
             // The API streams on its own threads; this one owns the device
             // and stops it on Ctrl-C or when the radio goes away.
             let ev = device.events().clone();
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) && !halt.load(Ordering::Relaxed) {
                 if ev.removed.load(Ordering::Relaxed) || ev.failed.load(Ordering::Relaxed) {
                     drop(device);
                     bail!(
@@ -208,7 +211,12 @@ fn start_sdrplay(
 }
 
 #[cfg(not(feature = "sdrplay"))]
-fn start_sdrplay(_: &ServeOptions, _: Option<String>, _: Arc<AtomicBool>) -> Result<Started> {
+fn start_sdrplay(
+    _: &ServeOptions,
+    _: Option<String>,
+    _: Arc<AtomicBool>,
+    _: Arc<AtomicBool>,
+) -> Result<Started> {
     bail!(
         "this scanner was built without SDRplay support; rebuild with `--features sdrplay` (needs the SDRplay API 3.x installed)"
     )
@@ -296,6 +304,57 @@ fn channel_list(
         .collect()
 }
 
+/// Whether a source error means the radio stopped delivering samples.
+fn is_stall(e: &scanner_sources::SourceError) -> bool {
+    matches!(e, scanner_sources::SourceError::Io(io)
+        if io.get_ref().is_some_and(|r| r.is::<ring::Stalled>()))
+}
+
+/// Wait (up to 10 s) for a radio thread whose session has been halted. The
+/// vendor API can hang tearing down a stream that died; then the thread is
+/// left behind and the radio is opened again anyway.
+fn stop_radio(radio: std::thread::JoinHandle<Result<()>>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(radio.join());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => eprintln!("radio: {e:#}"),
+        Ok(Err(_)) => eprintln!("radio thread panicked"),
+        Err(_) => {
+            eprintln!("radio: the old stream did not stop within 10 s; opening a new one anyway")
+        }
+    }
+}
+
+/// Open the radio again, retrying with a growing delay (1 s, doubling to
+/// 30 s) until it works or Ctrl-C. Returns the new session and its halt
+/// flag, or `None` on Ctrl-C.
+fn reopen(o: &ServeOptions, stop: &Arc<AtomicBool>) -> Option<(Started, Arc<AtomicBool>)> {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let halt = Arc::new(AtomicBool::new(false));
+        match start_source(o, stop.clone(), halt.clone()) {
+            Ok(s) => return Some((s, halt)),
+            Err(e) => {
+                wait = (wait * 2).min(Duration::from_secs(30));
+                eprintln!(
+                    "reopening the radio failed: {e:#}; trying again in {} s",
+                    wait.as_secs()
+                );
+            }
+        }
+    }
+}
+
 pub fn serve(o: ServeOptions) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -309,9 +368,17 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         .context("installing Ctrl-C handler")?;
     }
 
-    let (info, mut source, radio, device_events) = start_source(&o, stop.clone())?;
+    let mut halt = Arc::new(AtomicBool::new(false));
+    let (mut info, mut source, mut radio, mut device_events) =
+        start_source(&o, stop.clone(), halt.clone())?;
     let t0 = info.start_time.unwrap_or_else(SystemTime::now);
-    let mut scanner = Scanner::new(o.scanner, info.sample_rate, info.center_freq, t0, o.plan);
+    let mut scanner = Scanner::new(
+        o.scanner.clone(),
+        info.sample_rate,
+        info.center_freq,
+        t0,
+        o.plan,
+    );
     let p = *scanner.params();
     eprintln!(
         "{}: {} S/s at {}, FFT {} ({:.1} Hz bins), watching {} slots, recording to {}",
@@ -411,8 +478,68 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let started = Instant::now();
     let mut next_status = started + o.status_every;
     let mut busy = Duration::ZERO;
+    // Carried over from scanners and radio sessions before a reopen.
+    let mut reopened = 0u32;
+    let mut recorded_before = 0u64;
+    let mut dropped_before = 0u64;
+    let live_radio = matches!(o.source, SourceSpec::Sdrplay { .. });
+    // When this radio session started (its counters start from zero).
+    let mut session_started = started;
     loop {
-        let k = source.read(&mut buf)?;
+        let read = source.read(&mut buf);
+        // A radio that stalls or whose stream ends (USB failure, unplugged)
+        // is reopened rather than ending the program. A replay ends for
+        // good when its file does.
+        let lost = live_radio
+            && !stop.load(Ordering::Relaxed)
+            && match &read {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(e) => is_stall(e),
+            };
+        if lost {
+            eprintln!(
+                "radio lost ({}); closing open transmissions and reopening it",
+                match &read {
+                    Err(e) => e.to_string(),
+                    _ => "the stream ended".into(),
+                }
+            );
+            scanner.finish(&mut out);
+            if !out.is_empty() {
+                tx.send(std::mem::take(&mut out))
+                    .ok()
+                    .context("recorder thread stopped")?;
+            }
+            recorded_before += scanner.stats().recorded;
+            dropped_before += source.stats().samples_dropped;
+            halt.store(true, Ordering::Relaxed);
+            drop(source);
+            stop_radio(radio);
+            let Some((started, new_halt)) = reopen(&o, &stop) else {
+                // Ctrl-C while waiting for the radio.
+                eprintln!("stopped while waiting for the radio");
+                return Ok(());
+            };
+            reopened += 1;
+            halt = new_halt;
+            (info, source, radio, device_events) = started;
+            let next_id = scanner.next_id();
+            scanner = Scanner::new(
+                o.scanner.clone(),
+                info.sample_rate,
+                info.center_freq,
+                info.start_time.unwrap_or_else(SystemTime::now),
+                o.plan,
+            );
+            scanner.set_next_id(next_id);
+            let mut ignored = Vec::new();
+            apply_overrides(&mut scanner, &base, &overrides, &mut ignored);
+            session_started = Instant::now();
+            eprintln!("radio reopened: {}", info.description);
+            continue;
+        }
+        let k = read?;
         if k == 0 {
             break;
         }
@@ -461,8 +588,8 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                 slots: scanner.detector().slots().len(),
                 uptime_s: wall,
                 dsp_load: busy.as_secs_f64() / wall,
-                samples_dropped: source.stats().samples_dropped,
-                recorded: scanner.stats().recorded,
+                samples_dropped: dropped_before + source.stats().samples_dropped,
+                recorded: recorded_before + scanner.stats().recorded,
                 active: scanner
                     .active()
                     .into_iter()
@@ -507,19 +634,19 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                     let got = e.samples_received.load(Ordering::Relaxed) as f64;
                     format!(
                         ", radio: received {:.3} MS/s{}",
-                        got / wall / 1e6,
+                        got / session_started.elapsed().as_secs_f64().max(1e-9) / 1e6,
                         e.summary().map(|s| format!(", {s}")).unwrap_or_default()
                     )
                 })
                 .unwrap_or_default();
             eprintln!(
-                "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}",
+                "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}{}",
                 wall,
                 busy.as_secs_f64() / wall * 100.0,
                 rs.blocks_written - rs.blocks_read,
                 rs.capacity,
-                rs.dropped_samples,
-                st.recorded,
+                dropped_before + rs.dropped_samples,
+                recorded_before + st.recorded,
                 active.join(", "),
                 match (
                     scanner.detector().burst_blocks(),
@@ -528,7 +655,11 @@ pub fn serve(o: ServeOptions) -> Result<()> {
                     (0, 0) => String::new(),
                     (b, s) => format!(", guard held opens in {b} burst and {s} noise-step blocks"),
                 },
-                radio_note
+                radio_note,
+                match reopened {
+                    0 => String::new(),
+                    n => format!(", radio reopened {n} times"),
+                }
             );
             next_status += o.status_every;
         }
@@ -539,10 +670,14 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let radio_result = radio.join().expect("radio thread panicked");
     let rec = writer.join().expect("recorder thread panicked")?;
     eprintln!(
-        "stopped: {} transmissions, {:.1} s of audio, {} samples dropped",
+        "stopped: {} transmissions, {:.1} s of audio, {} samples dropped{}",
         rec.files,
         rec.audio_secs,
-        source.stats().samples_dropped
+        dropped_before + source.stats().samples_dropped,
+        match reopened {
+            0 => String::new(),
+            n => format!(", radio reopened {n} times"),
+        }
     );
     if let Some(note) = device_events.as_ref().and_then(|e| e.summary()) {
         eprintln!("radio: {note}");
