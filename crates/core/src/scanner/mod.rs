@@ -5,13 +5,16 @@
 //! [`Output`] records (transmission open, audio, close) for a writer to turn
 //! into files. Channel chains run in parallel on the rayon pool.
 
-use crate::afsk::{AfskDecoder, Frame};
-use crate::channelizer::{Analyzer, BankParams, Block, Extractor, FilterBank};
+mod channel;
+
+use crate::afsk::Frame;
+use crate::channelizer::{Analyzer, BankParams, Block, FilterBank};
 use crate::clock::SampleClock;
-use crate::config::{Mode, Slot, SlotOrigin};
+use crate::config::{Slot, SlotOrigin};
+use crate::demod;
 use crate::detector::{Detector, DetectorParams, Event, SlotState};
-use crate::dsp::{Agc, Deemphasis, FmDiscriminator, HighPass, NoiseSquelch, Resampler, soft_limit};
-use crate::tone::{Tone, ToneDetector};
+use crate::tone::Tone;
+use channel::Channel;
 use num_complex::Complex32;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -173,219 +176,6 @@ pub struct ScannerStats {
     pub max_concurrent: usize,
 }
 
-struct Chain {
-    id: u64,
-    slot: usize,
-    /// The slot as recorded (frequency retuned for grid slots).
-    tuned: Slot,
-    extractor: Extractor,
-    disc: FmDiscriminator,
-    /// Packet decoder on an `afsk1200` slot: then the chain makes frames,
-    /// never audio.
-    afsk: Option<AfskDecoder>,
-    nsq: Option<NoiseSquelch>,
-    deemph: Option<Deemphasis>,
-    resampler: Resampler,
-    hp: Option<HighPass>,
-    tone: Option<ToneDetector>,
-    /// Audio level (dB) after the high-pass in 100 ms frames, `None` for
-    /// a frame with any muted audio, newest last; and the frame being
-    /// summed (sum of squares, samples, any muted). Speech swings 10 dB
-    /// and more from frame to frame; a carrier, plain or with a steady
-    /// tone, barely moves.
-    levels: VecDeque<Option<f32>>,
-    level_acc: (f64, usize, bool),
-    /// Set when a new level is in.
-    level_new: bool,
-    /// Audio samples per level, and levels kept.
-    level_len: usize,
-    levels_max: usize,
-    gain: f32,
-    agc: Option<Agc>,
-    /// Discriminator samples released unmuted so far.
-    played: u64,
-    /// Discriminator sample rate (the channel IQ rate).
-    rate: f64,
-    /// Audio samples still to drop for the resampler's group delay.
-    skip: usize,
-    /// Audio not yet emitted.
-    pending: Vec<f32>,
-    /// Audio samples emitted so far.
-    emitted: usize,
-    /// Audio samples sent to live listeners so far (counted like `emitted`),
-    /// or `None` until the chain is announced to them.
-    live_sent: Option<usize>,
-    confirmed: bool,
-    /// Stream sample (input rate) of audio sample 0, may be negative at
-    /// stream start.
-    audio_t0: i64,
-    iq: Vec<Complex32>,
-    demod: Vec<f32>,
-    /// Squelch gain now (0 = muted, 1 = open), ramped between blocks.
-    squelch: f32,
-    /// Ramp step per discriminator sample (a 5 ms ramp).
-    ramp_step: f32,
-    /// Discriminator output of the newest blocks, held until the squelch
-    /// state of the blocks after them is known.
-    held: VecDeque<Vec<f32>>,
-    /// Squelch state of recent blocks: the one before the oldest held block,
-    /// then one per held block.
-    gates: VecDeque<bool>,
-}
-
-/// Blocks of squelch look-ahead. A block plays only if it, the block before
-/// and the `SQUELCH_LOOKAHEAD` blocks after it are all open. The detector's
-/// FFT window reaches a few ms past a block's audio, so the block after a
-/// key-down can still read as open; two blocks of look-ahead mute the
-/// discriminator's key-down breakup anyway.
-const SQUELCH_LOOKAHEAD: usize = 2;
-
-impl Chain {
-    /// Demodulate one block. `open` is the squelch for this block: blocks
-    /// where the slot is below the close threshold (pre-roll noise, the hang
-    /// time, fades, zero-filled drops) are muted. Muting keeps the samples,
-    /// so timing is unchanged.
-    ///
-    /// The squelch acts on the discriminator output, before de-emphasis,
-    /// resampling and the high-pass, so those filters never ring on loud
-    /// FM noise. A block is gated one block late, once its neighbours are
-    /// known: it plays only if it and both neighbours are open, which keeps
-    /// the discriminator's settling at key-up and its breakup at key-down
-    /// out of the recording.
-    fn process(&mut self, block: &Block, open: bool) {
-        self.iq.clear();
-        self.extractor.process(block, &mut self.iq);
-        let mut d = self.spare_demod();
-        self.disc.process(&self.iq, &mut d);
-        if let Some(a) = &mut self.afsk {
-            // The FCS decides what is a packet; no squelch needed.
-            a.push(&d);
-            self.demod = d;
-            return;
-        }
-        // The noise squelch measures every block, so its hysteresis follows
-        // the signal even while the power squelch has it muted.
-        let quiet = self.nsq.as_mut().is_none_or(|n| n.update(&d));
-        self.held.push_back(d);
-        self.gates.push_back(open && quiet);
-        if self.held.len() > SQUELCH_LOOKAHEAD {
-            // gates: [before, oldest held, ..., newest]
-            let play = self.gates.iter().all(|&g| g);
-            self.demod = self.held.pop_front().unwrap();
-            self.gates.pop_front();
-            self.release(play);
-        }
-    }
-
-    fn spare_demod(&mut self) -> Vec<f32> {
-        let mut v = std::mem::take(&mut self.demod);
-        v.clear();
-        v
-    }
-
-    /// Gate one block's discriminator output (in `demod`) and run it
-    /// through the audio filters into `pending`.
-    fn release(&mut self, play: bool) {
-        if play {
-            self.played += self.demod.len() as u64;
-        }
-        let target = if play { 1.0 } else { 0.0 };
-        let step = self.ramp_step;
-        for v in &mut self.demod {
-            if self.squelch < target {
-                self.squelch = (self.squelch + step).min(1.0);
-            } else if self.squelch > target {
-                self.squelch = (self.squelch - step).max(0.0);
-            }
-            *v *= self.squelch;
-        }
-        if let Some(d) = &mut self.deemph {
-            d.process(&mut self.demod);
-        }
-        let start = self.pending.len();
-        self.resampler.process(&self.demod, &mut self.pending);
-        if self.skip > 0 {
-            let k = self.skip.min(self.pending.len() - start);
-            self.pending.drain(start..start + k);
-            self.skip -= k;
-        }
-        let new = &mut self.pending[start..];
-        if play && let Some(t) = &mut self.tone {
-            t.push(new);
-        }
-        if let Some(h) = &mut self.hp {
-            h.process(new);
-        }
-        let (acc, n, muted) = &mut self.level_acc;
-        *muted |= !play;
-        for &v in new.iter() {
-            *acc += v as f64 * v as f64;
-            *n += 1;
-            if *n == self.level_len {
-                let db = 10.0 * (*acc / *n as f64).max(1e-20).log10();
-                self.levels.push_back((!*muted).then_some(db as f32));
-                if self.levels.len() > self.levels_max {
-                    self.levels.pop_front();
-                }
-                self.level_new = true;
-                (*acc, *n, *muted) = (0.0, 0, !play);
-            }
-        }
-        if let Some(agc) = &mut self.agc {
-            agc.process(new, play);
-        } else {
-            for v in new {
-                *v = soft_limit(*v * self.gain);
-            }
-        }
-    }
-
-    /// Whether the levels so far say this is a steady carrier: a full
-    /// window of frames, none muted, spread under `spread_db`. Checked
-    /// once per new level.
-    fn is_spur(&mut self, spread_db: f32) -> bool {
-        if !std::mem::take(&mut self.level_new)
-            || self.levels_max == 0
-            || self.levels.len() < self.levels_max
-        {
-            return false;
-        }
-        let Some(v) = self.levels.iter().copied().collect::<Option<Vec<f32>>>() else {
-            return false;
-        };
-        let mean = v.iter().sum::<f32>() / v.len() as f32;
-        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32;
-        var.sqrt() < spread_db
-    }
-
-    /// Seconds of audio released unmuted.
-    fn played_secs(&self) -> f64 {
-        self.played as f64 / self.rate
-    }
-
-    /// End of transmission: release the held block, muted.
-    fn flush(&mut self) {
-        while let Some(d) = self.held.pop_front() {
-            self.demod = d;
-            self.release(false);
-        }
-        self.demod.clear();
-    }
-
-    /// Emit everything except the last `holdback` samples.
-    fn drain_ready(&mut self, holdback: usize, out: &mut Vec<Output>) {
-        let n = self.pending.len().saturating_sub(holdback);
-        if n > 0 {
-            let samples: Vec<f32> = self.pending.drain(..n).collect();
-            self.emitted += samples.len();
-            out.push(Output::Audio {
-                id: self.id,
-                samples,
-            });
-        }
-    }
-}
-
 pub struct Scanner {
     cfg: ScannerConfig,
     bank: FilterBank,
@@ -397,7 +187,7 @@ pub struct Scanner {
     history: VecDeque<(Arc<Block>, Arc<[f32]>)>,
     history_len: usize,
     spare: Vec<Vec<Complex32>>,
-    chains: Vec<Chain>,
+    chains: Vec<Channel>,
     next_id: u64,
     events: Vec<Event>,
     stats: ScannerStats,
@@ -514,7 +304,7 @@ impl Scanner {
                 // Join transmissions already open at their newest audio.
                 let rate = self.cfg.audio_rate;
                 let mut live = Vec::new();
-                for c in self.chains.iter_mut().filter(|c| c.afsk.is_none()) {
+                for c in self.chains.iter_mut().filter(|c| c.records_audio()) {
                     live.push(LiveAudio::Start {
                         id: c.id,
                         freq: c.tuned.freq,
@@ -546,7 +336,7 @@ impl Scanner {
     fn feed_live(&mut self) {
         let Some(live) = &mut self.live else { return };
         let rate = self.cfg.audio_rate;
-        for c in self.chains.iter_mut().filter(|c| c.afsk.is_none()) {
+        for c in self.chains.iter_mut().filter(|c| c.records_audio()) {
             let sent = *c.live_sent.get_or_insert_with(|| {
                 live.push(LiveAudio::Start {
                     id: c.id,
@@ -619,7 +409,7 @@ impl Scanner {
 
     /// Close the transmissions of chains matching `pick` as if their signal
     /// had just stopped.
-    fn close_where(&mut self, pick: impl Fn(&Chain) -> bool, out: &mut Vec<Output>) {
+    fn close_where(&mut self, pick: impl Fn(&Channel) -> bool, out: &mut Vec<Output>) {
         let Some(last) = self.last_block else { return };
         let slots: Vec<usize> = self
             .chains
@@ -700,15 +490,15 @@ impl Scanner {
         let min_blocks = (self.cfg.min_len / block_secs).ceil() as u64;
         let preroll = self.detector.signal_offset_blocks();
         for c in &mut self.chains {
-            if c.afsk.is_some() {
-                Self::emit_packets(&self.clock, &mut self.stats, self.bank.params(), c, out);
+            Self::emit_packets(&self.clock, &mut self.stats, self.bank.params(), c, out);
+            if !c.records_audio() {
                 continue;
             }
             if !c.confirmed {
                 // Only time with the signal present counts, not hang time.
                 if let SlotState::Active { start } = self.detector.state(c.slot) {
                     if block.index + 1 >= start + preroll + min_blocks
-                        && c.played_secs() >= self.cfg.min_len
+                        && c.demod.played_secs() >= self.cfg.min_len
                     {
                         c.confirmed = true;
                         out.push(Output::Open(Self::tx_start(
@@ -732,12 +522,11 @@ impl Scanner {
     /// Throw away recordings that turned out to be steady carriers, and
     /// lock their frequencies out.
     fn drop_spurs(&mut self, out: &mut Vec<Output>) {
-        let spread = self.cfg.spur_spread_db;
         let found: Vec<usize> = self
             .chains
             .iter_mut()
             .enumerate()
-            .filter_map(|(i, c)| c.is_spur(spread).then_some(i))
+            .filter_map(|(i, c)| c.demod.is_spur().then_some(i))
             .collect();
         for i in found.into_iter().rev() {
             let c = self.chains.swap_remove(i);
@@ -759,11 +548,10 @@ impl Scanner {
         clock: &SampleClock,
         stats: &mut ScannerStats,
         p: &BankParams,
-        c: &mut Chain,
+        c: &mut Channel,
         out: &mut Vec<Output>,
     ) {
-        let Some(a) = &mut c.afsk else { return };
-        for d in a.take() {
+        for d in c.demod.take_frames() {
             let at = c.audio_t0 + (d.at_sample as f64 * p.sample_rate / c.rate) as i64;
             stats.packets += 1;
             out.push(Output::Packet(Packet {
@@ -780,7 +568,7 @@ impl Scanner {
         ((hang + 0.1) * self.cfg.audio_rate as f64).ceil() as usize
     }
 
-    fn tx_start(clock: &SampleClock, c: &Chain, audio_rate: u32) -> TxStart {
+    fn tx_start(clock: &SampleClock, c: &Channel, audio_rate: u32) -> TxStart {
         let s = c.audio_t0.max(0) as u64;
         TxStart {
             id: c.id,
@@ -800,8 +588,7 @@ impl Scanner {
             } => {
                 self.stats.opened += 1;
                 let ws = &self.detector.slots()[slot];
-                let afsk = ws.slot.mode == Mode::Afsk1200;
-                if !ws.slot.record || !(ws.slot.mode == Mode::Nbfm || afsk) {
+                if !ws.slot.record || !demod::supports(ws.slot.mode) {
                     self.stats.not_recorded += 1;
                     return;
                 }
@@ -834,11 +621,10 @@ impl Scanner {
                     return;
                 }
                 let ex = self.bank.extractor(offset, ws.slot.bandwidth);
-                let rate = ex.output_rate();
-                let audio_rate = self.cfg.audio_rate as f64;
-                let cutoff = (audio_rate / 2.0 * 0.85).min(ws.slot.bandwidth / 2.0);
-                let resampler = Resampler::new(rate, audio_rate, cutoff, audio_rate / 2.0 - cutoff);
-                let skip = resampler.delay_out().round() as usize;
+                let Some(dm) = demod::build(&ws.slot, ex.output_rate(), &self.cfg) else {
+                    // `supports` said yes above.
+                    unreachable!("no demodulator for {:?}", ws.slot.mode);
+                };
                 let first = self
                     .history
                     .iter()
@@ -849,51 +635,7 @@ impl Scanner {
                     Some(b) => b.first_sample as i64 - (self.bank.params().overlap() / 2) as i64,
                     None => 0,
                 };
-                let mut c = Chain {
-                    id: self.next_id,
-                    slot,
-                    tuned,
-                    disc: FmDiscriminator::new(rate, ws.slot.deviation),
-                    afsk: afsk.then(|| AfskDecoder::new(rate)),
-                    nsq: (!afsk && self.cfg.noise_squelch_db > 0.0).then(|| {
-                        NoiseSquelch::new(
-                            rate,
-                            ws.slot.deviation,
-                            ws.slot.bandwidth,
-                            self.cfg.noise_squelch_db,
-                        )
-                    }),
-                    deemph: self
-                        .cfg
-                        .deemphasis
-                        .then(|| Deemphasis::new(rate, self.cfg.deemphasis_tau)),
-                    resampler,
-                    hp: (self.cfg.highpass_hz > 0.0)
-                        .then(|| HighPass::new(audio_rate, self.cfg.highpass_hz)),
-                    tone: self.cfg.tones.then(|| ToneDetector::new(audio_rate)),
-                    levels: VecDeque::new(),
-                    level_acc: (0.0, 0, false),
-                    level_new: false,
-                    level_len: self.cfg.audio_rate as usize / 10,
-                    levels_max: (self.cfg.spur_secs * 10.0).ceil() as usize,
-                    gain: self.cfg.audio_gain,
-                    agc: self.cfg.agc.then(|| Agc::new(audio_rate)),
-                    played: 0,
-                    rate,
-                    skip,
-                    pending: Vec::new(),
-                    emitted: 0,
-                    live_sent: None,
-                    confirmed: false,
-                    audio_t0,
-                    iq: Vec::new(),
-                    demod: Vec::new(),
-                    squelch: 0.0,
-                    ramp_step: (1.0 / (0.005 * rate)) as f32,
-                    held: VecDeque::new(),
-                    gates: VecDeque::from([false]),
-                    extractor: ex,
-                };
+                let mut c = Channel::new(self.next_id, slot, tuned, ex, dm, audio_t0);
                 self.next_id += 1;
                 let close = self.cfg.detector.close_db;
                 for (b, snrs) in self
@@ -916,15 +658,14 @@ impl Scanner {
                     return;
                 };
                 let mut c = self.chains.swap_remove(pos);
-                if c.afsk.is_some() {
-                    let p = *self.bank.params();
-                    Self::emit_packets(&self.clock, &mut self.stats, &p, &mut c, out);
+                let p = *self.bank.params();
+                Self::emit_packets(&self.clock, &mut self.stats, &p, &mut c, out);
+                if !c.records_audio() {
                     return;
                 }
                 if let (Some(live), Some(_)) = (&mut self.live, c.live_sent) {
                     live.push(LiveAudio::End { id: c.id });
                 }
-                let p = *self.bank.params();
                 let end_sample = (end_block + 1) * p.hop as u64;
                 let signal_start =
                     (start_block + self.detector.signal_offset_blocks()) * p.hop as u64;
@@ -933,7 +674,7 @@ impl Scanner {
                     self.stats.discarded_short += 1;
                     return;
                 }
-                if !c.confirmed && c.played_secs() < self.cfg.min_len {
+                if !c.confirmed && c.demod.played_secs() < self.cfg.min_len {
                     self.stats.discarded_silent += 1;
                     return;
                 }
@@ -963,7 +704,7 @@ impl Scanner {
                     signal_secs,
                     peak_snr_db,
                     mean_snr_db,
-                    tone: c.tone.as_ref().and_then(|t| t.detect()),
+                    tone: c.demod.tags().tone,
                 }));
             }
         }
@@ -973,6 +714,8 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Mode;
+    use crate::dsp::Agc;
     use std::f64::consts::PI;
 
     fn slot(freq: f64) -> Slot {
