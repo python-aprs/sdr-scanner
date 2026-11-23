@@ -207,6 +207,9 @@ impl Recorder {
                         &o.rel,
                         bytes,
                     )?;
+                    if let Some(t) = &end.tone {
+                        self.index.set_tone(o.row, &t.label())?;
+                    }
                     let mut opus_bytes = 0;
                     if let Some((orel, w)) = o.opus {
                         match w.finish() {
@@ -306,10 +309,12 @@ mod tests {
             signal_secs: 0.8,
             peak_snr_db: 30.0,
             mean_snr_db: 25.0,
+            tone: Some(scanner_core::tone::Tone::Ctcss(100.0)),
         }))
         .unwrap();
         let rows = r.index().recent(5).unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tone.as_deref(), Some("100.0"));
         assert_eq!(rows[0].origin, "listed");
         assert_eq!(rows[0].audio_secs, Some(1.0));
         assert!(dir.path().join(&rows[0].wav_path).exists());

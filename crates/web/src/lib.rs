@@ -653,6 +653,8 @@ pub struct ListParams {
     pub since: Option<f64>,
     pub until: Option<f64>,
     pub min_secs: Option<f64>,
+    /// Exact tone label: `100.0` or `D023N`.
+    pub tone: Option<String>,
     pub before_id: Option<i64>,
     pub limit: Option<usize>,
 }
@@ -693,6 +695,7 @@ async fn list_recordings(
         since_ns: p.since.map(|t| (t * 1e9) as i64),
         until_ns: p.until.map(|t| (t * 1e9) as i64),
         min_secs: p.min_secs,
+        tone: p.tone.filter(|t| !t.is_empty()),
         before_id: p.before_id,
         limit: p.limit.unwrap_or(100),
     };

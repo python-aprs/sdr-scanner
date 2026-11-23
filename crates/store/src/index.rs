@@ -31,6 +31,10 @@ pub static SCHEMA: Schema = Schema {
                  ALTER TABLE transmissions ADD COLUMN opus_bytes INTEGER;",
             ),
         },
+        Migration {
+            description: "CTCSS/DCS tone tags",
+            up: Up::Sql("ALTER TABLE transmissions ADD COLUMN tone TEXT;"),
+        },
     ],
 };
 
@@ -77,6 +81,8 @@ pub struct Row {
     /// The compressed copy the web UI plays, when there is one.
     pub opus_path: Option<String>,
     pub opus_bytes: Option<i64>,
+    /// CTCSS tone (`100.0`) or DCS code (`D023N`) heard, if any.
+    pub tone: Option<String>,
 }
 
 /// Filters for [`Index::search`]. `None` means no constraint.
@@ -87,6 +93,8 @@ pub struct Query {
     pub since_ns: Option<i64>,
     pub until_ns: Option<i64>,
     pub min_secs: Option<f64>,
+    /// Exact tone label.
+    pub tone: Option<String>,
     /// Paging: only rows with a smaller id.
     pub before_id: Option<i64>,
     pub limit: usize,
@@ -188,6 +196,15 @@ impl Index {
         Ok(())
     }
 
+    /// Record the tone a transmission carried.
+    pub fn set_tone(&self, id: i64, tone: &str) -> Result<(), IndexError> {
+        self.db.execute(
+            "UPDATE transmissions SET tone = ?2 WHERE id = ?1",
+            params![id, tone],
+        )?;
+        Ok(())
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Row>, IndexError> {
         self.db
             .query_row("SELECT * FROM transmissions WHERE id = ?1", [id], row)
@@ -214,6 +231,7 @@ impl Index {
                AND (?3 IS NULL OR start_ns >= ?3) AND (?4 IS NULL OR start_ns < ?4)
                AND (?5 IS NULL OR audio_secs >= ?5)
                AND (?6 IS NULL OR id < ?6)
+               AND (?8 IS NULL OR tone = ?8)
              ORDER BY start_ns DESC, id DESC LIMIT ?7",
         )?;
         st.query_map(
@@ -224,7 +242,8 @@ impl Index {
                 q.until_ns,
                 q.min_secs,
                 q.before_id,
-                q.limit.clamp(1, 1000) as i64
+                q.limit.clamp(1, 1000) as i64,
+                q.tone
             ],
             row,
         )?
@@ -304,6 +323,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         status: r.get("status")?,
         opus_path: r.get("opus_path")?,
         opus_bytes: r.get("opus_bytes")?,
+        tone: r.get("tone")?,
     })
 }
 

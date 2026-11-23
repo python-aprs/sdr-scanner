@@ -10,6 +10,7 @@ use crate::clock::SampleClock;
 use crate::config::{Mode, Slot, SlotOrigin};
 use crate::detector::{Detector, DetectorParams, Event, SlotState};
 use crate::dsp::{Agc, Deemphasis, FmDiscriminator, HighPass, NoiseSquelch, Resampler, soft_limit};
+use crate::tone::{Tone, ToneDetector};
 use num_complex::Complex32;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -40,6 +41,8 @@ pub struct ScannerConfig {
     /// discriminator's noise above the voice band is at least this many dB
     /// below pure noise, on top of the power squelch. 0 disables.
     pub noise_squelch_db: f32,
+    /// Tag transmissions with their CTCSS tone or DCS code.
+    pub tones: bool,
     /// Lowest channel IQ rate.
     pub min_channel_rate: f64,
     /// Process channels in parallel.
@@ -64,6 +67,7 @@ impl Default for ScannerConfig {
             // An FM signal quiets by about its SNR plus 4 dB; pure noise
             // reads 2-5 dB. 8 dB opens from about 4 dB SNR.
             noise_squelch_db: 8.0,
+            tones: true,
             min_channel_rate: 25_000.0,
             parallel: true,
             grid_tune_step: 2500.0,
@@ -91,6 +95,8 @@ pub struct TxEnd {
     pub signal_secs: f64,
     pub peak_snr_db: f32,
     pub mean_snr_db: f32,
+    /// CTCSS tone or DCS code heard, if any.
+    pub tone: Option<Tone>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +154,7 @@ struct Chain {
     deemph: Option<Deemphasis>,
     resampler: Resampler,
     hp: Option<HighPass>,
+    tone: Option<ToneDetector>,
     gain: f32,
     agc: Option<Agc>,
     /// Discriminator samples released unmuted so far.
@@ -252,6 +259,9 @@ impl Chain {
             self.skip -= k;
         }
         let new = &mut self.pending[start..];
+        if play && let Some(t) = &mut self.tone {
+            t.push(new);
+        }
         if let Some(h) = &mut self.hp {
             h.process(new);
         }
@@ -716,6 +726,7 @@ impl Scanner {
                     resampler,
                     hp: (self.cfg.highpass_hz > 0.0)
                         .then(|| HighPass::new(audio_rate, self.cfg.highpass_hz)),
+                    tone: self.cfg.tones.then(|| ToneDetector::new(audio_rate)),
                     gain: self.cfg.audio_gain,
                     agc: self.cfg.agc.then(|| Agc::new(audio_rate)),
                     played: 0,
@@ -798,6 +809,7 @@ impl Scanner {
                     signal_secs,
                     peak_snr_db,
                     mean_snr_db,
+                    tone: c.tone.as_ref().and_then(|t| t.detect()),
                 }));
             }
         }
@@ -1279,6 +1291,41 @@ mod tests {
         let x = scene_amp(2.0, &[(100e3, 1000.0, 0.4, 1.6)], 3000.0, 4e-4);
         let (out, stats) = collect(&x, &plan, ScannerConfig::default());
         assert_eq!(s_opens(&out), 1, "{stats:?}");
+    }
+
+    #[test]
+    fn transmissions_are_tagged_with_their_tone() {
+        let fs = params().sample_rate;
+        // Voice-band tone at 3 kHz deviation, plus a sub-audible part.
+        let make = |sub: &dyn Fn(f64) -> f64| {
+            let mut x = scene(3.0, &[]);
+            let mut ph = 0.0f64;
+            for (i, v) in x.iter_mut().enumerate() {
+                let t = i as f64 / fs;
+                if (0.4..2.6).contains(&t) {
+                    let f = 100e3 + 3000.0 * (2.0 * PI * 1000.0 * t).sin() + sub(t);
+                    ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
+                    *v += Complex32::from_polar(0.1, ph as f32);
+                }
+            }
+            let (out, _) = collect(&x, &[slot(100e3)], ScannerConfig::default());
+            closes(&out).first().map(|e| e.tone)
+        };
+        let ctcss = make(&|t| 600.0 * (2.0 * PI * 127.3 * t).sin());
+        assert_eq!(ctcss, Some(Some(Tone::Ctcss(127.3))));
+        let w = crate::tone::dcs_word(0o244);
+        let dcs = make(&|t| {
+            let bit = (t * crate::tone::DCS_BAUD) as usize % 23;
+            if (w >> bit) & 1 == 1 { 600.0 } else { -600.0 }
+        });
+        assert_eq!(
+            dcs,
+            Some(Some(Tone::Dcs {
+                code: 0o244,
+                inverted: false
+            }))
+        );
+        assert_eq!(make(&|_| 0.0), Some(None));
     }
 
     #[test]
