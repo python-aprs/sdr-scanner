@@ -12,6 +12,7 @@
 //! | `PATCH /api/v1/channels/{freq_hz}` | admin (+ CSRF): `{"locked_out": bool, "priority": bool}`, either or both |
 //! | `DELETE /api/v1/channels/{freq_hz}/override` | admin (+ CSRF): back to the config file |
 //! | `GET /api/v1/live` (WebSocket) | same as status; see [`live`] |
+//! | `GET /api/v1/audio` (WebSocket) | same as recording audio; see [`audio`] |
 //! | `GET /`, `/assets/*` | anyone: the browser UI (see [`ui`]) |
 //!
 //! Accounts (see [`auth`]):
@@ -35,6 +36,7 @@
 //! recordings come from the SQLite index, opened per request on a blocking
 //! thread so the async runtime never waits on disk.
 
+pub mod audio;
 pub mod auth;
 pub mod live;
 pub mod ui;
@@ -138,6 +140,8 @@ pub struct AppState {
     pub settings: Option<Arc<Settings>>,
     /// Commands to the DSP thread.
     pub control: Option<ControlSender>,
+    /// Live listening; `None` when the scanner offers none.
+    pub audio: Option<Arc<audio::AudioHub>>,
 }
 
 /// A command for the running scanner.
@@ -170,6 +174,7 @@ impl AppState {
             channels: Default::default(),
             settings: None,
             control: None,
+            audio: None,
         }
     }
 }
@@ -368,6 +373,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/channels/{freq_hz}/override", delete(reset_channel))
         .route("/api/v1/live", get(live::live_ws))
+        .route("/api/v1/audio", get(audio::audio_ws))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/{id}", get(get_recording))
         .route("/api/v1/recordings/{id}/audio", get(get_audio))
@@ -1052,6 +1058,8 @@ mod tests {
             public,
             Some(Arc::new(auth)),
         );
+        let mut state = state;
+        state.audio = Some(audio::AudioHub::new());
         (dir, state, id, token)
     }
 
@@ -1174,6 +1182,7 @@ mod tests {
             ("/api/v1/recordings", 1),
             ("/api/v1/recordings/{id}", 2),
             ("/api/v1/recordings/{id}/audio", 3),
+            ("/api/v1/audio", 3),
             ("/api/v1/auth/tokens", 4),
         ];
         #[derive(Clone, Copy, Debug)]
@@ -1247,7 +1256,9 @@ mod tests {
                 };
                 // A plain GET that passes the guard is then refused as a
                 // bad WebSocket handshake; that is the "allowed" answer.
-                if route == "/api/v1/live" && got == S::BAD_REQUEST {
+                if route.starts_with("/api/v1/live") && got == S::BAD_REQUEST
+                    || route == "/api/v1/audio" && got == S::BAD_REQUEST
+                {
                     got = S::OK;
                 }
                 assert_eq!(got, want, "{uri} public={public:?} who={who:?}");

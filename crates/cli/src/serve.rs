@@ -358,6 +358,8 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     };
     publish_channels(&scanner, &overrides);
     let status: scanner_web::StatusHandle = Default::default();
+    let audio_hub = scanner_web::audio::AudioHub::new();
+    let mut live_tx = None;
     let spectrum: scanner_web::SpectrumHandle = Default::default();
     // The spectrum shows the profile's span, inside what the radio delivers
     // cleanly.
@@ -385,6 +387,12 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         state.channels = channels.clone();
         state.settings = Some(settings.clone());
         state.control = Some(control_tx.clone());
+        live_tx = Some(
+            audio_hub
+                .spawn_encoder()
+                .context("starting the live audio thread")?,
+        );
+        state.audio = Some(audio_hub.clone());
         scanner_web::spawn(addr, state)
             .with_context(|| format!("starting the web API on {addr}"))?;
         eprintln!("web interface on http://{addr}/");
@@ -412,8 +420,16 @@ pub fn serve(o: ServeOptions) -> Result<()> {
             }
         }
         let t = Instant::now();
+        scanner.set_live(live_tx.is_some() && audio_hub.wanted());
         scanner.push(&buf[..k], &mut out);
         busy += t.elapsed();
+        if let Some(tx) = &live_tx {
+            let mut live = Vec::new();
+            scanner.take_live(&mut live);
+            if !live.is_empty() {
+                let _ = tx.send(live);
+            }
+        }
         if !out.is_empty() {
             for o in &out {
                 if let Output::Open(s) = o {
