@@ -901,10 +901,9 @@ mod tests {
             let zc = mid.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count() as f64;
             let f = zc / ((b - a) as f64 / 8000.0);
             assert!((f - tone).abs() < 10.0, "tone {f}");
-            // Level: the AGC puts a steady tone's peaks at its target.
+            // Level: the AGC puts a steady tone's RMS at its target.
             let rms = (mid.iter().map(|v| v * v).sum::<f32>() / mid.len() as f32).sqrt();
-            let want = Agc::TARGET * std::f32::consts::FRAC_1_SQRT_2;
-            assert!((rms / want - 1.0).abs() < 0.1, "rms {rms}");
+            assert!((rms / Agc::TARGET - 1.0).abs() < 0.12, "rms {rms}");
             let close = out
                 .iter()
                 .find_map(|o| match o {
@@ -943,7 +942,8 @@ mod tests {
         );
         let (light, full) = (level(300.0, true), level(3000.0, true));
         assert!((full - light).abs() < 1.0, "agc: {light} vs {full}");
-        assert!(light > -12.0, "agc level {light} dBFS");
+        let target = 20.0 * Agc::TARGET.log10();
+        assert!((light - target).abs() < 1.5, "agc level {light} dBFS");
     }
 
     #[test]
