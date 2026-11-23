@@ -19,6 +19,8 @@ use scanner_sources::{FileSource, Source};
 use std::path::{Path, PathBuf};
 
 mod admin;
+mod kiss;
+mod outputs;
 mod serve;
 
 #[derive(Parser)]
@@ -772,6 +774,7 @@ fn run(a: RunArgs) -> Result<()> {
         .with_opus(!a.tuning.no_opus)
         .with_retention(a.tuning.retention())?;
     let (tx, writer) = recorder.spawn(64);
+    let outputs = outputs::Outputs::new(tx, None, false);
 
     // Reader thread: file I/O and sample conversion overlap with DSP.
     let (rtx, rrx) = std::sync::mpsc::sync_channel::<Vec<Complex32>>(4);
@@ -795,21 +798,13 @@ fn run(a: RunArgs) -> Result<()> {
 
     let started = Instant::now();
     let mut out: Vec<Output> = Vec::new();
-    let send = |out: &mut Vec<Output>| -> Result<()> {
-        if !out.is_empty() {
-            tx.send(std::mem::take(out))
-                .ok()
-                .context("recorder thread stopped")?;
-        }
-        Ok(())
-    };
     for chunk in rrx {
         scanner.push(&chunk, &mut out);
-        send(&mut out)?;
+        outputs.send(&mut out)?;
     }
     scanner.finish(&mut out);
-    send(&mut out)?;
-    drop(tx);
+    outputs.send(&mut out)?;
+    drop(outputs);
     reader.join().expect("reader thread panicked")?;
     let rec = writer.join().expect("recorder thread panicked")?;
     let elapsed = started.elapsed().as_secs_f64();
