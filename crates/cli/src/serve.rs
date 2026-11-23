@@ -185,8 +185,36 @@ fn start_sdrplay(
         serial,
         ..o.sdrplay.clone()
     };
-    // Callbacks are ~1000 samples; the ring is fed in full blocks.
-    let (device, source) = Sdrplay::start(&cfg, BLOCKS, BLOCK)?;
+    // Opening goes through blocking SDRplay API calls with no timeout: they
+    // wait for as long as another program holds the API lock or the service
+    // is stuck. Open on a helper thread so we can say what we are waiting on
+    // and give up on Ctrl-C.
+    eprintln!("opening the SDRplay radio...");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("radio-open".into())
+        .spawn(move || {
+            // Callbacks are ~1000 samples; the ring is fed in full blocks.
+            let _ = tx.send(Sdrplay::start(&cfg, BLOCKS, BLOCK));
+        })?;
+    let opened = Instant::now();
+    let mut hinted = false;
+    let (device, source) = loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(r) => break r?,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("the thread opening the radio died")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if stop.load(Ordering::Relaxed) || halt.load(Ordering::Relaxed) {
+            bail!("stopped while waiting for the SDRplay API to open the radio");
+        }
+        if !hinted && opened.elapsed() >= OPEN_HINT_AFTER {
+            hinted = true;
+            eprintln!("{}", open_hint(opened.elapsed()));
+        }
+    };
     let info = source.info().clone();
     let events = device.events().clone();
     let radio = std::thread::Builder::new()
@@ -213,6 +241,21 @@ fn start_sdrplay(
             Ok(())
         })?;
     Ok((info, source, radio, Some(events)))
+}
+
+/// How long opening the radio may take before we tell the user why.
+#[cfg_attr(not(feature = "sdrplay"), allow(dead_code))]
+const OPEN_HINT_AFTER: Duration = Duration::from_secs(10);
+
+#[cfg_attr(not(feature = "sdrplay"), allow(dead_code))]
+fn open_hint(waited: Duration) -> String {
+    format!(
+        "still waiting for the SDRplay API after {} s. Another program probably has the \
+         radio (an earlier `scanner serve`, SDRconnect, SDRuno), or sdrplay_apiService is \
+         stuck. Check with `pgrep -fl 'scanner|SDRconnect|sdrplay'`; quit the other program, \
+         or restart the service or replug the radio. Ctrl-C to give up.",
+        waited.as_secs()
+    )
 }
 
 #[cfg(not(feature = "sdrplay"))]
