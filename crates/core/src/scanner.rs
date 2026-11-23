@@ -9,7 +9,7 @@ use crate::channelizer::{Analyzer, BankParams, Block, Extractor, FilterBank};
 use crate::clock::SampleClock;
 use crate::config::{Mode, Slot, SlotOrigin};
 use crate::detector::{Detector, DetectorParams, Event, SlotState};
-use crate::dsp::{Agc, Deemphasis, FmDiscriminator, HighPass, Resampler, soft_limit};
+use crate::dsp::{Agc, Deemphasis, FmDiscriminator, HighPass, NoiseSquelch, Resampler, soft_limit};
 use num_complex::Complex32;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -36,6 +36,10 @@ pub struct ScannerConfig {
     pub agc: bool,
     /// High-pass corner for removing CTCSS tones; 0 disables.
     pub highpass_hz: f64,
+    /// Noise squelch (see [`NoiseSquelch`]): audio plays only while the
+    /// discriminator's noise above the voice band is at least this many dB
+    /// below pure noise, on top of the power squelch. 0 disables.
+    pub noise_squelch_db: f32,
     /// Lowest channel IQ rate.
     pub min_channel_rate: f64,
     /// Process channels in parallel.
@@ -57,6 +61,9 @@ impl Default for ScannerConfig {
             audio_gain: 0.5,
             agc: true,
             highpass_hz: 300.0,
+            // An FM signal quiets by about its SNR plus 4 dB; pure noise
+            // reads 2-5 dB. 8 dB opens from about 4 dB SNR.
+            noise_squelch_db: 8.0,
             min_channel_rate: 25_000.0,
             parallel: true,
             grid_tune_step: 2500.0,
@@ -137,6 +144,7 @@ struct Chain {
     tuned: Slot,
     extractor: Extractor,
     disc: FmDiscriminator,
+    nsq: Option<NoiseSquelch>,
     deemph: Option<Deemphasis>,
     resampler: Resampler,
     hp: Option<HighPass>,
@@ -197,8 +205,11 @@ impl Chain {
         self.extractor.process(block, &mut self.iq);
         let mut d = self.spare_demod();
         self.disc.process(&self.iq, &mut d);
+        // The noise squelch measures every block, so its hysteresis follows
+        // the signal even while the power squelch has it muted.
+        let quiet = self.nsq.as_mut().is_none_or(|n| n.update(&d));
         self.held.push_back(d);
-        self.gates.push_back(open);
+        self.gates.push_back(open && quiet);
         if self.held.len() > SQUELCH_LOOKAHEAD {
             // gates: [before, oldest held, ..., newest]
             let play = self.gates.iter().all(|&g| g);
@@ -690,6 +701,14 @@ impl Scanner {
                     slot,
                     tuned,
                     disc: FmDiscriminator::new(rate, ws.slot.deviation),
+                    nsq: (self.cfg.noise_squelch_db > 0.0).then(|| {
+                        NoiseSquelch::new(
+                            rate,
+                            ws.slot.deviation,
+                            ws.slot.bandwidth,
+                            self.cfg.noise_squelch_db,
+                        )
+                    }),
                     deemph: self
                         .cfg
                         .deemphasis
@@ -819,6 +838,11 @@ mod tests {
 
     /// Like `scene`, with the tone at `dev` Hz deviation.
     fn scene_dev(secs: f64, sigs: &[(f64, f64, f64, f64)], dev: f64) -> Vec<Complex32> {
+        scene_amp(secs, sigs, dev, 0.1)
+    }
+
+    /// Like `scene_dev`, with carriers of amplitude `amp`.
+    fn scene_amp(secs: f64, sigs: &[(f64, f64, f64, f64)], dev: f64, amp: f32) -> Vec<Complex32> {
         let fs = params().sample_rate;
         let n = (secs * fs) as usize;
         let mut seed = 0x1234_5678_9abc_def0u64;
@@ -839,7 +863,7 @@ mod tests {
                 if t >= on && t < offt {
                     let f = off + dev * (2.0 * PI * tone * t).sin();
                     ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
-                    *v += Complex32::from_polar(0.1, ph as f32);
+                    *v += Complex32::from_polar(amp, ph as f32);
                 }
             }
         }
@@ -1202,6 +1226,59 @@ mod tests {
         s.push(&x[..20_000], &mut out);
         s.take_live(&mut more);
         assert!(more.is_empty());
+    }
+
+    /// Add band-limited noise (random-phase tones every 125 Hz across
+    /// `centre` +/- `half` Hz, total RMS `rms`) from `on` to `off` seconds.
+    fn add_noise_band(x: &mut [Complex32], centre: f64, half: f64, rms: f32, on: f64, off: f64) {
+        let fs = params().sample_rate;
+        let k = (half / 125.0) as i64;
+        let n = (2 * k + 1) as f32;
+        let mut seed = 99u32;
+        let tones: Vec<(f64, f64)> = (-k..=k)
+            .map(|j| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (
+                    centre + j as f64 * 125.0,
+                    seed as f64 / u32::MAX as f64 * 2.0 * PI,
+                )
+            })
+            .collect();
+        let a = rms / n.sqrt();
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = i as f64 / fs;
+            if t >= on && t < off {
+                for &(f, p) in &tones {
+                    *v += Complex32::from_polar(a, (2.0 * PI * f * t + p) as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn noise_squelch_keeps_wideband_noise_out() {
+        // Noise filling the slot (like a switching supply's hash) lifts its
+        // power well over the open threshold, but it is not an FM signal.
+        let mut x = scene(2.0, &[]);
+        add_noise_band(&mut x, 100e3, 7000.0, 4e-4, 0.4, 1.6);
+        let plan = vec![slot(100e3)];
+        let off = ScannerConfig {
+            noise_squelch_db: 0.0,
+            ..Default::default()
+        };
+        let (out, stats) = collect(&x, &plan, off);
+        assert_eq!(
+            s_opens(&out),
+            1,
+            "power squelch alone records it: {stats:?}"
+        );
+        let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+        assert_eq!(s_opens(&out), 0, "{stats:?}");
+        assert_eq!(stats.discarded_silent, 1, "{stats:?}");
+        // A real transmission at the same power still records.
+        let x = scene_amp(2.0, &[(100e3, 1000.0, 0.4, 1.6)], 3000.0, 4e-4);
+        let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+        assert_eq!(s_opens(&out), 1, "{stats:?}");
     }
 
     #[test]

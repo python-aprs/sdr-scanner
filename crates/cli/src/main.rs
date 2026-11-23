@@ -205,6 +205,12 @@ struct Tuning {
     /// Seconds below the close threshold before a transmission ends.
     #[arg(long, default_value_t = 1.5)]
     hang: f64,
+    /// Noise squelch: play audio only while the noise above the voice band
+    /// is this many dB quieter than no signal at all (a signal quiets by
+    /// about its SNR plus 4 dB). Keeps wideband noise and hash that lift a
+    /// channel's power out of recordings. 0 turns it off.
+    #[arg(long, default_value_t = 8.0)]
+    noise_squelch: f32,
     /// Drop transmissions shorter than this (seconds).
     #[arg(long, default_value_t = 0.3)]
     min_len: f64,
@@ -284,6 +290,7 @@ impl Tuning {
             audio_rate: profile.audio_rate,
             deemphasis: profile.deemphasis,
             min_len: self.min_len,
+            noise_squelch_db: self.noise_squelch,
             parallel: !self.serial,
             ..Default::default()
         }
