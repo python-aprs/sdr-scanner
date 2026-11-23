@@ -27,6 +27,10 @@
     return el;
   }
 
+  // replaceChildren() turns null into the text "null"; skip empty children
+  // the way h() does.
+  const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
+
   const MHZ = (hz, digits = 4) => (hz / 1e6).toFixed(digits);
   const fmtSecs = (s) => {
     if (s === null || s === undefined) return '';
@@ -349,7 +353,7 @@
       const vol = h('input', { type: 'range', min: '0', max: '1', step: '0.05', value: String(listen.volume), 'aria-label': 'Volume', class: 'vol' });
       vol.oninput = () => listen.setVolume(Number(vol.value));
       const now = listen.playing();
-      wrap.replaceChildren(h('span', { class: 'k', 'aria-hidden': 'true' }, '\u{1F50A}'), seg, vol,
+      fill(wrap, h('span', { class: 'k', 'aria-hidden': 'true' }, '\u{1F50A}'), seg, vol,
         listen.mode === 'freqs' ? h('span', { class: 'muted' }, `${listen.freqs.size} selected`) : null,
         now.length ? h('span', { class: 'now-playing mono' }, now.map((f) => MHZ(f, 4)).join(', ')) : null);
     }
@@ -604,7 +608,7 @@
       const hz = frame.start + (hover.x / r.width) * (frame.stop - frame.start);
       const i = Math.min(frame.db.length - 1, Math.max(0, Math.floor((hover.x / r.width) * frame.db.length)));
       const c = channelAt(hz);
-      tip.replaceChildren(
+      fill(tip,
         h('span', { class: 'mono' }, `${MHZ(hz, 4)} MHz`), ` · ${fmtDb(frame.db[i])}`,
         c && c.name ? h('div', { class: 'muted' }, `${c.name} (${kindLabel[c.kind] || c.kind})`) : null,
         canRecordings() ? h('div', { class: 'muted' }, 'Click for recordings') : null);
