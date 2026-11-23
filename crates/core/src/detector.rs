@@ -61,6 +61,19 @@ pub struct DetectorParams {
     /// A steady level above this is a real carrier (a beacon, a weather
     /// broadcast), not a comb line; it is left alone.
     pub background_max_db: f32,
+    /// Pulsed comb guard. A switching supply that turns on and off puts
+    /// its whole comb up at once: when at least `comb_teeth` slots start an
+    /// attack within `comb_window` seconds, all no stronger than
+    /// `background_max_db`, and that many of them sit on one evenly spaced
+    /// grid, those slots are comb lines. For `comb_hold` seconds after a
+    /// slot was last seen as one, it must clear the level it rose to then
+    /// by `comb_margin_db` to open (its close threshold is raised by as
+    /// much). Linked repeaters keying up together are not evenly spaced
+    /// and are usually stronger, so they are left alone. 0 teeth disables.
+    pub comb_teeth: usize,
+    pub comb_window: f64,
+    pub comb_hold: f64,
+    pub comb_margin_db: f32,
 }
 
 impl Default for DetectorParams {
@@ -86,6 +99,10 @@ impl Default for DetectorParams {
             background_pct: 0.1,
             background_min_db: 1.5,
             background_max_db: 15.0,
+            comb_teeth: 4,
+            comb_window: 1.0,
+            comb_hold: 1800.0,
+            comb_margin_db: 6.0,
         }
     }
 }
@@ -210,6 +227,16 @@ pub struct Detector {
     /// Per slot: the learned background (dB), 0 until enough is held.
     bg_db: Vec<f32>,
     bg_scratch: Vec<f32>,
+    /// Recent attack starts: (slot, block, SNR).
+    rises: VecDeque<(usize, u64, f32)>,
+    /// Per slot: the level (dB) it rose to as a comb line, and the block it
+    /// was last seen as one (see `DetectorParams::comb_teeth`).
+    comb_level: Vec<f32>,
+    comb_seen: Vec<u64>,
+    /// Per slot: blocks in a row over the plain open threshold while idle.
+    raw_run: Vec<u64>,
+    /// Pulsed comb events seen.
+    comb_events: u64,
 }
 
 /// Median of an exponential-ish smoothed noise PSD sits below its mean; this
@@ -365,6 +392,11 @@ impl Detector {
             bg_blocks: (1.0 / block).round().max(1.0) as u32,
             bg_db: vec![0.0; count],
             bg_scratch: Vec::new(),
+            rises: VecDeque::new(),
+            comb_level: vec![0.0; count],
+            comb_seen: vec![0; count],
+            raw_run: vec![0; count],
+            comb_events: 0,
         }
     }
 
@@ -674,6 +706,19 @@ impl Detector {
             });
             self.opens
                 .push(snr >= self.params.open_db + self.background_db(i) && wins);
+            // For the pulsed comb guard: a slot idle or in its attack that
+            // has been over the plain open threshold for an attack's worth
+            // of blocks rose now, whether or not its threshold is raised
+            // (so a known comb keeps being seen).
+            let waiting = matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. });
+            if waiting && snr >= self.params.open_db && wins && !(step || interfered) {
+                self.raw_run[i] += 1;
+                if self.raw_run[i] == self.attack_blocks {
+                    self.rises.push_back((i, block.index, snr));
+                }
+            } else {
+                self.raw_run[i] = 0;
+            }
         }
         if step || interfered {
             // Hold every waiting slot back for this block; after a step the
@@ -685,6 +730,7 @@ impl Detector {
                 }
             }
         }
+        self.learn_comb(b);
         // Broadband-burst guard (see DetectorParams::burst_slots).
         if self.params.burst_slots > 0 {
             let waiting = |i: usize| {
@@ -818,6 +864,60 @@ impl Detector {
         }
     }
 
+    /// Look for a pulsed comb among the slots that started an attack within
+    /// the last `comb_window` (see `DetectorParams::comb_teeth`), mark its
+    /// lines, and cancel their attacks.
+    fn learn_comb(&mut self, b: u64) {
+        let hold = (self.params.comb_hold / self.bank.block_secs()) as u64;
+        for i in 0..self.slots.len() {
+            if self.comb_level[i] > 0.0 && b.saturating_sub(self.comb_seen[i]) > hold {
+                self.comb_level[i] = 0.0;
+            }
+        }
+        let window = (self.params.comb_window / self.bank.block_secs()).ceil() as u64;
+        while self.rises.front().is_some_and(|r| r.1 + window < b) {
+            self.rises.pop_front();
+        }
+        let teeth = self.params.comb_teeth;
+        if teeth == 0 || !self.rises.back().is_some_and(|r| r.1 == b) {
+            return;
+        }
+        // Per slot, the strongest rise in the window; strong ones are not
+        // comb lines.
+        let mut rose: Vec<(usize, f32)> = Vec::new();
+        for &(i, _, snr) in &self.rises {
+            match rose.iter_mut().find(|r| r.0 == i) {
+                Some(r) => r.1 = r.1.max(snr),
+                None => rose.push((i, snr)),
+            }
+        }
+        rose.retain(|r| r.1 <= self.params.background_max_db);
+        if rose.len() < teeth {
+            return;
+        }
+        let offs: Vec<f64> = rose.iter().map(|r| self.slots[r.0].offset_hz).collect();
+        let Some(members) = comb_members(&offs, teeth) else {
+            return;
+        };
+        self.comb_events += 1;
+        for k in members {
+            let (i, snr) = rose[k];
+            self.comb_level[i] = self.comb_level[i].max(snr);
+            self.comb_seen[i] = b;
+            if matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. }) {
+                self.states[i] = SlotState::Idle;
+                self.attack_centre[i] = (0.0, 0);
+                self.opens[i] = false;
+            }
+        }
+        self.rises.retain(|r| self.comb_seen[r.0] != b);
+    }
+
+    /// Pulsed comb events seen (see `DetectorParams::comb_teeth`).
+    pub fn comb_events(&self) -> u64 {
+        self.comb_events
+    }
+
     /// How far the whole band's noise sits above the smoothed floor this
     /// block, at least 1: the median over segments of this block's level
     /// over the floor, measured two ways (below), whichever is higher.
@@ -907,14 +1007,21 @@ impl Detector {
     /// interference under it (dB; see `DetectorParams::background_secs`).
     pub fn background_db(&self, i: usize) -> f32 {
         let bg = self.bg_db[i];
-        if bg >= self.params.background_min_db && bg <= self.params.background_max_db {
+        let steady = if bg >= self.params.background_min_db && bg <= self.params.background_max_db {
             bg
         } else {
             0.0
-        }
+        };
+        let comb = if self.comb_level[i] > 0.0 {
+            (self.comb_level[i] + self.params.comb_margin_db - self.params.open_db).max(0.0)
+        } else {
+            0.0
+        };
+        steady.max(comb)
     }
 
-    /// Slots whose thresholds are raised for steady interference.
+    /// Slots whose thresholds are raised for steady or pulsed comb
+    /// interference.
     pub fn background_slots(&self) -> usize {
         (0..self.slots.len())
             .filter(|&i| self.background_db(i) > 0.0)
@@ -1034,6 +1141,59 @@ impl Detector {
         s.record = record;
         s.priority = priority;
     }
+}
+
+/// Which of these offsets (Hz) lie on one evenly spaced grid of at least
+/// `teeth` lines, if any: the grid (spacing 50 kHz or more, from any pair
+/// and its first few divisions) that holds the most of them, each within
+/// 10 kHz of a line. Offsets within 30 kHz of each other count as one line.
+fn comb_members(offs: &[f64], teeth: usize) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = (0..offs.len()).collect();
+    order.sort_by(|&a, &b| offs[a].total_cmp(&offs[b]));
+    // Lines: (centre, members).
+    let mut lines: Vec<(f64, Vec<usize>)> = Vec::new();
+    for k in order {
+        let f = offs[k];
+        match lines.last_mut() {
+            Some((c, m)) if f - *c <= 30e3 => {
+                *c = (*c * m.len() as f64 + f) / (m.len() + 1) as f64;
+                m.push(k);
+            }
+            _ => lines.push((f, vec![k])),
+        }
+    }
+    if lines.len() < teeth {
+        return None;
+    }
+    let on = |f0: f64, s: f64| -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&j| {
+                let k = (lines[j].0 - f0) / s;
+                (k - k.round()).abs() * s <= 10e3
+            })
+            .collect()
+    };
+    let mut best: Vec<usize> = Vec::new();
+    for a in 0..lines.len() {
+        for b in a + 1..lines.len() {
+            let d = lines[b].0 - lines[a].0;
+            for div in 1..=4 {
+                let s = d / div as f64;
+                if s < 50e3 {
+                    break;
+                }
+                let got = on(lines[a].0, s);
+                // A grid must be filled in, not just two lines far apart
+                // with the rest landing on a fine spacing by chance: at
+                // least half the lines between the outermost members.
+                let span = (lines[*got.last().unwrap()].0 - lines[got[0]].0) / s;
+                if got.len() > best.len() && got.len() as f64 >= (span.round() + 1.0) / 2.0 {
+                    best = got;
+                }
+            }
+        }
+    }
+    (best.len() >= teeth).then(|| best.iter().flat_map(|&j| lines[j].1.clone()).collect())
 }
 
 #[cfg(test)]
@@ -1404,6 +1564,54 @@ mod tests {
     }
 
     #[test]
+    fn pulsed_comb_lines_are_learned_and_signals_still_open() {
+        // A supply that cycles: lines every 125 kHz, ~9 dB, on for 2 s and
+        // off for 2 s; a real 20 dB signal next to one starts while the
+        // comb is up.
+        let mut sigs: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for on in [0.5, 4.5] {
+            for k in [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0] {
+                sigs.push((k * 125e3, 11.0, on, on + 2.0));
+            }
+        }
+        sigs.push((255e3, 20.0, 5.0, 7.0));
+        let x = scene(8.0, &sigs, 37);
+        let plan: Vec<Slot> = (-16..=16).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let dp = DetectorParams {
+            grid_window_hz: 25e3,
+            ..DetectorParams::default()
+        };
+        let (det, events, _) = run(&x, &plan, dp);
+        let block = params().block_secs();
+        let opens: Vec<(f64, f64)> = events
+            .iter()
+            .filter_map(|e| match *e {
+                Event::Open { slot, block: b, .. } => {
+                    Some((det.slots()[slot].offset_hz, b as f64 * block))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opens.len(), 1, "{opens:?}");
+        assert!((opens[0].0 - 250e3).abs() < 1.0, "{opens:?}");
+        assert!((opens[0].1 - 5.0).abs() < 0.2, "{opens:?}");
+        assert!(det.comb_events() >= 2, "{}", det.comb_events());
+        assert_eq!(det.comb(), Some((125e3, 6)));
+    }
+
+    #[test]
+    fn comb_members_needs_an_even_grid() {
+        let khz = |v: &[f64]| v.iter().map(|f| f * 1e3).collect::<Vec<f64>>();
+        // Masen's comb: every ~262 kHz, with a line missing.
+        let got = comb_members(&khz(&[-520.0, -258.0, 4.0, 528.0, 790.0]), 4).unwrap();
+        assert_eq!(got.len(), 5);
+        // Four repeaters keyed up together, not evenly spaced.
+        assert!(comb_members(&khz(&[-610.0, -130.0, 270.0, 875.0]), 4).is_none());
+        // Too few lines.
+        assert!(comb_members(&khz(&[0.0, 260.0, 520.0]), 4).is_none());
+    }
+
+    #[test]
     fn detects_transmission_with_correct_timing() {
         let x = scene(4.0, &[(100e3, 15.0, 0.5, 2.0)], 11);
         let plan: Vec<Slot> = (-20..=20).map(|k| slot(k as f64 * 12.5e3, 11e3)).collect();
@@ -1498,12 +1706,14 @@ mod tests {
             .collect();
         assert_eq!(opened, vec![100e3], "{opened:?}");
         assert!(det.burst_blocks() > 0);
-        // With the guard off, the products open too.
+        // With the guard off, the products open too. (Evenly spaced as
+        // they are here, the comb guard would also catch them.)
         let (_, events, _) = run(
             &x,
             &plan,
             DetectorParams {
                 burst_slots: 0,
+                comb_teeth: 0,
                 ..Default::default()
             },
         );
