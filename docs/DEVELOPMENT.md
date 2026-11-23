@@ -271,6 +271,16 @@ Stage benchmark (ns per input sample and share of a core at 10 MS/s):
 cargo bench -p scanner-core --bench pipeline
 ```
 
+End-to-end benchmark: the whole `Scanner` over the 2 m band at 10 MS/s
+(idle, 8 voice channels plus APRS, and 16 voice channels), with a
+fingerprint of everything it output. A refactor that should change nothing
+must leave the fingerprints as they were; quote both benches before and
+after in the PR.
+
+```sh
+cargo bench -p scanner-core --bench scanner
+```
+
 A recording path can be given as `name`, `name.sigmf-meta` or `name.sigmf-data`.
 
 ### Database migrations
