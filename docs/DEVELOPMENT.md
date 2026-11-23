@@ -341,7 +341,8 @@ turns jumps in the API's sample counter into zero-filled gaps.
 stand-in header and runs `serve` against a fake API library that streams a
 keyed carrier, so the whole path can be exercised without the SDK or a radio.
 
-The Airspy backend (`--features airspy`, libairspy) is next.
+The Airspy backend (libairspy, behind an `airspy` feature) comes later; the
+feature is added along with it.
 
 
 #### Calibrating gain

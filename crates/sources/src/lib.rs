@@ -10,8 +10,6 @@ pub mod file;
 pub mod ring;
 pub mod sigmf;
 
-#[cfg(feature = "airspy")]
-pub mod airspy;
 pub mod sdrplay;
 
 pub use file::FileSource;

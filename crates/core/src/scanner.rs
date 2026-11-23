@@ -593,12 +593,7 @@ impl Scanner {
         priority: bool,
         out: &mut Vec<Output>,
     ) -> bool {
-        let Some(i) = self
-            .detector
-            .slots()
-            .iter()
-            .position(|w| (w.slot.freq - freq).abs() < 1.0)
-        else {
+        let Some(i) = self.detector.slot_at(freq) else {
             return false;
         };
         self.detector.set_flags(i, record, priority);

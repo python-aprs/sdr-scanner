@@ -50,13 +50,7 @@ pub enum AuthError {
 
 pub type Result<T> = std::result::Result<T, AuthError>;
 
-/// Nanoseconds since the Unix epoch.
-pub fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
+pub use scanner_core::clock::now_ns;
 
 /// 32 random bytes, base64url without padding (43 characters).
 fn random_secret() -> String {
