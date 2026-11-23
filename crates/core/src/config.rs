@@ -64,6 +64,9 @@ pub struct ChannelEntry {
     #[serde(default)]
     pub priority: bool,
     pub record: Option<bool>,
+    /// CTCSS tone in Hz the channel is known to use, informational for now
+    /// (compare with the tone tagged on each recording).
+    pub tone: Option<f64>,
 }
 
 /// A repeater pair: creates an output slot and, if `monitor_input`, an input
@@ -617,6 +620,41 @@ offset = "600 kHz"
                 .iter()
                 .all(|s| s.origin != SlotOrigin::RepeaterInput)
         );
+    }
+
+    #[test]
+    fn shipped_configs_load_without_warnings() {
+        for (file, text) in [
+            (
+                "example-2m.toml",
+                include_str!("../../../config/example-2m.toml"),
+            ),
+            ("rainier.toml", include_str!("../../../config/rainier.toml")),
+            ("cowlitz.toml", include_str!("../../../config/cowlitz.toml")),
+        ] {
+            let cfg = ConfigFile::parse(text).unwrap_or_else(|e| panic!("{file}: {e}"));
+            for name in cfg.profiles.keys() {
+                let p = cfg
+                    .profile(name)
+                    .unwrap_or_else(|e| panic!("{file} {name}: {e}"));
+                let plan = p.channel_plan();
+                assert!(
+                    plan.warnings.is_empty(),
+                    "{file} {name}: {:?}",
+                    plan.warnings
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn channel_tone_is_carried() {
+        let cfg = ConfigFile::parse(include_str!("../../../config/cowlitz.toml")).unwrap();
+        let p = cfg.profile("cowlitz-vhf").unwrap();
+        let c = p.channels.iter().find(|c| c.freq.0 == 155.325e6).unwrap();
+        assert_eq!(c.tone, Some(107.2));
+        // Wider than the RSP1A's usable 0.9 x 8 MS/s would not fit.
+        assert!(p.span.width() <= 0.9 * 8e6);
     }
 
     #[test]
