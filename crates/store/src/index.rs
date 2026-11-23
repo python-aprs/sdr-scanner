@@ -135,6 +135,23 @@ pub struct PacketRow {
     pub raw: Vec<u8>,
 }
 
+impl PacketRow {
+    /// The row for a packet the scanner decoded (`id` 0 until it is stored).
+    pub fn from_decoded(p: &scanner_core::scanner::Packet) -> Self {
+        PacketRow {
+            id: 0,
+            time_ns: scanner_core::clock::unix_ns(p.time),
+            freq_hz: p.slot.freq,
+            channel: p.slot.name.clone(),
+            source: p.frame.source.clone(),
+            dest: p.frame.dest.clone(),
+            path: p.frame.path.join(","),
+            text: p.frame.tnc2(),
+            raw: p.frame.raw.clone(),
+        }
+    }
+}
+
 pub struct NewRow<'a> {
     pub freq_hz: f64,
     pub channel: Option<&'a str>,

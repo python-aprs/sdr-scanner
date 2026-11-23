@@ -20,6 +20,8 @@ pub struct Web {
     audio: Arc<scanner_web::audio::AudioHub>,
     live_tx: Option<Sender<Vec<LiveAudio>>>,
     pub egress: Option<Arc<scanner_web::egress::Egress>>,
+    /// Decoded packets for the Live page.
+    pub packets: scanner_web::PacketFeed,
     /// Commands from the web server.
     pub control: Receiver<scanner_web::Control>,
 }
@@ -48,6 +50,7 @@ impl Web {
             audio: scanner_web::audio::AudioHub::new(),
             live_tx: None,
             egress: None,
+            packets: scanner_web::packet_feed(),
             control,
         };
         let Some(addr) = o.http else {
@@ -80,6 +83,7 @@ impl Web {
         );
         state.audio = Some(web.audio.clone());
         state.storage = storage;
+        state.packets = web.packets.clone();
         let eg = Arc::new(scanner_web::egress::Egress::new(
             o.anon_egress_bytes,
             Some(channels.settings.clone()),

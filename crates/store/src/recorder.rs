@@ -189,17 +189,8 @@ impl Recorder {
                 }
             }
             Output::Packet(p) => {
-                self.index.insert_packet(&crate::index::PacketRow {
-                    id: 0,
-                    time_ns: unix_ns(p.time),
-                    freq_hz: p.slot.freq,
-                    channel: p.slot.name.clone(),
-                    source: p.frame.source.clone(),
-                    dest: p.frame.dest.clone(),
-                    path: p.frame.path.join(","),
-                    text: p.frame.tnc2(),
-                    raw: p.frame.raw,
-                })?;
+                self.index
+                    .insert_packet(&crate::index::PacketRow::from_decoded(&p))?;
                 self.stats.packets += 1;
             }
             Output::Discard { id } => {
