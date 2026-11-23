@@ -167,6 +167,9 @@ pub struct Detector {
     /// Per grid slot: sum and count of the signal centre over the attack,
     /// so a retune is not thrown off by one block of lopsided FM speech.
     attack_centre: Vec<(f64, u32)>,
+    /// Per slot: the last block it came back from its hang time (an open
+    /// slot rising again), for the pulsed comb guard.
+    back_at: Vec<Option<u64>>,
     attack_blocks: u64,
     hang_blocks: u64,
     preroll_blocks: u64,
@@ -285,6 +288,7 @@ impl Detector {
             opens: vec![false; count],
             close_db: vec![0.0; count],
             attack_centre: vec![(0.0, 0); count],
+            back_at: vec![None; count],
             skipped,
         }
     }
@@ -429,7 +433,12 @@ impl Detector {
                 }
             }
         }
-        for i in self.comb.learn(b) {
+        let open_on = |i: usize| {
+            let snr = self.stats[i].snr_db;
+            let back = self.back_at[i]?;
+            (self.states[i].is_open() && snr >= self.params.open_db).then_some((snr, back))
+        };
+        for i in self.comb.learn(b, open_on) {
             if self.states[i].is_waiting() {
                 self.states[i] = SlotState::Idle;
                 self.attack_centre[i] = (0.0, 0);
@@ -496,6 +505,7 @@ impl Detector {
                         });
                         active += 1;
                         st.open();
+                        self.back_at[i] = None;
                         SlotState::Active { start }
                     } else {
                         SlotState::Attack { since }
@@ -504,7 +514,10 @@ impl Detector {
                 SlotState::Attack { .. } => SlotState::Idle,
                 SlotState::Active { start } if stay => SlotState::Active { start },
                 SlotState::Active { start } => SlotState::Hang { start, since: b },
-                SlotState::Hang { start, .. } if stay && !interfered => SlotState::Active { start },
+                SlotState::Hang { start, .. } if stay && !interfered => {
+                    self.back_at[i] = Some(b);
+                    SlotState::Active { start }
+                }
                 SlotState::Hang { start, since } => {
                     if b - since >= self.hang_blocks {
                         events.push(st.close(i, start, since.saturating_sub(1)));
@@ -1039,6 +1052,61 @@ mod tests {
         assert!((opens[0].1 - 5.0).abs() < 0.2, "{opens:?}");
         assert!(det.comb_events() >= 2, "{}", det.comb_events());
         assert_eq!(det.comb(), Some((125e3, 6)));
+    }
+
+    #[test]
+    fn comb_line_open_before_the_comb_is_learned_closes_once_it_is() {
+        // Startup: one line of a pulsed comb (0.1 s every 0.6 s, under the
+        // 1.5 s hang) opens a slot before the guard knows the comb. Its own
+        // pulses then hold it open. Once the whole comb pulses and the
+        // guard learns it, that slot must close too, not record until the
+        // comb stops (minutes of blips and silence, live on the RSP1A).
+        let mut sigs: Vec<(f64, f64, f64, f64)> = Vec::new();
+        let mut t = 0.3;
+        while t < 10.0 {
+            let ks: &[f64] = if t < 2.0 {
+                &[1.0]
+            } else {
+                &[-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
+            };
+            for &k in ks {
+                sigs.push((k * 260e3, 12.0, t, t + 0.1));
+            }
+            t += 0.6;
+        }
+        let x = scene(10.0, &sigs, 41);
+        let plan: Vec<Slot> = (-40..=40).map(|k| slot(k as f64 * 20e3, 16e3)).collect();
+        let (det, events, _) = run(&x, &plan, DetectorParams::default());
+        let block = params().block_secs();
+        let dbg: Vec<(f64, f64)> = events
+            .iter()
+            .map(|e| match *e {
+                Event::Open { slot, block: b, .. } => {
+                    (det.slots()[slot].offset_hz, b as f64 * block)
+                }
+                Event::Close {
+                    slot, end_block, ..
+                } => (-det.slots()[slot].offset_hz, end_block as f64 * block),
+            })
+            .collect();
+        assert!(det.comb_events() >= 1, "comb never learned {dbg:?}");
+        let mut opened = 0;
+        for e in &events {
+            match *e {
+                Event::Open { block: b, .. } => {
+                    // Only the line that came up alone, before the comb.
+                    assert!(b as f64 * block < 2.0, "opened at {}", b as f64 * block);
+                    opened += 1;
+                }
+                Event::Close { end_block, .. } => {
+                    let end = end_block as f64 * block;
+                    // Learned at the first full pulse (2.1 s); held at most
+                    // until that pulse, not to the end of the capture.
+                    assert!(end < 3.0, "held open to {end:.2} s");
+                }
+            }
+        }
+        assert_eq!(opened, 1, "{events:?}");
     }
 
     #[test]
