@@ -31,6 +31,8 @@ pub struct RecorderStats {
     pub opus_bytes: u64,
     /// Opus copies abandoned after an error (the WAV is still kept).
     pub opus_errors: u64,
+    /// AX.25 packets stored.
+    pub packets: u64,
     /// Recordings thrown away part-way (a carrier found to be a spur).
     pub discarded: u64,
     /// Index row ids completed by this recorder, in close order.
@@ -192,6 +194,20 @@ impl Recorder {
                         self.opus_failed(&orel, e);
                     }
                 }
+            }
+            Output::Packet(p) => {
+                self.index.insert_packet(&crate::index::PacketRow {
+                    id: 0,
+                    time_ns: unix_ns(p.time),
+                    freq_hz: p.slot.freq,
+                    channel: p.slot.name.clone(),
+                    source: p.frame.source.clone(),
+                    dest: p.frame.dest.clone(),
+                    path: p.frame.path.join(","),
+                    text: p.frame.tnc2(),
+                    raw: p.frame.raw,
+                })?;
+                self.stats.packets += 1;
             }
             Output::Discard { id } => {
                 if let Some(o) = self.open.remove(&id) {

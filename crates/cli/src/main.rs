@@ -137,6 +137,11 @@ struct ServeArgs {
     /// (UTC). Admin traffic is counted but never held back. 0: no budget.
     #[arg(long, default_value_t = 3.0)]
     anon_egress_gb: f64,
+    /// Serve decoded AX.25 packets as KISS over TCP on this address (e.g.
+    /// 127.0.0.1:8001), so APRS software can use the scanner as a
+    /// receive-only TNC. Off by default.
+    #[arg(long)]
+    kiss: Option<std::net::SocketAddr>,
     /// Accounts database (default: auth.sqlite in --out).
     #[arg(long)]
     auth_db: Option<PathBuf>,
@@ -407,6 +412,7 @@ fn main() -> Result<()> {
                 retention: a.tuning.retention(),
                 anon_egress_bytes: (a.anon_egress_gb.max(0.0) * 1e9) as u64,
                 status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
+                kiss: a.kiss,
             })
         }
         Cmd::Config {
@@ -842,6 +848,7 @@ fn run(a: RunArgs) -> Result<()> {
                 "discarded_short": stats.discarded_short,
                 "discarded_silent": stats.discarded_silent,
                 "spurs": stats.spurs,
+                "packets": stats.packets,
                 "not_recorded": stats.not_recorded,
                 "duplicates": stats.duplicates,
                 "max_concurrent": stats.max_concurrent,

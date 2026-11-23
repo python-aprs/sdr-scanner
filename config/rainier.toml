@@ -23,14 +23,12 @@ priority = true
 [[profiles.rainier-2m.channels]]
 freq   = "144.3900 MHz"
 name   = "APRS"
-mode   = "afsk1200"
-record = false              # until the packet decoder lands (Phase 5)
+mode   = "afsk1200"           # decodes AX.25 packets; no audio files
 
 [[profiles.rainier-2m.channels]]
 freq   = "144.9200 MHz"
 name   = "Packet"
 mode   = "afsk1200"
-record = false
 
 [[profiles.rainier-2m.lockouts]]
 start  = "144.000 MHz"

@@ -5,6 +5,7 @@
 //! [`Output`] records (transmission open, audio, close) for a writer to turn
 //! into files. Channel chains run in parallel on the rayon pool.
 
+use crate::afsk::{AfskDecoder, Frame};
 use crate::channelizer::{Analyzer, BankParams, Block, Extractor, FilterBank};
 use crate::clock::SampleClock;
 use crate::config::{Mode, Slot, SlotOrigin};
@@ -119,6 +120,16 @@ pub enum Output {
     Discard {
         id: u64,
     },
+    /// An AX.25 frame decoded on an `afsk1200` slot.
+    Packet(Packet),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Packet {
+    pub slot: Slot,
+    /// When the frame ended.
+    pub time: SystemTime,
+    pub frame: Frame,
 }
 
 /// Audio for live listeners, sent as soon as it is demodulated (recordings
@@ -157,6 +168,8 @@ pub struct ScannerStats {
     pub duplicates: u64,
     /// Steady carriers found and locked out (see `ScannerConfig::spur_secs`).
     pub spurs: u64,
+    /// AX.25 frames decoded on `afsk1200` slots.
+    pub packets: u64,
     pub max_concurrent: usize,
 }
 
@@ -167,6 +180,9 @@ struct Chain {
     tuned: Slot,
     extractor: Extractor,
     disc: FmDiscriminator,
+    /// Packet decoder on an `afsk1200` slot: then the chain makes frames,
+    /// never audio.
+    afsk: Option<AfskDecoder>,
     nsq: Option<NoiseSquelch>,
     deemph: Option<Deemphasis>,
     resampler: Resampler,
@@ -241,6 +257,12 @@ impl Chain {
         self.extractor.process(block, &mut self.iq);
         let mut d = self.spare_demod();
         self.disc.process(&self.iq, &mut d);
+        if let Some(a) = &mut self.afsk {
+            // The FCS decides what is a packet; no squelch needed.
+            a.push(&d);
+            self.demod = d;
+            return;
+        }
         // The noise squelch measures every block, so its hysteresis follows
         // the signal even while the power squelch has it muted.
         let quiet = self.nsq.as_mut().is_none_or(|n| n.update(&d));
@@ -492,7 +514,7 @@ impl Scanner {
                 // Join transmissions already open at their newest audio.
                 let rate = self.cfg.audio_rate;
                 let mut live = Vec::new();
-                for c in &mut self.chains {
+                for c in self.chains.iter_mut().filter(|c| c.afsk.is_none()) {
                     live.push(LiveAudio::Start {
                         id: c.id,
                         freq: c.tuned.freq,
@@ -524,7 +546,7 @@ impl Scanner {
     fn feed_live(&mut self) {
         let Some(live) = &mut self.live else { return };
         let rate = self.cfg.audio_rate;
-        for c in &mut self.chains {
+        for c in self.chains.iter_mut().filter(|c| c.afsk.is_none()) {
             let sent = *c.live_sent.get_or_insert_with(|| {
                 live.push(LiveAudio::Start {
                     id: c.id,
@@ -683,6 +705,10 @@ impl Scanner {
         let min_blocks = (self.cfg.min_len / block_secs).ceil() as u64;
         let preroll = self.detector.signal_offset_blocks();
         for c in &mut self.chains {
+            if c.afsk.is_some() {
+                Self::emit_packets(&self.clock, &mut self.stats, self.bank.params(), c, out);
+                continue;
+            }
             if !c.confirmed {
                 // Only time with the signal present counts, not hang time.
                 if let SlotState::Active { start } = self.detector.state(c.slot) {
@@ -734,6 +760,25 @@ impl Scanner {
         }
     }
 
+    fn emit_packets(
+        clock: &SampleClock,
+        stats: &mut ScannerStats,
+        p: &BankParams,
+        c: &mut Chain,
+        out: &mut Vec<Output>,
+    ) {
+        let Some(a) = &mut c.afsk else { return };
+        for d in a.take() {
+            let at = c.audio_t0 + (d.at_sample as f64 * p.sample_rate / c.rate) as i64;
+            stats.packets += 1;
+            out.push(Output::Packet(Packet {
+                slot: c.tuned.clone(),
+                time: clock.time_at(at.max(0) as u64),
+                frame: d.frame,
+            }));
+        }
+    }
+
     /// Audio held back so that a close can trim the hang time.
     fn holdback(&self) -> usize {
         let hang = self.detector.hang_blocks() as f64 * self.bank.params().block_secs();
@@ -760,7 +805,8 @@ impl Scanner {
             } => {
                 self.stats.opened += 1;
                 let ws = &self.detector.slots()[slot];
-                if !ws.slot.record || ws.slot.mode != Mode::Nbfm {
+                let afsk = ws.slot.mode == Mode::Afsk1200;
+                if !ws.slot.record || !(ws.slot.mode == Mode::Nbfm || afsk) {
                     self.stats.not_recorded += 1;
                     return;
                 }
@@ -813,7 +859,8 @@ impl Scanner {
                     slot,
                     tuned,
                     disc: FmDiscriminator::new(rate, ws.slot.deviation),
-                    nsq: (self.cfg.noise_squelch_db > 0.0).then(|| {
+                    afsk: afsk.then(|| AfskDecoder::new(rate)),
+                    nsq: (!afsk && self.cfg.noise_squelch_db > 0.0).then(|| {
                         NoiseSquelch::new(
                             rate,
                             ws.slot.deviation,
@@ -874,6 +921,11 @@ impl Scanner {
                     return;
                 };
                 let mut c = self.chains.swap_remove(pos);
+                if c.afsk.is_some() {
+                    let p = *self.bank.params();
+                    Self::emit_packets(&self.clock, &mut self.stats, &p, &mut c, out);
+                    return;
+                }
                 if let (Some(live), Some(_)) = (&mut self.live, c.live_sent) {
                     live.push(LiveAudio::End { id: c.id });
                 }
@@ -1488,6 +1540,53 @@ mod tests {
         assert_eq!(stats.spurs, 0, "{stats:?}");
         assert!(spurs.is_empty());
         assert_eq!(closes(&out).len(), 1);
+    }
+
+    #[test]
+    fn afsk_slots_decode_packets_instead_of_recording() {
+        use crate::afsk::tests::{afsk_audio, ui_frame};
+        let fs = params().sample_rate;
+        let frame = ui_frame("KF7HVM", "APRS", &[("WIDE2", 1, false)], b">scanner test");
+        // Audio at 31.25 kHz, held per sample at 2 MS/s.
+        let audio = afsk_audio(&frame, 31250.0, 0.6, 0.6);
+        let mut x = scene(1.5, &[]);
+        let on = (0.3 * fs) as usize;
+        let mut ph = 0.0f64;
+        let len = (audio.len() as f64 / 31250.0 * fs) as usize;
+        for i in 0..len + (0.1 * fs) as usize {
+            let a = audio
+                .get((i as f64 * 31250.0 / fs) as usize)
+                .copied()
+                .unwrap_or(0.0);
+            let f = 100e3 + 5000.0 * a as f64;
+            ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
+            x[on + i] += Complex32::from_polar(0.1, ph as f32);
+        }
+        let mut s = slot(100e3);
+        s.mode = Mode::Afsk1200;
+        s.origin = SlotOrigin::Listed;
+        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
+        let packets: Vec<&Packet> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Packet(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(packets.len(), 1, "{stats:?}");
+        assert_eq!(
+            packets[0].frame.tnc2(),
+            "KF7HVM-9>APRS,WIDE2-1:>scanner test"
+        );
+        let t = packets[0]
+            .time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let end = 0.3 + audio.len() as f64 / 31250.0;
+        assert!((t - end).abs() < 0.05, "{t} vs {end}");
+        assert_eq!(s_opens(&out), 0, "no audio files");
+        assert_eq!(stats.packets, 1);
     }
 
     #[test]
