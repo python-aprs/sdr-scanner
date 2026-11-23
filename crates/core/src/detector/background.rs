@@ -146,7 +146,16 @@ impl PulsedComb {
     /// Expire old lines and rises, then look for a comb among the slots
     /// that rose within the window. Returns the slots marked as comb lines
     /// this block, whose attacks the caller cancels.
-    pub fn learn(&mut self, b: u64) -> Vec<usize> {
+    ///
+    /// `open_on(i)` is, for an open (recording) slot over the plain open
+    /// threshold, its SNR (dB) this block and the last block it came back
+    /// from its hang time; `None` for any other slot. An open slot is never
+    /// seen rising, so a comb line that opened before the comb was learned
+    /// (at startup, say) would be held open by its own pulses for as long
+    /// as the comb lasts. An open slot on the learned grid that came back
+    /// within the window, so rose with the comb, is marked too: that
+    /// raises its close threshold, and it closes.
+    pub fn learn(&mut self, b: u64, open_on: impl Fn(usize) -> Option<(f32, u64)>) -> Vec<usize> {
         for i in 0..self.level.len() {
             if self.level[i] > 0.0 && b.saturating_sub(self.seen[i]) > self.hold {
                 self.level[i] = 0.0;
@@ -173,7 +182,7 @@ impl PulsedComb {
             return Vec::new();
         }
         let offs: Vec<f64> = rose.iter().map(|r| self.offsets[r.0]).collect();
-        let Some(members) = comb_members(&offs, teeth) else {
+        let Some((members, f0, spacing)) = comb_grid(&offs, teeth) else {
             return Vec::new();
         };
         self.events += 1;
@@ -184,6 +193,17 @@ impl PulsedComb {
             self.seen[i] = b;
             marked.push(i);
         }
+        for i in 0..self.offsets.len() {
+            let Some((snr, back)) = open_on(i) else {
+                continue;
+            };
+            if back + self.window < b || snr > self.max_db || !on_grid(self.offsets[i], f0, spacing)
+            {
+                continue;
+            }
+            self.level[i] = self.level[i].max(snr);
+            self.seen[i] = b;
+        }
         self.rises.retain(|r| self.seen[r.0] != b);
         marked
     }
@@ -193,7 +213,21 @@ impl PulsedComb {
 /// `teeth` lines, if any: the grid (spacing 50 kHz or more, from any pair
 /// and its first few divisions) that holds the most of them, each within
 /// 10 kHz of a line. Offsets within 30 kHz of each other count as one line.
+#[cfg(test)]
 pub(super) fn comb_members(offs: &[f64], teeth: usize) -> Option<Vec<usize>> {
+    comb_grid(offs, teeth).map(|g| g.0)
+}
+
+/// Whether `f` (Hz) lies within 10 kHz of a line of the grid through `f0`
+/// spaced `spacing` apart.
+fn on_grid(f: f64, f0: f64, spacing: f64) -> bool {
+    let k = (f - f0) / spacing;
+    (k - k.round()).abs() * spacing <= 10e3
+}
+
+/// The comb members (see `comb_members`), with the grid they lie on: (members, a line's
+/// offset, spacing), all Hz.
+fn comb_grid(offs: &[f64], teeth: usize) -> Option<(Vec<usize>, f64, f64)> {
     let mut order: Vec<usize> = (0..offs.len()).collect();
     order.sort_by(|&a, &b| offs[a].total_cmp(&offs[b]));
     // Lines: (centre, members).
@@ -213,13 +247,11 @@ pub(super) fn comb_members(offs: &[f64], teeth: usize) -> Option<Vec<usize>> {
     }
     let on = |f0: f64, s: f64| -> Vec<usize> {
         (0..lines.len())
-            .filter(|&j| {
-                let k = (lines[j].0 - f0) / s;
-                (k - k.round()).abs() * s <= 10e3
-            })
+            .filter(|&j| on_grid(lines[j].0, f0, s))
             .collect()
     };
     let mut best: Vec<usize> = Vec::new();
+    let mut grid = (0.0, 0.0);
     for a in 0..lines.len() {
         for b in a + 1..lines.len() {
             let d = lines[b].0 - lines[a].0;
@@ -235,11 +267,15 @@ pub(super) fn comb_members(offs: &[f64], teeth: usize) -> Option<Vec<usize>> {
                 let span = (lines[*got.last().unwrap()].0 - lines[got[0]].0) / s;
                 if got.len() > best.len() && got.len() as f64 >= (span.round() + 1.0) / 2.0 {
                     best = got;
+                    grid = (lines[a].0, s);
                 }
             }
         }
     }
-    (best.len() >= teeth).then(|| best.iter().flat_map(|&j| lines[j].1.clone()).collect())
+    (best.len() >= teeth).then(|| {
+        let members = best.iter().flat_map(|&j| lines[j].1.clone()).collect();
+        (members, grid.0, grid.1)
+    })
 }
 
 /// The comb pattern among these raised slots' offsets (Hz), if there is
