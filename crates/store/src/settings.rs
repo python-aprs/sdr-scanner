@@ -1,7 +1,7 @@
 //! Settings changed while the scanner runs (from the web UI or API), kept in
 //! `settings.sqlite` next to the recordings so they survive a restart. For
 //! now: per-frequency lockout and priority overrides on top of the config
-//! file.
+//! file, and the bytes the web interface sent each month.
 
 use crate::migrate::{self, MigrateError, Migration, Schema, Up};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,19 +20,40 @@ pub enum SettingsError {
 pub static SCHEMA: Schema = Schema {
     name: "settings database",
     application_id: 0x5343_4E53, // "SCNS"
-    migrations: &[Migration {
-        description: "channel_overrides table",
-        up: Up::Sql(
-            "CREATE TABLE channel_overrides (
+    migrations: &[
+        Migration {
+            description: "channel_overrides table",
+            up: Up::Sql(
+                "CREATE TABLE channel_overrides (
                 freq_hz    INTEGER PRIMARY KEY,
                 locked_out INTEGER,
                 priority   INTEGER,
                 updated_ns INTEGER NOT NULL,
                 updated_by TEXT    NOT NULL
             );",
-        ),
-    }],
+            ),
+        },
+        Migration {
+            description: "egress table",
+            up: Up::Sql(
+                "CREATE TABLE egress (
+                month TEXT    NOT NULL,
+                role  TEXT    NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (month, role)
+            );",
+            ),
+        },
+    ],
 };
+
+/// Bytes sent to one role in one month (`YYYY-MM`, UTC).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EgressMonth {
+    pub month: String,
+    pub role: String,
+    pub bytes: u64,
+}
 
 /// A lockout or priority setting for one frequency. `None` leaves the config
 /// file's value in force.
@@ -114,6 +135,36 @@ impl Settings {
         Ok(self.get(freq_hz)?.expect("just written"))
     }
 
+    /// Add to a month's egress count.
+    pub fn add_egress(&self, month: &str, role: &str, bytes: u64) -> Result<(), SettingsError> {
+        self.db().execute(
+            "INSERT INTO egress (month, role, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT (month, role) DO UPDATE SET bytes = bytes + ?3",
+            params![month, role, bytes as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Egress of the latest `months` months, newest first.
+    pub fn egress(&self, months: usize) -> Result<Vec<EgressMonth>, SettingsError> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT month, role, bytes FROM egress
+             WHERE month IN (SELECT DISTINCT month FROM egress ORDER BY month DESC LIMIT ?1)
+             ORDER BY month DESC, role",
+        )?;
+        let rows = st
+            .query_map([months as i64], |r| {
+                Ok(EgressMonth {
+                    month: r.get(0)?,
+                    role: r.get(1)?,
+                    bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Back to the config file for this frequency. False if there was no
     /// override.
     pub fn clear(&self, freq_hz: i64) -> Result<bool, SettingsError> {
@@ -157,6 +208,23 @@ mod tests {
         assert!(s.clear(146_520_000).unwrap());
         assert!(!s.clear(146_520_000).unwrap());
         assert_eq!(s.overrides().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn egress_accumulates_per_month_and_role() {
+        let s = Settings::in_memory().unwrap();
+        s.add_egress("2026-10", "anonymous", 5).unwrap();
+        s.add_egress("2026-11", "anonymous", 100).unwrap();
+        s.add_egress("2026-11", "anonymous", 20).unwrap();
+        s.add_egress("2026-11", "admin", 7).unwrap();
+        let e = s.egress(1).unwrap();
+        assert_eq!(
+            e.iter()
+                .map(|e| (e.month.as_str(), e.role.as_str(), e.bytes))
+                .collect::<Vec<_>>(),
+            vec![("2026-11", "admin", 7), ("2026-11", "anonymous", 120)]
+        );
+        assert_eq!(s.egress(12).unwrap().len(), 3);
     }
 
     #[test]

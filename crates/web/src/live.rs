@@ -14,6 +14,7 @@
 //! spectrum rate is 1 to 5 frames a second (default 2); a paused client (a
 //! hidden tab) gets status only, so it costs almost nothing.
 
+use crate::egress::Level;
 use crate::{ApiError, AppState, Caller};
 use axum::extract::State;
 use axum::extract::ws::{
@@ -151,11 +152,12 @@ pub(crate) async fn live_ws(
 }
 
 async fn run(
-    mut sock: WebSocket,
+    sock: WebSocket,
     s: AppState,
     headers: HeaderMap,
     caller: Caller,
 ) -> Result<(), axum::Error> {
+    let mut sock = crate::egress::Sock::new(sock, s.meter(caller.role));
     let hello = serde_json::json!({
         "type": "hello",
         "role": caller.role,
@@ -216,9 +218,14 @@ async fn run(
                     let snap = s.status.read().map(|g| g.clone()).unwrap_or_default();
                     let mut v = serde_json::to_value(&snap).unwrap_or_default();
                     v["type"] = "status".into();
+                    v["budget"] = serde_json::to_value(sock.meter.level()).unwrap_or_default();
                     sock.send(Message::Text(v.to_string().into())).await?;
                 }
-                if !paused && now >= next_spectrum {
+                // Near the data budget, anonymous viewers get one frame a
+                // second; once it is spent, none.
+                let level = sock.meter.level();
+                if !paused && level != Level::Spent && now >= next_spectrum {
+                    let rate = if level == Level::Low { 1 } else { rate };
                     next_spectrum = now + Duration::from_millis(1000 / rate as u64);
                     let frame = s
                         .spectrum

@@ -76,6 +76,33 @@ pub fn compact_utc(t: SystemTime) -> String {
     )
 }
 
+/// The UTC calendar month holding `t` as (year, month), and the Unix
+/// seconds at which that month starts and the next one starts.
+pub fn utc_month(t: SystemTime) -> ((i64, u32), i64, i64) {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, _) = civil_from_days(secs.div_euclid(86_400));
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    (
+        (y, m),
+        days_from_civil(y, m, 1) * 86_400,
+        days_from_civil(ny, nm, 1) * 86_400,
+    )
+}
+
+/// (year, month, day) to days since 1970-01-01. Howard Hinnant's algorithm.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Days since 1970-01-01 to (year, month, day). Howard Hinnant's algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -128,6 +155,22 @@ mod tests {
         c.reanchor(1000, at(102)); // radio clock says 101, host says 102
         assert_eq!(c.unix_nanos_at(1000), 102_000_000_000);
         assert_eq!(c.unix_nanos_at(0), 101_000_000_000);
+    }
+
+    #[test]
+    fn finds_the_utc_month() {
+        // 2026-11-22T06:54:03Z
+        let ((y, m), start, next) = utc_month(at(1_795_330_443));
+        assert_eq!((y, m), (2026, 11));
+        assert_eq!(compact_utc(at(start as u64)), "20261101T000000.000Z");
+        assert_eq!(compact_utc(at(next as u64)), "20261201T000000.000Z");
+        let ((y, m), _, next) = utc_month(at(1_796_083_200 + 5)); // 2026-12-01
+        assert_eq!((y, m), (2026, 12));
+        assert_eq!(compact_utc(at(next as u64)), "20270101T000000.000Z");
+        for z in [-800_000, -1, 0, 59, 60, 11_016, 20_514, 2_000_000] {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+        }
     }
 
     #[test]

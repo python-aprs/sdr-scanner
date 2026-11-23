@@ -10,6 +10,7 @@
 //! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin: the Opus copy, or the WAV with `?format=wav` or when there's no copy |
 //! | `GET /api/v1/channels` | same as status |
 //! | `GET /api/v1/storage` | admin: disk usage, budget, free space and what retention deleted |
+//! | `GET /api/v1/egress` | admin: bytes sent per role this month and earlier ones (see [`egress`]) |
 //! | `PATCH /api/v1/channels/{freq_hz}` | admin (+ CSRF): `{"locked_out": bool, "priority": bool}`, either or both |
 //! | `DELETE /api/v1/channels/{freq_hz}/override` | admin (+ CSRF): back to the config file |
 //! | `GET /api/v1/live` (WebSocket) | same as status; see [`live`] |
@@ -39,6 +40,7 @@
 
 pub mod audio;
 pub mod auth;
+pub mod egress;
 pub mod live;
 pub mod ui;
 
@@ -145,6 +147,9 @@ pub struct AppState {
     pub audio: Option<Arc<audio::AudioHub>>,
     /// Disk budget and usage; `None` when retention is off.
     pub storage: Option<Arc<scanner_store::retention::DiskUsage>>,
+    /// Bytes sent per role and month, and the anonymous budget; `None`
+    /// counts nothing.
+    pub egress: Option<Arc<egress::Egress>>,
 }
 
 /// A command for the running scanner.
@@ -179,6 +184,7 @@ impl AppState {
             control: None,
             audio: None,
             storage: None,
+            egress: None,
         }
     }
 }
@@ -322,6 +328,20 @@ impl AppState {
         Ok(anonymous(Via::Nothing))
     }
 
+    fn egress_level(&self, role: Role) -> egress::Level {
+        self.egress
+            .as_ref()
+            .map_or(egress::Level::Ok, |e| e.level(role))
+    }
+
+    /// A counter for one connection by `role`.
+    fn meter(&self, role: Role) -> egress::Meter {
+        match &self.egress {
+            Some(e) => e.meter(role),
+            None => egress::Meter::none(role),
+        }
+    }
+
     fn auth(&self) -> Result<Arc<AuthStore>, ApiError> {
         self.auth.clone().ok_or(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -372,6 +392,7 @@ pub fn router(state: AppState) -> Router {
     r.route("/api/v1/status", get(status))
         .route("/api/v1/channels", get(channels))
         .route("/api/v1/storage", get(storage))
+        .route("/api/v1/egress", get(egress_report))
         .route(
             "/api/v1/channels/{freq_hz}",
             axum::routing::patch(edit_channel),
@@ -390,7 +411,68 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/tokens/{id}", delete(revoke_token))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn(ui::security_headers))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            count_egress,
+        ))
         .with_state(state)
+}
+
+/// Count each HTTP response against its caller's role. WebSockets count
+/// their own messages (see [`egress::Sock`]).
+async fn count_egress(
+    State(s): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(eg) = s.egress.clone() else {
+        return next.run(req).await;
+    };
+    // Only a real login counts as admin, so a made-up cookie can't move
+    // anonymous traffic off the anonymous budget.
+    let creds = bearer(req.headers()).is_some() || session_cookie(req.headers()).is_some();
+    let role = if creds {
+        s.caller(req.headers())
+            .await
+            .map_or(Role::Anonymous, |c| c.role)
+    } else {
+        Role::Anonymous
+    };
+    let resp = next.run(req).await;
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        use axum::body::HttpBody;
+        let body = resp.body().size_hint().exact().unwrap_or(0);
+        // Status line, header lines and the blank line.
+        let head: usize = 17
+            + resp
+                .headers()
+                .iter()
+                .map(|(k, v)| k.as_str().len() + v.len() + 4)
+                .sum::<usize>();
+        eg.add(role, body + head as u64);
+    }
+    resp
+}
+
+/// Data sent this month and in earlier ones (admin).
+async fn egress_report(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.caller(&headers).await?.require(false)?;
+    let current = s.egress.as_ref().map(|e| e.status());
+    let settings = s.settings.clone();
+    let history = blocking(move || {
+        Ok(match settings {
+            Some(st) => st.egress(12).map_err(settings_err)?,
+            None => Vec::new(),
+        })
+    })
+    .await?;
+    Ok(Json(serde_json::json!({
+        "current": current,
+        "history": history,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -642,7 +724,11 @@ async fn get_audio(
     UrlPath(id): UrlPath<i64>,
     UrlQuery(p): UrlQuery<AudioParams>,
 ) -> Result<Response, ApiError> {
-    s.caller(&headers).await?.require(s.public.audio)?;
+    let caller = s.caller(&headers).await?;
+    caller.require(s.public.audio)?;
+    if s.egress_level(caller.role) == egress::Level::Spent {
+        return Err(budget_spent());
+    }
     let want_opus = match p.format.as_deref() {
         None => None,
         Some("wav") => Some(false),
@@ -708,6 +794,13 @@ async fn get_audio(
     }
 }
 
+fn budget_spent() -> ApiError {
+    ApiError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "this scanner's data budget for visitors is used up for the month".into(),
+    )
+}
+
 /// `bytes=a-b`, `bytes=a-` or `bytes=-n`, one range only.
 fn parse_range(v: &str, total: usize) -> Option<(usize, usize)> {
     let spec = v.strip_prefix("bytes=")?;
@@ -746,6 +839,10 @@ struct SessionInfo {
     accounts_configured: bool,
     /// What anonymous visitors may see.
     public: Public,
+    /// Where this caller stands against the monthly data budget.
+    budget: egress::Level,
+    /// When the budget starts again, if there is one.
+    budget_resets_ns: Option<i64>,
 }
 
 fn limiter_keys(client: &str, username: &str) -> Vec<String> {
@@ -828,6 +925,8 @@ async fn login(
         via: Some("session"),
         accounts_configured: true,
         public: s.public,
+        budget: egress::Level::Ok,
+        budget_resets_ns: None,
     })
     .into_response();
     resp.headers_mut().insert(
@@ -863,6 +962,13 @@ async fn session_info(
 ) -> Result<Json<SessionInfo>, ApiError> {
     let c = s.caller(&headers).await?;
     let configured = s.auth.is_some();
+    let budget = s.egress_level(c.role);
+    let budget_resets_ns = s
+        .egress
+        .as_ref()
+        .map(|e| e.status())
+        .filter(|st| st.budget_bytes > 0)
+        .map(|st| st.resets_ns);
     Ok(Json(match c.via {
         Via::Session { session, .. } => SessionInfo {
             role: c.role,
@@ -872,6 +978,8 @@ async fn session_info(
             via: Some("session"),
             accounts_configured: configured,
             public: s.public,
+            budget,
+            budget_resets_ns,
         },
         Via::Token(t) => SessionInfo {
             role: c.role,
@@ -881,6 +989,8 @@ async fn session_info(
             via: Some("token"),
             accounts_configured: configured,
             public: s.public,
+            budget,
+            budget_resets_ns,
         },
         _ => SessionInfo {
             role: c.role,
@@ -890,6 +1000,8 @@ async fn session_info(
             via: None,
             accounts_configured: configured,
             public: s.public,
+            budget,
+            budget_resets_ns,
         },
     }))
 }
@@ -1070,6 +1182,16 @@ pub fn spawn(
         .name("web-main".into())
         .spawn(move || {
             rt.block_on(async move {
+                if let Some(e) = state.egress.clone() {
+                    tokio::spawn(async move {
+                        let mut t = tokio::time::interval(std::time::Duration::from_secs(10));
+                        loop {
+                            t.tick().await;
+                            let e = e.clone();
+                            let _ = tokio::task::spawn_blocking(move || e.flush()).await;
+                        }
+                    });
+                }
                 let app =
                     router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
                 if let Err(e) = axum::serve(listener, app).await {
@@ -1247,6 +1369,7 @@ mod tests {
             ("/api/v1/audio", 3),
             ("/api/v1/auth/tokens", 4),
             ("/api/v1/storage", 4),
+            ("/api/v1/egress", 4),
         ];
         #[derive(Clone, Copy, Debug)]
         enum Who {
@@ -1714,6 +1837,47 @@ mod tests {
         )
         .await;
         assert_eq!(r.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    #[tokio::test]
+    async fn egress_is_counted_by_role_and_the_budget_stops_visitors() {
+        let open = Public {
+            live: true,
+            recordings: true,
+            audio: true,
+        };
+        let (_dir, mut state, id, token) = setup(open);
+        let eg = Arc::new(egress::Egress::new(2000, None));
+        state.egress = Some(eg.clone());
+        let audio = format!("/api/v1/recordings/{id}/audio");
+        let (st, body) = get(&state, &audio, None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        let anon = eg.status().anonymous_bytes;
+        assert!(
+            anon > body.len() as u64 && anon < body.len() as u64 + 1000,
+            "{anon}"
+        );
+        // A made-up token is still anonymous.
+        get(&state, &audio, Some("scn_made_up"), None).await;
+        assert!(eg.status().anonymous_bytes > anon);
+        assert_eq!(eg.status().admin_bytes, 0);
+        get(&state, &audio, Some(&token), None).await;
+        assert!(eg.status().admin_bytes > 0);
+
+        // Spend the budget: visitors lose audio, the admin keeps it.
+        eg.add(Role::Anonymous, 2000);
+        let (st, _) = get(&state, &audio, None, None).await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        let (st, _) = get(&state, &audio, Some(&token), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let (_, body) = get(&state, "/api/v1/auth/session", None, None).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["budget"], "spent");
+        assert!(v["budget_resets_ns"].as_i64().unwrap() > now_ns());
+        let (_, body) = get(&state, "/api/v1/egress", Some(&token), None).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["current"]["level"], "spent");
+        assert_eq!(v["current"]["budget_bytes"], 2000);
     }
 
     #[tokio::test]

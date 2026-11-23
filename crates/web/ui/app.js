@@ -98,10 +98,25 @@
   const isAdmin = () => state.session && state.session.role === 'admin';
   const pub = () => (state.session && state.session.public) || { live: true, recordings: false, audio: false };
   const canRecordings = () => isAdmin() || pub().recordings;
-  const canAudio = () => isAdmin() || pub().audio;
+  // Where visitors stand against the scanner's monthly data budget.
+  const budgetSpent = () => !isAdmin() && state.budget === 'spent';
+  const canAudio = () => isAdmin() || (pub().audio && !budgetSpent());
+  const budgetBanner = h('div', { class: 'budget-banner', role: 'status', hidden: true });
+  function setBudget(level) {
+    const was = state.budget;
+    state.budget = isAdmin() ? 'ok' : (level || 'ok');
+    const resets = state.session && state.session.budget_resets_ns;
+    const back = resets ? ` on ${dateTimeFmt.format(nsDate(resets))}` : ' next month';
+    budgetBanner.hidden = state.budget === 'ok';
+    budgetBanner.textContent = state.budget === 'spent'
+      ? `This scanner has used its data allowance for visitors this month. Live audio, recordings and the spectrum are back${back}.`
+      : 'This scanner is close to its monthly data allowance for visitors, so the spectrum updates once a second.';
+    if (was !== undefined && was !== state.budget && state.view) route();
+  }
 
   async function loadSession() {
     try { state.session = await api('/auth/session'); } catch (_) { state.session = null; }
+    setBudget(state.session && state.session.budget);
     renderWho();
   }
 
@@ -183,7 +198,7 @@
       ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
           let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
-          if (m.type === 'status') { state.status = m; onStatus(m); }
+          if (m.type === 'status') { state.status = m; onStatus(m); if (m.budget && m.budget !== state.budget) setBudget(m.budget); }
           this.emit(m.type, m);
         } else {
           this.emit('spectrum', decodeSpectrum(ev.data));
@@ -288,6 +303,7 @@
           let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
           if (m.type === 'start') this.start(m);
           else if (m.type === 'end') this.end(m.id);
+          else if (m.type === 'budget') { this.set('off'); setBudget(m.level); }
         } else {
           const dv = new DataView(ev.data);
           const st = this.streams.get(dv.getUint32(4, true));
@@ -343,6 +359,7 @@
   function listenControls() {
     const wrap = h('div', { class: 'controls listen' });
     function render() {
+      if (budgetSpent() && pub().audio) { wrap.replaceChildren(h('span', { class: 'muted', title: 'The data allowance for visitors is used up this month' }, 'Listening paused')); return; }
       if (!canAudio()) { wrap.replaceChildren(h('span', { class: 'muted', title: 'Live audio is private on this scanner' }, 'Listening: log in')); return; }
       if (!listen.supported) { wrap.replaceChildren(h('span', { class: 'muted' }, 'This browser can’t play live audio')); return; }
       const titles = { off: 'Not listening', follow: 'One transmission at a time, priority channels first', all: 'Everything on the air, mixed' };
@@ -456,7 +473,7 @@
     const spec = h('canvas', { id: 'spectrum', 'aria-label': 'Spectrum' });
     const fall = waterfallCanvas;
     const tip = h('div', { class: 'scope-tip', hidden: true });
-    const empty = h('div', { class: 'scope-empty' }, 'Waiting for the first spectrum…');
+    const empty = h('div', { class: 'scope-empty' }, budgetSpent() ? 'Spectrum paused until the data allowance resets' : 'Waiting for the first spectrum…');
     const scope = h('div', { class: 'scope' }, spec, fall, tip, empty);
 
     const activeList = h('ul', { class: 'active-list' });
@@ -983,6 +1000,35 @@
           : 'Retention is off: nothing is deleted.'));
     }).catch((ex) => storageBody.replaceChildren(h('p', { class: 'error' }, ex.message)));
 
+    // Data sent: what the uplink has carried this month, by role.
+    const dataBody = h('div', { class: 'panel-body' }, h('p', { class: 'muted' }, 'Loading…'));
+    const data = h('section', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', {}, 'Data sent')), dataBody);
+    api('/egress').then((eg) => {
+      const c = eg.current;
+      if (!c) { dataBody.replaceChildren(h('p', { class: 'muted' }, 'Not counted on this scanner.')); return; }
+      const levels = { ok: null, low: h('span', { class: 'badge' }, 'Slowed'), spent: h('span', { class: 'badge warn' }, 'Used up') };
+      const rows = [
+        h('dt', {}, 'Visitors'), h('dd', {},
+          c.budget_bytes ? `${fmtBytes(c.anonymous_bytes)} of ${fmtBytes(c.budget_bytes)} ` : `${fmtBytes(c.anonymous_bytes)}, no limit`,
+          levels[c.level],
+          c.budget_bytes ? h('meter', { class: 'disk', min: 0, max: c.budget_bytes, low: 0.8 * c.budget_bytes, high: 0.999 * c.budget_bytes, optimum: 0, value: Math.min(c.anonymous_bytes, c.budget_bytes) }) : null),
+        h('dt', {}, 'Admins'), h('dd', {}, fmtBytes(c.admin_bytes)),
+      ];
+      if (c.budget_bytes) rows.push(h('dt', {}, 'Allowance resets'), h('dd', {}, dateTimeFmt.format(nsDate(c.resets_ns))));
+      const months = new Map();
+      for (const e of eg.history) {
+        if (e.month === c.month) continue;
+        const m = months.get(e.month) || { anonymous: 0, admin: 0 };
+        m[e.role] = e.bytes; months.set(e.month, m);
+      }
+      const past = months.size ? h('table', { class: 'table compact' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Month'), h('th', { class: 'num' }, 'Visitors'), h('th', { class: 'num' }, 'Admins'))),
+        h('tbody', {}, [...months].map(([m, v]) => h('tr', {}, h('td', { class: 'mono' }, m), h('td', { class: 'num mono' }, fmtBytes(v.anonymous)), h('td', { class: 'num mono' }, fmtBytes(v.admin)))))) : null;
+      dataBody.replaceChildren(...[h('dl', { class: 'kv' }, rows), past].filter(Boolean),
+        h('p', { class: 'muted' }, 'This month is ', h('span', { class: 'mono' }, c.month), ' (UTC). Past 80 % of the visitor allowance their spectrum slows; once it is used up their audio and spectrum stop. Set with ', h('code', {}, '--anon-egress-gb'), '.'));
+    }).catch((ex) => dataBody.replaceChildren(h('p', { class: 'error' }, ex.message)));
+
     // Password.
     const cur = h('input', { type: 'password', autocomplete: 'current-password', required: true });
     const nw = h('input', { type: 'password', autocomplete: 'new-password', required: true, minlength: 10 });
@@ -1055,7 +1101,7 @@
     }
     loadTokens();
 
-    root.append(h('div', { class: 'grid two-col' }, account, visitors, storage, password, tokens));
+    root.append(h('div', { class: 'grid two-col' }, account, visitors, storage, data, password, tokens));
     return null;
   }
 
@@ -1068,6 +1114,7 @@
 
   // ---------- start ----------
   window.addEventListener('hashchange', route);
+  view().before(budgetBanner);
   (async () => {
     await loadSession();
     await loadChannels();

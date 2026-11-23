@@ -17,6 +17,7 @@
 //! with `"freqs": [146520000, ...]` (those channels, +/- 3 kHz).
 //! Squelched channels send nothing, so silence costs no bandwidth.
 
+use crate::egress::Sock;
 use crate::{ApiError, AppState, Caller};
 use axum::extract::State;
 use axum::extract::ws::{
@@ -291,6 +292,9 @@ pub(crate) async fn audio_ws(
 ) -> Result<Response, ApiError> {
     let caller = s.caller(&headers).await?;
     caller.require(s.public.audio)?;
+    if s.egress_level(caller.role) == crate::egress::Level::Spent {
+        return Err(crate::budget_spent());
+    }
     if !crate::live::same_origin(&headers) {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
@@ -315,12 +319,13 @@ pub(crate) async fn audio_ws(
 }
 
 async fn run(
-    mut sock: WebSocket,
+    sock: WebSocket,
     s: AppState,
     hub: Arc<AudioHub>,
     headers: HeaderMap,
-    _caller: Caller,
+    caller: Caller,
 ) -> Result<(), axum::Error> {
+    let mut sock = Sock::new(sock, s.meter(caller.role));
     let mut rx = hub.tx.subscribe();
     let mut guard = ListenerGuard {
         hub: &hub,
@@ -422,6 +427,13 @@ async fn run(
                     }
                     HubMsg::Frame { id, seq, packet } => {
                         if sel.sending.contains(id) {
+                            if sock.meter.level() == crate::egress::Level::Spent {
+                                // Out of data for the month: say so and stop.
+                                let v = serde_json::json!({"type": "budget", "level": "spent"});
+                                let _ = sock.send(Message::Text(v.to_string().into())).await;
+                                let _ = sock.send(Message::Close(None)).await;
+                                return Ok(());
+                            }
                             sock.send(Message::Binary(encode_frame(*id, *seq, packet).into())).await?;
                         }
                     }
@@ -460,14 +472,14 @@ async fn run(
     }
 }
 
-async fn send_start(sock: &mut WebSocket, id: u64, st: &Stream) -> Result<(), axum::Error> {
+async fn send_start(sock: &mut Sock, id: u64, st: &Stream) -> Result<(), axum::Error> {
     let v = serde_json::json!({
         "type": "start", "id": id as u32, "freq_hz": st.freq, "priority": st.priority,
     });
     sock.send(Message::Text(v.to_string().into())).await
 }
 
-async fn send_end(sock: &mut WebSocket, id: u64) -> Result<(), axum::Error> {
+async fn send_end(sock: &mut Sock, id: u64) -> Result<(), axum::Error> {
     let v = serde_json::json!({"type": "end", "id": id as u32});
     sock.send(Message::Text(v.to_string().into())).await
 }
