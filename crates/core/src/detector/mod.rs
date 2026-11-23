@@ -6,10 +6,21 @@
 //! slot's SNR. A per-slot state machine (idle → attack → active → hang → idle)
 //! turns that into transmission open/close events.
 
+mod background;
+mod floor;
+mod guards;
+mod spectrum;
+mod state;
+
+pub use state::{Event, SlotState};
+
 use crate::channelizer::{BankParams, Block};
 use crate::config::{Slot, SlotOrigin, same_freq};
-use num_complex::Complex32;
-use std::collections::VecDeque;
+use background::{PulsedComb, SteadyBackground, comb_pattern};
+use floor::NoiseFloor;
+use guards::{BurstGuard, InterferenceGuard};
+use spectrum::Spectrum;
+use state::SlotStats;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectorParams {
@@ -107,43 +118,6 @@ impl Default for DetectorParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotState {
-    Idle,
-    /// Above the open threshold since this block.
-    Attack {
-        since: u64,
-    },
-    /// Open; transmission started at this block (pre-roll included).
-    Active {
-        start: u64,
-    },
-    /// Below the close threshold since `since`.
-    Hang {
-        start: u64,
-        since: u64,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Event {
-    /// A slot opened. `start_block` includes pre-roll; the consumer should
-    /// demodulate blocks `start_block..=block` now.
-    Open {
-        slot: usize,
-        start_block: u64,
-        block: u64,
-    },
-    /// A slot closed. `end_block` is the last block the signal was present.
-    Close {
-        slot: usize,
-        start_block: u64,
-        end_block: u64,
-        peak_snr_db: f32,
-        mean_snr_db: f32,
-    },
-}
-
 /// A slot as the detector sees it.
 #[derive(Debug, Clone)]
 pub struct WatchedSlot {
@@ -157,14 +131,17 @@ pub struct WatchedSlot {
     segment: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-struct SlotStats {
-    snr_db: f32,
-    peak: f32,
-    sum: f64,
-    count: u64,
-}
-
+/// Turns FFT blocks into open/close events, in stages each block:
+///
+/// 1. [`Spectrum`]: per-bin power, DC notch, smoothed spectrum.
+/// 2. [`NoiseFloor`]: per-segment floor, the noise-step guard, and the
+///    band-wide rise taken out of every slot's SNR.
+/// 3. [`InterferenceGuard`]: band-wide bursts block opens.
+/// 4. Slot SNRs, and the thresholds raised over steady interference
+///    ([`SteadyBackground`]) and pulsed comb lines ([`PulsedComb`]).
+/// 5. Which slots may open: stronger than overlapping neighbours, over
+///    their raised threshold, not held back by a guard ([`BurstGuard`]).
+/// 6. The per-slot state machine (idle → attack → active → hang → idle).
 pub struct Detector {
     params: DetectorParams,
     bank: BankParams,
@@ -174,41 +151,19 @@ pub struct Detector {
     /// Per slot, SNR (linear) smoothed over ~50 ms; see [`Detector::squelch_db`].
     smooth: Vec<f32>,
     smooth_alpha: f32,
-    /// Smoothed power per bin, shifted order.
-    psd: Vec<f32>,
-    /// Scratch: raw power per bin, shifted order.
-    raw: Vec<f32>,
-    cumsum: Vec<f64>,
-    seg_bounds: Vec<(usize, usize)>,
-    seg_floor: Vec<f32>,
-    seg_scratch: Vec<f32>,
-    /// Each segment's level this block (from its median bin).
-    seg_level: Vec<f32>,
-    /// Scratch: each segment's mean power this block.
-    seg_power: Vec<f32>,
-    /// Band-wide noise level this block over the smoothed floor (at least
-    /// 1). See [`Detector::common_ratio`].
-    common: f32,
-    alpha: f32,
+    spectrum: Spectrum,
+    floor: NoiseFloor,
     floor_alpha: f32,
+    interference: InterferenceGuard,
+    burst: BurstGuard,
+    background: SteadyBackground,
+    comb: PulsedComb,
     blocks_seen: u64,
-    /// Blocks in which the burst guard held slots back.
-    burst_blocks: u64,
-    /// Blocks in which the noise floor rose across much of the band at once.
-    step_blocks: u64,
-    /// Band-wide power this block: the median over segments of their mean
-    /// power (absolute, not over the floor, which a burst can snap up).
-    band_power: f32,
-    /// `band_power` followed over seconds (grows slowly, falls fast, like
-    /// the floor): the reference interference is judged against.
-    band_base: f32,
-    /// Blocks still to treat as interference after a flagged one, which
-    /// covers the burst's tail spilling into the next blocks.
-    interference_hold: u32,
-    /// Blocks flagged as interference bursts (see `INTERFERENCE_RATIO`).
-    interference_blocks: u64,
     /// Scratch: per slot, whether it may start or continue an attack.
     opens: Vec<bool>,
+    /// Scratch: per slot, the close threshold this block (raised over
+    /// interference).
+    close_db: Vec<f32>,
     /// Per grid slot: sum and count of the signal centre over the attack,
     /// so a retune is not thrown off by one block of lopsided FM speech.
     attack_centre: Vec<(f64, u32)>,
@@ -216,61 +171,14 @@ pub struct Detector {
     hang_blocks: u64,
     preroll_blocks: u64,
     skipped: Vec<String>,
-    /// Per slot: 1 s means of the linear SNR, newest last, for the
-    /// background (see `DetectorParams::background_secs`).
-    bg_hist: Vec<VecDeque<f32>>,
-    /// Per slot: the linear SNR summed over the current second.
-    bg_acc: Vec<f64>,
-    /// Blocks summed into `bg_acc` so far, and per second.
-    bg_n: u32,
-    bg_blocks: u32,
-    /// Per slot: the learned background (dB), 0 until enough is held.
-    bg_db: Vec<f32>,
-    bg_scratch: Vec<f32>,
-    /// Recent attack starts: (slot, block, SNR).
-    rises: VecDeque<(usize, u64, f32)>,
-    /// Per slot: the level (dB) it rose to as a comb line, and the block it
-    /// was last seen as one (see `DetectorParams::comb_teeth`).
-    comb_level: Vec<f32>,
-    comb_seen: Vec<u64>,
-    /// Per slot: blocks in a row over the plain open threshold while idle.
-    raw_run: Vec<u64>,
-    /// Pulsed comb events seen.
-    comb_events: u64,
 }
 
-/// Median of an exponential-ish smoothed noise PSD sits below its mean; this
-/// converts the per-segment median to a mean estimate. Measured by
-/// `idle_slots_read_zero_db` for the default smoothing at typical block rates.
-const MEDIAN_TO_MEAN: f32 = 1.2;
-/// Mean over median of one block's (unsmoothed, exponentially distributed)
-/// bin powers: 1 / ln 2.
-const RAW_MEDIAN_TO_MEAN: f32 = std::f32::consts::LOG2_E;
-/// A segment whose median power this block is this far above its floor has
-/// risen as a whole (a gain step or front-end overload), not because of a
-/// few signals in it.
-const STEP_RATIO: f32 = 2.0;
 /// Time constant (s) of the SNR average that must also clear the close
 /// threshold to hold a transmission open. An FM carrier's power is steady,
 /// so averaging costs it nothing; noise alone pokes one block over the
 /// threshold now and then, and on a real RSP1A that was often enough to
 /// hold empty recordings open for minutes.
 const SQUELCH_SMOOTHING: f64 = 0.05;
-/// A block whose band-wide power (the median over segments of their mean
-/// power) is this many times its usual value is an interference burst. Live on an RSP1A at LNA 3 /
-/// GR 40 (Nov 2026), a comb with lines every 256 kHz, each ~10 kHz wide,
-/// pulsed on for ~100 ms every ~0.6 s: it lifted the band's mean ~6 dB but
-/// the channels under its lines 10-14 dB, so taking the band-wide rise out
-/// (`common_ratio`) still left them over the open threshold. Nothing may
-/// start in such a block, and it cannot hold a transmission open: a
-/// transmission in its hang time keeps counting down. Front-end overload
-/// from a nearby handheld keyed up lifted the band's mean ~1.5x. The
-/// usual value is tracked apart from the floor: between bursts the band's
-/// mean sat at 0.3-0.6 of a floor the bursts themselves held up, and a
-/// burst that lifts the band 3 dB snaps the floor up (the step guard).
-const INTERFERENCE_RATIO: f32 = 2.0;
-/// Blocks after an interference burst that are still treated as one.
-const INTERFERENCE_HOLD: u32 = 2;
 
 impl Detector {
     /// Watch the slots of a channel plan that fall inside the capture.
@@ -334,30 +242,36 @@ impl Detector {
                 }
             }
         }
-        // Noise floor segments over the usable band.
-        let first = ((n as f64 / 2.0) - half_usable / bin_hz).max(0.0) as usize;
-        let last = ((n as f64 / 2.0) + half_usable / bin_hz).min(n as f64) as usize;
-        let segs = params.floor_segments.max(1);
-        let seg_len = (last - first).div_ceil(segs);
-        let seg_bounds: Vec<(usize, usize)> = (0..segs)
-            .map(|k| (first + k * seg_len, (first + (k + 1) * seg_len).min(last)))
-            .filter(|(a, b)| b > a)
-            .collect();
+        let floor = NoiseFloor::new(bank, params.usable, params.floor_segments);
         for s in &mut slots {
-            let mid = (s.lo + s.hi) / 2;
-            s.segment = seg_bounds
-                .iter()
-                .position(|&(a, b)| mid >= a && mid < b)
-                .unwrap_or(0);
+            s.segment = floor.segment_of((s.lo + s.hi) / 2);
         }
         let block = bank.block_secs();
         let blocks = |secs: f64| (secs / block).ceil() as u64;
         let count = slots.len();
-        let nseg = seg_bounds.len();
+        let attack_blocks = blocks(params.attack).max(1);
         Detector {
-            alpha: (block / params.smoothing.max(block)).min(1.0) as f32,
+            spectrum: Spectrum::new(bank, params.smoothing, params.dc_notch_hz),
+            floor,
             floor_alpha: (block / params.floor_smoothing.max(block)).min(1.0) as f32,
-            attack_blocks: blocks(params.attack).max(1),
+            interference: InterferenceGuard::default(),
+            burst: BurstGuard::new(params.burst_slots, params.burst_margin_db),
+            background: SteadyBackground::new(
+                count,
+                params.background_secs,
+                params.background_pct,
+                block,
+            ),
+            comb: PulsedComb::new(
+                params.comb_teeth,
+                params.comb_window,
+                params.comb_hold,
+                params.background_max_db,
+                attack_blocks,
+                block,
+                slots.iter().map(|s| s.offset_hz).collect(),
+            ),
+            attack_blocks,
             hang_blocks: blocks(params.hang).max(1),
             preroll_blocks: blocks(params.preroll),
             params,
@@ -367,36 +281,11 @@ impl Detector {
             stats: vec![SlotStats::default(); count],
             smooth: vec![0.0; count],
             smooth_alpha: (block / SQUELCH_SMOOTHING.max(block)).min(1.0) as f32,
-            psd: vec![0.0; n],
-            raw: vec![0.0; n],
-            cumsum: vec![0.0; n + 1],
-            seg_bounds,
-            seg_floor: vec![0.0; nseg],
-            seg_scratch: Vec::new(),
-            seg_level: vec![0.0; nseg],
-            seg_power: Vec::with_capacity(nseg),
-            common: 1.0,
             blocks_seen: 0,
-            burst_blocks: 0,
-            step_blocks: 0,
-            band_power: 0.0,
-            band_base: 0.0,
-            interference_hold: 0,
-            interference_blocks: 0,
-            opens: Vec::new(),
-            attack_centre: Vec::new(),
+            opens: vec![false; count],
+            close_db: vec![0.0; count],
+            attack_centre: vec![(0.0, 0); count],
             skipped,
-            bg_hist: vec![VecDeque::new(); count],
-            bg_acc: vec![0.0; count],
-            bg_n: 0,
-            bg_blocks: (1.0 / block).round().max(1.0) as u32,
-            bg_db: vec![0.0; count],
-            bg_scratch: Vec::new(),
-            rises: VecDeque::new(),
-            comb_level: vec![0.0; count],
-            comb_seen: vec![0; count],
-            raw_run: vec![0; count],
-            comb_events: 0,
         }
     }
 
@@ -437,33 +326,23 @@ impl Detector {
 
     fn block_centroid_hz(&self, i: usize) -> f64 {
         let s = &self.slots[i];
-        let floor = self.seg_floor[s.segment];
+        let floor = self.floor.floor[s.segment];
         // Look half a channel beyond the window on each side, so a signal
         // straddling the window edge is measured whole.
         let pad = (s.slot.bandwidth / 2.0 / self.bank.bin_hz()) as usize;
         let lo = s.lo.saturating_sub(pad);
-        let hi = (s.hi + pad).min(self.raw.len());
-        self.excess_centroid(lo, hi, floor).unwrap_or(s.offset_hz)
-    }
-
-    /// Power-weighted centre (offset Hz) of the power above `floor` in
-    /// shifted bins `lo..hi`, or None if nothing is above it.
-    fn excess_centroid(&self, lo: usize, hi: usize, floor: f32) -> Option<f64> {
-        let (mut w, mut acc) = (0.0f64, 0.0f64);
-        for (k, &p) in self.raw[lo..hi].iter().enumerate() {
-            let excess = (p - floor).max(0.0) as f64;
-            w += excess;
-            acc += excess * (lo + k) as f64;
-        }
-        (w > 0.0).then(|| (acc / w - (self.bank.n / 2) as f64) * self.bank.bin_hz())
+        let hi = (s.hi + pad).min(self.spectrum.raw.len());
+        self.spectrum
+            .excess_centroid(lo, hi, floor)
+            .unwrap_or(s.offset_hz)
     }
 
     /// Whether the excess power in an explicit slot's own window is centred
     /// within a quarter of its bandwidth.
     fn is_centred(&self, i: usize) -> bool {
         let s = &self.slots[i];
-        let floor = self.seg_floor[s.segment];
-        let Some(off) = self.excess_centroid(s.lo, s.hi, floor) else {
+        let floor = self.floor.floor[s.segment];
+        let Some(off) = self.spectrum.excess_centroid(s.lo, s.hi, floor) else {
             return false;
         };
         (off - s.offset_hz).abs() < s.slot.bandwidth / 4.0
@@ -492,11 +371,7 @@ impl Detector {
     /// Noise floor (dB per bin, relative to a full-scale tone reading 0 dB)
     /// at each segment.
     pub fn floor_db(&self) -> Vec<f32> {
-        let n2 = (self.bank.n as f32).powi(2);
-        self.seg_floor
-            .iter()
-            .map(|&f| 10.0 * (f / n2).max(1e-30).log10())
-            .collect()
+        self.floor.floor_db(self.bank.n)
     }
 
     /// The smoothed spectrum between `lo_hz` and `hi_hz` (offsets from the
@@ -504,278 +379,94 @@ impl Detector {
     /// [`Self::floor_db`]). Each value is the strongest bin it covers, so a
     /// narrow carrier stays visible at low display resolution.
     pub fn spectrum_db(&self, lo_hz: f64, hi_hz: f64, bins: usize) -> Vec<f32> {
-        let n = self.bank.n;
-        let bin_hz = self.bank.bin_hz();
-        let to_bin =
-            |hz: f64| ((hz / bin_hz).round() as i64 + (n / 2) as i64).clamp(0, n as i64) as usize;
-        let (a, b) = (to_bin(lo_hz.min(hi_hz)), to_bin(lo_hz.max(hi_hz)));
-        let n2 = (n as f32).powi(2);
-        if b <= a || bins == 0 {
-            return Vec::new();
-        }
-        let width = (b - a) as f64 / bins as f64;
-        (0..bins)
-            .map(|i| {
-                let s = a + (i as f64 * width) as usize;
-                let e = (a + ((i + 1) as f64 * width) as usize).max(s + 1).min(b);
-                let p = self.psd[s..e].iter().copied().fold(0.0f32, f32::max);
-                10.0 * (p / n2).max(1e-30).log10()
-            })
-            .collect()
+        self.spectrum.smoothed_db(lo_hz, hi_hz, bins)
     }
 
     /// Update with one block; appends open/close events.
     pub fn update(&mut self, block: &Block, events: &mut Vec<Event>) {
-        let n = self.bank.n;
-        let h = n / 2;
-        let x = &block.bins;
-        // Power with a frequency-domain Hann window (X[k] - (X[k-1]+X[k+1])/2,
-        // times 1/2), which tames rectangular-window leakage from strong
-        // signals into neighbouring slots. Written in shifted order.
-        let hann = |prev: Complex32, cur: Complex32, next: Complex32| {
-            ((cur - (prev + next) * 0.5) * 0.5).norm_sqr()
-        };
-        let (neg, pos) = self.raw.split_at_mut(h);
-        // Bins 0..h (DC and positive) go to the upper half, h..n to the lower.
-        pos[0] = hann(x[n - 1], x[0], x[1]);
-        for (k, w) in x.windows(3).enumerate() {
-            let k = k + 1;
-            let v = hann(w[0], w[1], w[2]);
-            if k < h {
-                pos[k] = v;
-            } else {
-                neg[k - h] = v;
-            }
-        }
-        neg[h - 1] = hann(x[n - 2], x[n - 1], x[0]);
-        if self.params.dc_notch_hz > 0.0 {
-            let w = (self.params.dc_notch_hz / self.bank.bin_hz()).ceil() as usize + 1;
-            if h > w + 1 {
-                let a = self.raw[h - w - 1];
-                let b = self.raw[h + w + 1];
-                self.raw[h - w..=h + w].fill(0.5 * (a + b));
-            }
-        }
-        let alpha = if self.blocks_seen == 0 {
-            1.0
-        } else {
-            self.alpha
-        };
-        for (s, &r) in self.psd.iter_mut().zip(&self.raw) {
-            *s += alpha * (r - *s);
-        }
-        let mut acc = 0.0f64;
-        self.cumsum[0] = 0.0;
-        // Slot power uses this block's raw spectrum: integrating over the
-        // slot's ~100+ bins already makes it a low-variance estimate, and
-        // temporal smoothing would stretch short bursts past the attack time.
-        for (k, &v) in self.raw.iter().enumerate() {
-            acc += v as f64;
-            self.cumsum[k + 1] = acc;
-        }
-        // Per-segment median floor (subsampled for speed).
-        let falpha = if self.blocks_seen == 0 {
-            1.0
-        } else {
-            self.floor_alpha
-        };
-        let mut risen = 0usize;
-        for (i, &(a, b)) in self.seg_bounds.iter().enumerate() {
-            // The whole segment's level this block, from its median bin:
-            // signals occupy too few bins to move it.
-            self.seg_scratch.clear();
-            let stride = ((b - a) / 512).max(1);
-            self.seg_scratch
-                .extend(self.raw[a..b].iter().step_by(stride).copied());
-            let mid = self.seg_scratch.len() / 2;
-            let (_, m, _) = self.seg_scratch.select_nth_unstable_by(mid, f32::total_cmp);
-            let level = *m * RAW_MEDIAN_TO_MEAN;
-            self.seg_level[i] = level;
-            {
-                let f = &mut self.seg_floor[i];
-                if *f > 0.0 && level > *f * STEP_RATIO {
-                    // Follow a broadband rise at once instead of over the
-                    // slow growth time, or every slot in the segment looks
-                    // busy until the floor catches up.
-                    risen += 1;
-                    *f = level;
-                    continue;
-                }
-            }
-            self.seg_scratch.clear();
-            let stride = ((b - a) / 512).max(1);
-            self.seg_scratch
-                .extend(self.psd[a..b].iter().step_by(stride).copied());
-            let mid = self.seg_scratch.len() / 2;
-            let (_, m, _) = self.seg_scratch.select_nth_unstable_by(mid, f32::total_cmp);
-            let est = *m * MEDIAN_TO_MEAN;
-            // Grow slowly, fall fast: a burst of signals in a segment must not
-            // drag the floor up, but a gain drop should be followed quickly.
-            let f = &mut self.seg_floor[i];
-            // A block of zeros (a zero-filled overrun gap) says nothing about
-            // the noise floor; following it down would make every slot look
-            // busy once samples return.
-            if *f > 0.0 && est < *f * 1e-3 {
-                continue;
-            }
-            if *f == 0.0 || est < *f {
-                *f += (falpha * 4.0).min(1.0) * (est - *f);
-            } else {
-                *f += falpha * (est - *f);
-            }
-        }
+        let first = self.blocks_seen == 0;
+        self.spectrum.update(block, first);
+        let falpha = if first { 1.0 } else { self.floor_alpha };
+        let step = self.floor.update(&self.spectrum, falpha, first);
         self.blocks_seen += 1;
-        // A broadband step across much of the band this block: nothing new
-        // may start (see the guard below).
-        let step = risen * 4 >= self.seg_bounds.len() && self.blocks_seen > 1;
-        if step {
-            self.step_blocks += 1;
-        }
-        self.common = self.common_ratio();
-        let burst = self.blocks_seen > 1
-            && self.band_base > 0.0
-            && self.band_power >= INTERFERENCE_RATIO * self.band_base;
-        if burst {
-            self.interference_hold = INTERFERENCE_HOLD;
-        }
-        let interfered = burst || self.interference_hold > 0;
-        if !burst {
-            self.interference_hold = self.interference_hold.saturating_sub(1);
-        }
-        if interfered {
-            self.interference_blocks += 1;
-        }
-        // Followed through the bursts too (slowly, as they push it up), so
-        // a lasting rise such as a gain change is absorbed within seconds
-        // instead of being treated as interference for good. A block of
-        // zeros (a dropped stretch) says nothing about it.
-        if self.band_power > 0.0 {
-            let m = self.band_power;
-            let base = &mut self.band_base;
-            if *base == 0.0 || m < *base {
-                *base += (falpha * 4.0).min(1.0) * (m - *base);
-            } else {
-                *base += falpha * (m - *base);
-            }
-        }
+        let interfered = self
+            .interference
+            .update(self.floor.band_power, falpha, first);
+        let held = step || interfered;
 
         // SNR per slot, against the floor raised by any band-wide rise this
-        // block (see `common_ratio`).
-        let common = self.common as f64;
+        // block (see `NoiseFloor::common_ratio`).
+        let common = self.floor.common as f64;
+        let a = if first { 1.0 } else { self.smooth_alpha };
         for (i, s) in self.slots.iter().enumerate() {
-            let p = self.cumsum[s.hi] - self.cumsum[s.lo];
-            let noise = self.seg_floor[s.segment] as f64 * common * (s.hi - s.lo) as f64;
+            let p = self.spectrum.power(s.lo, s.hi);
+            let noise = self.floor.floor[s.segment] as f64 * common * (s.hi - s.lo) as f64;
             let snr = if noise > 0.0 {
                 10.0 * (p / noise).max(1e-12).log10()
             } else {
                 0.0
             };
             self.stats[i].snr_db = snr as f32;
-            if !(step || interfered) && noise > 0.0 {
-                self.bg_acc[i] += p / noise;
+            if !held && noise > 0.0 {
+                self.background.add(i, p / noise);
             }
             let lin = 10f32.powf(snr as f32 / 10.0);
-            let a = if self.blocks_seen <= 1 {
-                1.0
-            } else {
-                self.smooth_alpha
-            };
             self.smooth[i] += a * (lin - self.smooth[i]);
         }
-
-        if self.params.background_secs > 0.0 && !(step || interfered) {
-            self.bg_n += 1;
-            if self.bg_n >= self.bg_blocks {
-                self.learn_background();
-            }
+        if !held {
+            self.background.end_block();
         }
 
         let b = block.index;
-        let mut active = self
-            .states
-            .iter()
-            .filter(|s| matches!(s, SlotState::Active { .. } | SlotState::Hang { .. }))
-            .count();
-        self.opens.clear();
+        self.find_opens(b, held);
+        if held {
+            // Hold every waiting slot back for this block; after a step the
+            // floor has already moved up, so real signals still clear it
+            // next block.
+            for (open, st) in self.opens.iter_mut().zip(&self.states) {
+                if st.is_waiting() {
+                    *open = false;
+                }
+            }
+        }
+        for i in self.comb.learn(b) {
+            if self.states[i].is_waiting() {
+                self.states[i] = SlotState::Idle;
+                self.attack_centre[i] = (0.0, 0);
+                self.opens[i] = false;
+            }
+        }
+        // Comb lines just learned raise their thresholds from here on.
+        for i in 0..self.slots.len() {
+            self.close_db[i] = self.params.close_db + self.background_db(i);
+        }
+        self.burst
+            .apply(&self.states, &self.stats, &self.close_db, &mut self.opens);
+        self.step_states(b, interfered, events);
+    }
+
+    /// Which slots may start or continue an attack this block (`opens`),
+    /// and the rises the pulsed comb guard watches.
+    fn find_opens(&mut self, b: u64, held: bool) {
         for i in 0..self.slots.len() {
             let snr = self.stats[i].snr_db;
             let dens = |j: usize| self.stats[j].snr_db;
             let wins = self.slots[i].neighbors.iter().all(|&j| {
                 // A busy neighbour that is stronger takes this signal, unless
                 // this slot already owns it.
-                let other_owns = matches!(
-                    self.states[j],
-                    SlotState::Active { .. } | SlotState::Hang { .. }
-                );
+                let other_owns = self.states[j].is_open();
                 !(dens(j) > snr || (other_owns && dens(j) >= snr - 3.0))
             });
-            self.opens
-                .push(snr >= self.params.open_db + self.background_db(i) && wins);
-            // For the pulsed comb guard: a slot idle or in its attack that
-            // has been over the plain open threshold for an attack's worth
-            // of blocks rose now, whether or not its threshold is raised
-            // (so a known comb keeps being seen).
-            let waiting = matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. });
-            if waiting && snr >= self.params.open_db && wins && !(step || interfered) {
-                self.raw_run[i] += 1;
-                if self.raw_run[i] == self.attack_blocks {
-                    self.rises.push_back((i, block.index, snr));
-                }
-            } else {
-                self.raw_run[i] = 0;
-            }
+            self.opens[i] = snr >= self.params.open_db + self.background_db(i) && wins;
+            let over = self.states[i].is_waiting() && snr >= self.params.open_db && wins && !held;
+            self.comb.observe(i, b, snr, over);
         }
-        if step || interfered {
-            // Hold every waiting slot back for this block; after a step the
-            // floor has already moved up, so real signals still clear it
-            // next block.
-            for i in 0..self.slots.len() {
-                if matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. }) {
-                    self.opens[i] = false;
-                }
-            }
-        }
-        self.learn_comb(b);
-        // Broadband-burst guard (see DetectorParams::burst_slots).
-        if self.params.burst_slots > 0 {
-            let waiting = |i: usize| {
-                matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. })
-                    && self.opens[i]
-            };
-            // Counted against the close threshold, not the open one:
-            // overload products sit a few dB lower once band-wide rises are
-            // taken out of the SNR (`common_ratio`), and an RSP1A at LNA 3
-            // keyed up against by a nearby handheld then put only four or
-            // five of them over the open threshold at once, too few to arm
-            // the guard, so they opened one by one.
-            let idle =
-                |i: usize| matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. });
-            let hot = (0..self.slots.len())
-                .filter(|&i| {
-                    idle(i) && self.stats[i].snr_db >= self.params.close_db + self.background_db(i)
-                })
-                .count();
-            if hot >= self.params.burst_slots {
-                // The reference is the strongest signal anywhere, including
-                // one already open: the transmitter causing the overload is
-                // usually open before its products cross the threshold.
-                let top = (0..self.slots.len())
-                    .filter(|&i| waiting(i) || !matches!(self.states[i], SlotState::Idle))
-                    .map(|i| self.stats[i].snr_db)
-                    .fold(f32::MIN, f32::max);
-                let keep = top - self.params.burst_margin_db;
-                let drop: Vec<usize> = (0..self.slots.len())
-                    .filter(|&i| waiting(i) && self.stats[i].snr_db < keep)
-                    .collect();
-                for i in drop {
-                    self.opens[i] = false;
-                }
-                self.burst_blocks += 1;
-            }
-        }
-        self.attack_centre.resize(self.slots.len(), (0.0, 0));
+    }
+
+    /// Advance every slot's state machine by one block.
+    fn step_states(&mut self, b: u64, interfered: bool, events: &mut Vec<Event>) {
+        let mut active = self.states.iter().filter(|s| s.is_open()).count();
         for i in 0..self.slots.len() {
-            let snr = self.stats[i].snr_db;
             let open = self.opens[i];
             // An explicit slot starts its attack only for a signal centred on
             // it, not for the skirt of a neighbour 10 kHz away. (Grid slots
@@ -783,7 +474,7 @@ impl Detector {
             // attack, because FM speech is lopsided from block to block.
             let start =
                 open && (self.slots[i].slot.origin == SlotOrigin::Grid || self.is_centred(i));
-            let stay = self.squelch_db(i) >= self.params.close_db + self.background_db(i);
+            let stay = self.squelch_db(i) >= self.close_db[i];
             let st = &mut self.stats[i];
             let next = match self.states[i] {
                 SlotState::Idle if start => SlotState::Attack { since: b },
@@ -804,12 +495,7 @@ impl Detector {
                             block: b,
                         });
                         active += 1;
-                        *st = SlotStats {
-                            snr_db: snr,
-                            peak: snr,
-                            sum: 0.0,
-                            count: 0,
-                        };
+                        st.open();
                         SlotState::Active { start }
                     } else {
                         SlotState::Attack { since }
@@ -821,17 +507,7 @@ impl Detector {
                 SlotState::Hang { start, .. } if stay && !interfered => SlotState::Active { start },
                 SlotState::Hang { start, since } => {
                     if b - since >= self.hang_blocks {
-                        events.push(Event::Close {
-                            slot: i,
-                            start_block: start,
-                            end_block: since.saturating_sub(1),
-                            peak_snr_db: st.peak,
-                            mean_snr_db: if st.count > 0 {
-                                (st.sum / st.count as f64) as f32
-                            } else {
-                                snr
-                            },
-                        });
+                        events.push(st.close(i, start, since.saturating_sub(1)));
                         active -= 1;
                         SlotState::Idle
                     } else {
@@ -859,166 +535,30 @@ impl Detector {
                 (_, SlotState::Idle) => self.attack_centre[i] = (0.0, 0),
                 _ => {}
             }
-            let st = &mut self.stats[i];
             if matches!(next, SlotState::Active { .. }) {
-                st.peak = st.peak.max(snr);
-                st.sum += snr as f64;
-                st.count += 1;
+                self.stats[i].add();
             }
             self.states[i] = next;
         }
     }
 
-    /// Look for a pulsed comb among the slots that started an attack within
-    /// the last `comb_window` (see `DetectorParams::comb_teeth`), mark its
-    /// lines, and cancel their attacks.
-    fn learn_comb(&mut self, b: u64) {
-        let hold = (self.params.comb_hold / self.bank.block_secs()) as u64;
-        for i in 0..self.slots.len() {
-            if self.comb_level[i] > 0.0 && b.saturating_sub(self.comb_seen[i]) > hold {
-                self.comb_level[i] = 0.0;
-            }
-        }
-        let window = (self.params.comb_window / self.bank.block_secs()).ceil() as u64;
-        while self.rises.front().is_some_and(|r| r.1 + window < b) {
-            self.rises.pop_front();
-        }
-        let teeth = self.params.comb_teeth;
-        if teeth == 0 || !self.rises.back().is_some_and(|r| r.1 == b) {
-            return;
-        }
-        // Per slot, the strongest rise in the window; strong ones are not
-        // comb lines.
-        let mut rose: Vec<(usize, f32)> = Vec::new();
-        for &(i, _, snr) in &self.rises {
-            match rose.iter_mut().find(|r| r.0 == i) {
-                Some(r) => r.1 = r.1.max(snr),
-                None => rose.push((i, snr)),
-            }
-        }
-        rose.retain(|r| r.1 <= self.params.background_max_db);
-        if rose.len() < teeth {
-            return;
-        }
-        let offs: Vec<f64> = rose.iter().map(|r| self.slots[r.0].offset_hz).collect();
-        let Some(members) = comb_members(&offs, teeth) else {
-            return;
-        };
-        self.comb_events += 1;
-        for k in members {
-            let (i, snr) = rose[k];
-            self.comb_level[i] = self.comb_level[i].max(snr);
-            self.comb_seen[i] = b;
-            if matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. }) {
-                self.states[i] = SlotState::Idle;
-                self.attack_centre[i] = (0.0, 0);
-                self.opens[i] = false;
-            }
-        }
-        self.rises.retain(|r| self.comb_seen[r.0] != b);
-    }
-
     /// Pulsed comb events seen (see `DetectorParams::comb_teeth`).
     pub fn comb_events(&self) -> u64 {
-        self.comb_events
-    }
-
-    /// How far the whole band's noise sits above the smoothed floor this
-    /// block, at least 1: the median over segments of this block's level
-    /// over the floor, measured two ways (below), whichever is higher.
-    ///
-    /// The floor follows the noise over seconds, but interference can lift
-    /// the whole band for a block or a few hundred ms at a time. Seen live
-    /// on an RSP1A at LNA 3 / GR 40 (Nov 2026): swells of 2-6 dB several
-    /// times a second, and a 20-50 ms burst every 1.2 s that read 5-11 dB
-    /// in every slot. Against the slow floor alone that reads as a weak
-    /// signal in every slot, which opened dozens of empty recordings and
-    /// held them open for minutes. A rise shared by most segments is
-    /// interference, not signals: a signal occupies a few segments at most,
-    /// so the median over segments ignores it.
-    ///
-    /// Each segment's level is measured from its median bin and from its
-    /// mean power. The median bin follows broadband noise, including the
-    /// non-Gaussian kind from front-end overload, without being pulled up
-    /// by the signals in the segment. The mean (the same statistic as slot
-    /// power) also follows interference that is spiky across frequency,
-    /// like the comb from a pulse train, which lifts a band's power
-    /// without moving its median bin.
-    fn common_ratio(&mut self) -> f32 {
-        let median = |v: &mut Vec<f32>| -> f32 {
-            if v.is_empty() {
-                return 1.0;
-            }
-            let mid = v.len() / 2;
-            *v.select_nth_unstable_by(mid, f32::total_cmp).1
-        };
-        self.seg_scratch.clear();
-        self.seg_scratch.extend(
-            self.seg_level
-                .iter()
-                .zip(&self.seg_floor)
-                .filter(|&(&l, &f)| f > 0.0 && l > 0.0)
-                .map(|(&l, &f)| l / f),
-        );
-        let by_median = median(&mut self.seg_scratch);
-        self.seg_scratch.clear();
-        self.seg_power.clear();
-        for (&(a, b), &f) in self.seg_bounds.iter().zip(&self.seg_floor) {
-            let mean = ((self.cumsum[b] - self.cumsum[a]) / (b - a) as f64) as f32;
-            if f > 0.0 && mean > 0.0 {
-                self.seg_scratch.push(mean / f);
-                self.seg_power.push(mean);
-            }
-        }
-        let by_mean = median(&mut self.seg_scratch);
-        self.band_power = if self.seg_power.is_empty() {
-            0.0
-        } else {
-            median(&mut self.seg_power)
-        };
-        by_median.max(by_mean).max(1.0)
-    }
-
-    /// Close out a second of the per-slot background: push each slot's
-    /// mean, drop what is older than `background_secs`, and take the
-    /// quantile once enough is held.
-    fn learn_background(&mut self) {
-        let n = self.bg_n as f64;
-        let cap = self.params.background_secs.ceil().max(1.0) as usize;
-        let need = cap.div_ceil(2).min(10);
-        let pct = self.params.background_pct.clamp(0.0, 1.0);
-        for i in 0..self.slots.len() {
-            let h = &mut self.bg_hist[i];
-            h.push_back((self.bg_acc[i] / n) as f32);
-            while h.len() > cap {
-                h.pop_front();
-            }
-            self.bg_acc[i] = 0.0;
-            self.bg_db[i] = if h.len() >= need {
-                self.bg_scratch.clear();
-                self.bg_scratch.extend(h.iter().copied());
-                let k =
-                    ((self.bg_scratch.len() as f32 * pct) as usize).min(self.bg_scratch.len() - 1);
-                let (_, q, _) = self.bg_scratch.select_nth_unstable_by(k, f32::total_cmp);
-                (10.0 * q.max(1e-12).log10()).max(0.0)
-            } else {
-                0.0
-            };
-        }
-        self.bg_n = 0;
+        self.comb.events
     }
 
     /// How far slot `i`'s open and close thresholds are raised for steady
     /// interference under it (dB; see `DetectorParams::background_secs`).
     pub fn background_db(&self, i: usize) -> f32 {
-        let bg = self.bg_db[i];
+        let bg = self.background.db[i];
         let steady = if bg >= self.params.background_min_db && bg <= self.params.background_max_db {
             bg
         } else {
             0.0
         };
-        let comb = if self.comb_level[i] > 0.0 {
-            (self.comb_level[i] + self.params.comb_margin_db - self.params.open_db).max(0.0)
+        let level = self.comb.level[i];
+        let comb = if level > 0.0 {
+            (level + self.params.comb_margin_db - self.params.open_db).max(0.0)
         } else {
             0.0
         };
@@ -1040,69 +580,28 @@ impl Detector {
     /// slots point at one. Diagnostic only: the thresholds are raised per
     /// slot either way.
     pub fn comb(&self) -> Option<(f64, usize)> {
-        // Centres of raised runs (neighbouring raised slots within 30 kHz
-        // are one line).
-        let mut raised: Vec<f64> = (0..self.slots.len())
-            .filter(|&i| self.background_db(i) >= 3.0)
-            .map(|i| self.slots[i].offset_hz)
-            .collect();
-        raised.sort_by(f64::total_cmp);
-        let mut lines: Vec<(f64, usize)> = Vec::new();
-        for f in raised {
-            match lines.last_mut() {
-                Some((sum, n)) if f - *sum / *n as f64 <= 30e3 => {
-                    *sum += f;
-                    *n += 1;
-                }
-                _ => lines.push((f, 1)),
-            }
-        }
-        let centres: Vec<f64> = lines.iter().map(|&(s, n)| s / n as f64).collect();
-        let mut counts: Vec<(i64, usize)> = Vec::new();
-        for w in centres.windows(2) {
-            let d = ((w[1] - w[0]) / 5e3).round() as i64;
-            match counts.iter_mut().find(|(k, _)| (*k - d).abs() <= 1) {
-                Some(c) => c.1 += 1,
-                None => counts.push((d, 1)),
-            }
-        }
-        let (d, c) = counts.into_iter().max_by_key(|&(_, c)| c)?;
-        if c < 3 {
-            return None;
-        }
-        let spacing = d as f64 * 5e3;
-        // Lines on that comb (within 10 kHz of a multiple of the spacing
-        // from the first line on it).
-        let teeth = centres
-            .iter()
-            .map(|&f| {
-                centres
-                    .iter()
-                    .filter(|&&g| {
-                        let k = (g - f) / spacing;
-                        (k - k.round()).abs() * spacing <= 10e3
-                    })
-                    .count()
-            })
-            .max()
-            .unwrap_or(0);
-        Some((spacing, teeth))
+        comb_pattern(
+            (0..self.slots.len())
+                .filter(|&i| self.background_db(i) >= 3.0)
+                .map(|i| self.slots[i].offset_hz)
+                .collect(),
+        )
     }
 
     /// Blocks in which the broadband-burst guard held slots back.
     pub fn burst_blocks(&self) -> u64 {
-        self.burst_blocks
+        self.burst.blocks
     }
 
     /// Blocks in which the noise floor stepped up across much of the band
     /// (gain change, overload, a radio stream restart).
     pub fn step_blocks(&self) -> u64 {
-        self.step_blocks
+        self.floor.step_blocks
     }
 
-    /// Blocks flagged as interference bursts (see `INTERFERENCE_RATIO`).
+    /// Blocks flagged as interference bursts.
     pub fn interference_blocks(&self) -> u64 {
-        self.interference_blocks
+        self.interference.blocks
     }
 
     /// End of stream: close everything that is open.
@@ -1124,18 +623,7 @@ impl Detector {
             }
             SlotState::Idle => return,
         };
-        let st = &self.stats[i];
-        events.push(Event::Close {
-            slot: i,
-            start_block: start,
-            end_block: end,
-            peak_snr_db: st.peak,
-            mean_snr_db: if st.count > 0 {
-                (st.sum / st.count as f64) as f32
-            } else {
-                st.snr_db
-            },
-        });
+        events.push(self.stats[i].close(i, start, end));
         self.states[i] = SlotState::Idle;
     }
 
@@ -1148,64 +636,13 @@ impl Detector {
     }
 }
 
-/// Which of these offsets (Hz) lie on one evenly spaced grid of at least
-/// `teeth` lines, if any: the grid (spacing 50 kHz or more, from any pair
-/// and its first few divisions) that holds the most of them, each within
-/// 10 kHz of a line. Offsets within 30 kHz of each other count as one line.
-fn comb_members(offs: &[f64], teeth: usize) -> Option<Vec<usize>> {
-    let mut order: Vec<usize> = (0..offs.len()).collect();
-    order.sort_by(|&a, &b| offs[a].total_cmp(&offs[b]));
-    // Lines: (centre, members).
-    let mut lines: Vec<(f64, Vec<usize>)> = Vec::new();
-    for k in order {
-        let f = offs[k];
-        match lines.last_mut() {
-            Some((c, m)) if f - *c <= 30e3 => {
-                *c = (*c * m.len() as f64 + f) / (m.len() + 1) as f64;
-                m.push(k);
-            }
-            _ => lines.push((f, vec![k])),
-        }
-    }
-    if lines.len() < teeth {
-        return None;
-    }
-    let on = |f0: f64, s: f64| -> Vec<usize> {
-        (0..lines.len())
-            .filter(|&j| {
-                let k = (lines[j].0 - f0) / s;
-                (k - k.round()).abs() * s <= 10e3
-            })
-            .collect()
-    };
-    let mut best: Vec<usize> = Vec::new();
-    for a in 0..lines.len() {
-        for b in a + 1..lines.len() {
-            let d = lines[b].0 - lines[a].0;
-            for div in 1..=4 {
-                let s = d / div as f64;
-                if s < 50e3 {
-                    break;
-                }
-                let got = on(lines[a].0, s);
-                // A grid must be filled in, not just two lines far apart
-                // with the rest landing on a fine spacing by chance: at
-                // least half the lines between the outermost members.
-                let span = (lines[*got.last().unwrap()].0 - lines[got[0]].0) / s;
-                if got.len() > best.len() && got.len() as f64 >= (span.round() + 1.0) / 2.0 {
-                    best = got;
-                }
-            }
-        }
-    }
-    (best.len() >= teeth).then(|| best.iter().flat_map(|&j| lines[j].1.clone()).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::channelizer::Analyzer;
     use crate::config::Mode;
+    use background::comb_members;
+    use num_complex::Complex32;
     use std::f64::consts::PI;
 
     fn slot(freq: f64, bw: f64) -> Slot {
