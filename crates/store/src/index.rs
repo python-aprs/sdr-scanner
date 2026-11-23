@@ -232,6 +232,52 @@ impl Index {
         .map_err(Into::into)
     }
 
+    /// Bytes of audio (WAV and Opus) the complete rows hold on disk.
+    pub fn usage_bytes(&self) -> Result<u64, IndexError> {
+        let n: i64 = self.db.query_row(
+            "SELECT COALESCE(SUM(COALESCE(wav_bytes, 0) + COALESCE(opus_bytes, 0)), 0)
+             FROM transmissions WHERE status = 'complete'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// The oldest rows whose files retention may delete: complete ones,
+    /// and ones a crash interrupted (which may have left `.part` files).
+    pub fn oldest_expirable(&self, limit: usize) -> Result<Vec<Row>, IndexError> {
+        let mut st = self.db.prepare(
+            "SELECT * FROM transmissions WHERE status IN ('complete', 'interrupted')
+             ORDER BY start_ns, id LIMIT ?1",
+        )?;
+        Ok(st
+            .query_map([limit as i64], row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Start of the oldest recording still on disk.
+    pub fn oldest_complete_ns(&self) -> Result<Option<i64>, IndexError> {
+        Ok(self.db.query_row(
+            "SELECT MIN(start_ns) FROM transmissions WHERE status = 'complete'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Mark rows whose files are gone. The rows stay, so the log of what
+    /// was heard outlives the audio.
+    pub fn expire(&self, ids: &[i64]) -> Result<(), IndexError> {
+        let tx = self.db.unchecked_transaction()?;
+        {
+            let mut st = tx.prepare("UPDATE transmissions SET status = 'expired' WHERE id = ?1")?;
+            for id in ids {
+                st.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn count(&self) -> Result<i64, IndexError> {
         self.db
             .query_row("SELECT COUNT(*) FROM transmissions", [], |r| r.get(0))
