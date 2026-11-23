@@ -148,6 +148,8 @@ pub struct Detector {
     seg_scratch: Vec<f32>,
     /// Each segment's level this block (from its median bin).
     seg_level: Vec<f32>,
+    /// Scratch: each segment's mean power this block.
+    seg_power: Vec<f32>,
     /// Band-wide noise level this block over the smoothed floor (at least
     /// 1). See [`Detector::common_ratio`].
     common: f32,
@@ -158,6 +160,17 @@ pub struct Detector {
     burst_blocks: u64,
     /// Blocks in which the noise floor rose across much of the band at once.
     step_blocks: u64,
+    /// Band-wide power this block: the median over segments of their mean
+    /// power (absolute, not over the floor, which a burst can snap up).
+    band_power: f32,
+    /// `band_power` followed over seconds (grows slowly, falls fast, like
+    /// the floor): the reference interference is judged against.
+    band_base: f32,
+    /// Blocks still to treat as interference after a flagged one, which
+    /// covers the burst's tail spilling into the next blocks.
+    interference_hold: u32,
+    /// Blocks flagged as interference bursts (see `INTERFERENCE_RATIO`).
+    interference_blocks: u64,
     /// Scratch: per slot, whether it may start or continue an attack.
     opens: Vec<bool>,
     /// Per grid slot: sum and count of the signal centre over the attack,
@@ -186,6 +199,21 @@ const STEP_RATIO: f32 = 2.0;
 /// threshold now and then, and on a real RSP1A that was often enough to
 /// hold empty recordings open for minutes.
 const SQUELCH_SMOOTHING: f64 = 0.05;
+/// A block whose band-wide power (the median over segments of their mean
+/// power) is this many times its usual value is an interference burst. Live on an RSP1A at LNA 3 /
+/// GR 40 (Nov 2026), a comb with lines every 256 kHz, each ~10 kHz wide,
+/// pulsed on for ~100 ms every ~0.6 s: it lifted the band's mean ~6 dB but
+/// the channels under its lines 10-14 dB, so taking the band-wide rise out
+/// (`common_ratio`) still left them over the open threshold. Nothing may
+/// start in such a block, and it cannot hold a transmission open: a
+/// transmission in its hang time keeps counting down. Front-end overload
+/// from a nearby handheld keyed up lifted the band's mean ~1.5x. The
+/// usual value is tracked apart from the floor: between bursts the band's
+/// mean sat at 0.3-0.6 of a floor the bursts themselves held up, and a
+/// burst that lifts the band 3 dB snaps the floor up (the step guard).
+const INTERFERENCE_RATIO: f32 = 2.0;
+/// Blocks after an interference burst that are still treated as one.
+const INTERFERENCE_HOLD: u32 = 2;
 
 impl Detector {
     /// Watch the slots of a channel plan that fall inside the capture.
@@ -289,10 +317,15 @@ impl Detector {
             seg_floor: vec![0.0; nseg],
             seg_scratch: Vec::new(),
             seg_level: vec![0.0; nseg],
+            seg_power: Vec::with_capacity(nseg),
             common: 1.0,
             blocks_seen: 0,
             burst_blocks: 0,
             step_blocks: 0,
+            band_power: 0.0,
+            band_base: 0.0,
+            interference_hold: 0,
+            interference_blocks: 0,
             opens: Vec::new(),
             attack_centre: Vec::new(),
             skipped,
@@ -526,6 +559,32 @@ impl Detector {
             self.step_blocks += 1;
         }
         self.common = self.common_ratio();
+        let burst = self.blocks_seen > 1
+            && self.band_base > 0.0
+            && self.band_power >= INTERFERENCE_RATIO * self.band_base;
+        if burst {
+            self.interference_hold = INTERFERENCE_HOLD;
+        }
+        let interfered = burst || self.interference_hold > 0;
+        if !burst {
+            self.interference_hold = self.interference_hold.saturating_sub(1);
+        }
+        if interfered {
+            self.interference_blocks += 1;
+        }
+        // Followed through the bursts too (slowly, as they push it up), so
+        // a lasting rise such as a gain change is absorbed within seconds
+        // instead of being treated as interference for good. A block of
+        // zeros (a dropped stretch) says nothing about it.
+        if self.band_power > 0.0 {
+            let m = self.band_power;
+            let base = &mut self.band_base;
+            if *base == 0.0 || m < *base {
+                *base += (falpha * 4.0).min(1.0) * (m - *base);
+            } else {
+                *base += falpha * (m - *base);
+            }
+        }
 
         // SNR per slot, against the floor raised by any band-wide rise this
         // block (see `common_ratio`).
@@ -569,9 +628,10 @@ impl Detector {
             });
             self.opens.push(snr >= self.params.open_db && wins);
         }
-        if step {
-            // Hold every waiting slot back for this block; the floor has
-            // already moved up, so real signals still clear it next block.
+        if step || interfered {
+            // Hold every waiting slot back for this block; after a step the
+            // floor has already moved up, so real signals still clear it
+            // next block.
             for i in 0..self.slots.len() {
                 if matches!(self.states[i], SlotState::Idle | SlotState::Attack { .. }) {
                     self.opens[i] = false;
@@ -658,7 +718,7 @@ impl Detector {
                 SlotState::Attack { .. } => SlotState::Idle,
                 SlotState::Active { start } if stay => SlotState::Active { start },
                 SlotState::Active { start } => SlotState::Hang { start, since: b },
-                SlotState::Hang { start, .. } if stay => SlotState::Active { start },
+                SlotState::Hang { start, .. } if stay && !interfered => SlotState::Active { start },
                 SlotState::Hang { start, since } => {
                     if b - since >= self.hang_blocks {
                         events.push(Event::Close {
@@ -748,13 +808,20 @@ impl Detector {
         );
         let by_median = median(&mut self.seg_scratch);
         self.seg_scratch.clear();
+        self.seg_power.clear();
         for (&(a, b), &f) in self.seg_bounds.iter().zip(&self.seg_floor) {
-            let mean = (self.cumsum[b] - self.cumsum[a]) / (b - a) as f64;
+            let mean = ((self.cumsum[b] - self.cumsum[a]) / (b - a) as f64) as f32;
             if f > 0.0 && mean > 0.0 {
-                self.seg_scratch.push(mean as f32 / f);
+                self.seg_scratch.push(mean / f);
+                self.seg_power.push(mean);
             }
         }
         let by_mean = median(&mut self.seg_scratch);
+        self.band_power = if self.seg_power.is_empty() {
+            0.0
+        } else {
+            median(&mut self.seg_power)
+        };
         by_median.max(by_mean).max(1.0)
     }
 
@@ -767,6 +834,11 @@ impl Detector {
     /// (gain change, overload, a radio stream restart).
     pub fn step_blocks(&self) -> u64 {
         self.step_blocks
+    }
+
+    /// Blocks flagged as interference bursts (see `INTERFERENCE_RATIO`).
+    pub fn interference_blocks(&self) -> u64 {
+        self.interference_blocks
     }
 
     /// End of stream: close everything that is open.
@@ -1051,6 +1123,82 @@ mod tests {
         eprintln!("clicks: {opens} opens, worst block mean {worst} dB");
         assert_eq!(opens, 0, "{events:?}");
         assert!(worst < 1.5, "worst {worst}");
+    }
+
+    /// The interference in a live RSP1A capture (LNA 3 / GR 40, Nov 2026):
+    /// for 0.1 s every 0.6 s the band's noise rises ~4 dB and a comb of
+    /// ~10 kHz-wide lines every 256 kHz comes up ~14 dB, right on channels.
+    fn comb_bursts(secs: f64, extra: &[(f64, f64, f64, f64)], seed: u64) -> Vec<Complex32> {
+        let mut sigs: Vec<(f64, f64, f64, f64)> = extra.to_vec();
+        let mut t = 0.3;
+        while t < secs {
+            for k in [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0] {
+                sigs.push((k * 256e3, 14.0, t, t + 0.1));
+            }
+            t += 0.6;
+        }
+        let mut x = scene(secs, &sigs, seed);
+        let fs = params().sample_rate;
+        let g = 10f32.powf(4.0 / 20.0);
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = i as f64 / fs;
+            if t >= 0.3 && (t - 0.3) % 0.6 < 0.1 {
+                *v *= g;
+            }
+        }
+        x
+    }
+
+    #[test]
+    fn pulsed_comb_bursts_open_nothing() {
+        let x = comb_bursts(6.0, &[], 21);
+        let plan: Vec<Slot> = (-40..=40).map(|k| slot(k as f64 * 20e3, 16e3)).collect();
+        let (det, events, _) = run(&x, &plan, DetectorParams::default());
+        let opens = events
+            .iter()
+            .filter(|e| matches!(e, Event::Open { .. }))
+            .count();
+        eprintln!(
+            "comb: {opens} opens, {} interference blocks",
+            det.interference_blocks()
+        );
+        assert_eq!(opens, 0, "{events:?}");
+        assert!(det.interference_blocks() > 0);
+    }
+
+    #[test]
+    fn signals_get_through_pulsed_comb_bursts() {
+        // One on a comb line, one between lines, both ~10 dB.
+        let sigs = [(256e3, 10.0, 1.0, 4.0), (380e3, 10.0, 1.5, 5.0)];
+        let x = comb_bursts(6.0, &sigs, 23);
+        let plan: Vec<Slot> = (-40..=40).map(|k| slot(k as f64 * 20e3, 16e3)).collect();
+        let (det, events, _) = run(&x, &plan, DetectorParams::default());
+        let block = params().block_secs();
+        let mut got: Vec<(f64, f64, f64)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Close {
+                    slot,
+                    start_block,
+                    end_block,
+                    ..
+                } => Some((
+                    det.slots()[*slot].offset_hz,
+                    (*start_block + det.signal_offset_blocks()) as f64 * block,
+                    *end_block as f64 * block,
+                )),
+                _ => None,
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(got.len(), 2, "{got:?}");
+        for (g, (off, _, on, end)) in got.iter().zip(sigs) {
+            assert!((g.0 - off).abs() < 15e3, "{got:?}");
+            // May start a burst late (nothing opens during one), and ends
+            // with the signal.
+            assert!(g.1 >= on - 0.05 && g.1 < on + 0.25, "{got:?}");
+            assert!((g.2 - end).abs() < 0.1, "{got:?}");
+        }
     }
 
     #[test]
