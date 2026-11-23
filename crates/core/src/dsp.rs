@@ -264,64 +264,83 @@ impl HighPass {
     }
 }
 
-/// Automatic gain control for recorded audio.
+/// Automatic gain control for recorded audio: a speech-level normalizer.
 ///
 /// NBFM transmitters differ a lot in deviation: a handheld's voice can sit
-/// 15-20 dB below a repeater's, so one fixed gain leaves some recordings
-/// barely audible and clips others. This follows the audio's peak
-/// envelope and steers the gain to put speech peaks near `target`, between
-/// `min` and `max`.
+/// 15-20 dB below a repeater's, and one repeater recording often holds
+/// several people at different levels. This measures the audio in 20 ms
+/// frames, keeps only the frames that are speech (well above the quietest
+/// recent frames, which are the channel's own noise), and averages their
+/// level over about half a second of speech. The gain steers that speech
+/// level to `target` RMS (-18 dBFS) and moves smoothly (0.2 s), so it
+/// follows a new speaker within a second without riding individual words.
 ///
-/// A transmission plays its first 0.1 s of audio at unity gain while the
-/// AGC measures its peak, then the gain jumps once to the level that peak
-/// calls for. After that it moves slowly (half a second down, three
-/// seconds up), so it settles on a level per transmission rather than
-/// riding every word; it drops within milliseconds only when the audio
-/// would reach the limiter.
-/// While the squelch is muted the gain holds, so silence never winds it
-/// up. A soft limiter catches the onsets the gain has not yet caught.
+/// Pauses, the repeater's carrier between overs and anything muted by the
+/// squelch never change the gain, so silence is not pumped up. The gain is
+/// set straight away from the first speech frame of a transmission and is
+/// held between `min` and `max`. A soft limiter catches peaks.
 #[derive(Debug, Clone)]
 pub struct Agc {
     gain: f32,
-    env: f32,
+    /// Gain the smoothing heads for.
+    want: f32,
+    /// Speech level (RMS, linear), or 0 before the first speech frame.
+    level: f32,
+    /// Level of the quietest recent frames (the noise between words).
+    floor: f32,
     target: f32,
     min: f32,
     max: f32,
-    /// Per-sample envelope decay factor.
-    env_decay: f32,
-    /// Per-sample smoothing coefficients for falling and rising gain.
-    down: f32,
-    /// Falling gain when the audio would reach the limiter.
-    down_fast: f32,
-    up: f32,
-    /// Samples of audio left to measure before the first gain setting.
-    settle: u32,
+    /// Samples per frame, and the current frame's sum of squares and count.
+    frame: usize,
+    acc: f64,
+    n: usize,
+    /// Per-frame smoothing of the speech level (in dB terms), per-frame
+    /// rise of the noise floor, and per-sample gain smoothing.
+    level_k: f32,
+    floor_rise: f32,
+    gain_k: f32,
+    limit_k: f32,
+    /// Frames still to skip after the squelch opens: the first ones hold
+    /// the unmute ramp and filter settling, which would read too quiet.
+    skip: u32,
 }
 
 impl Agc {
-    /// Speech peaks land here (-6 dBFS); speech RMS then sits near -20 dBFS.
-    pub const TARGET: f32 = 0.5;
+    /// Speech RMS lands here (-20 dBFS).
+    pub const TARGET: f32 = 0.1;
     /// Most gain, relative to full deviation reading 1.0 (30 dB over that):
-    /// enough to bring a light-deviation handheld (~250 Hz rms, ~-44 dBFS
-    /// at the old fixed gain) up to the target.
+    /// enough to bring a light-deviation handheld (~250 Hz rms) up to the
+    /// target.
     pub const MAX_GAIN: f32 = 32.0;
     pub const MIN_GAIN: f32 = 0.25;
-    /// Gain at the start of a transmission.
-    pub const START_GAIN: f32 = 1.0;
+    /// Gain until the first speech frame is measured (~60 ms): the least,
+    /// so a transmission never starts louder than it goes on.
+    pub const START_GAIN: f32 = Self::MIN_GAIN;
+    /// A frame is speech when it is this far over the noise floor (12 dB).
+    const SPEECH_OVER_FLOOR: f32 = 2.8;
+    const SKIP_FRAMES: u32 = 2;
 
     pub fn new(rate: f64) -> Self {
-        let coef = |secs: f64| (1.0 - (-1.0 / (secs * rate)).exp()) as f32;
+        let frame = ((0.02 * rate).round() as usize).max(1);
+        let frames_per_s = rate / frame as f64;
         Agc {
             gain: Self::START_GAIN,
-            env: 0.0,
+            want: Self::START_GAIN,
+            level: 0.0,
+            floor: 0.0,
             target: Self::TARGET,
             min: Self::MIN_GAIN,
             max: Self::MAX_GAIN,
-            env_decay: (-1.0 / (3.0 * rate)).exp() as f32,
-            down: coef(0.5),
-            down_fast: coef(0.005),
-            up: coef(3.0),
-            settle: (0.1 * rate) as u32,
+            frame,
+            acc: 0.0,
+            n: 0,
+            level_k: (1.0 - (-1.0 / (0.3 * frames_per_s)).exp()) as f32,
+            // 3 dB a second.
+            floor_rise: 10f32.powf(3.0 / 20.0 / frames_per_s as f32),
+            gain_k: (1.0 - (-1.0 / (0.1 * rate)).exp()) as f32,
+            limit_k: (1.0 - (-1.0 / (0.005 * rate)).exp()) as f32,
+            skip: Self::SKIP_FRAMES,
         }
     }
 
@@ -330,35 +349,72 @@ impl Agc {
     }
 
     /// Apply the gain to `buf` in place. With `adapt` false (squelch
-    /// muted) the gain and envelope hold.
+    /// muted) the gain heads for where it was going but nothing new is
+    /// measured.
     pub fn process(&mut self, buf: &mut [f32], adapt: bool) {
         for v in buf {
             if adapt {
-                self.env = v.abs().max(self.env * self.env_decay);
-                let want = if self.env > 0.0 {
-                    (self.target / self.env).clamp(self.min, self.max)
-                } else {
-                    self.max
-                };
-                if self.settle > 0 {
-                    self.settle -= 1;
-                    if self.settle == 0 {
-                        self.gain = want;
-                    }
-                } else {
-                    let k = if want >= self.gain {
-                        self.up
-                    } else if self.env * self.gain > SOFT_KNEE {
-                        self.down_fast
+                self.acc += (*v as f64) * (*v as f64);
+                self.n += 1;
+                if self.n == self.frame {
+                    let rms = (self.acc / self.n as f64).sqrt() as f32;
+                    if self.skip > 0 {
+                        self.skip -= 1;
                     } else {
-                        self.down
-                    };
-                    // Smoothed in log terms, so the gain moves at the same
-                    // rate in dB whichever way it goes.
-                    self.gain *= (want / self.gain).powf(k);
+                        self.end_frame(rms);
+                    }
+                    self.acc = 0.0;
+                    self.n = 0;
                 }
+            } else {
+                self.acc = 0.0;
+                self.n = 0;
+                self.skip = Self::SKIP_FRAMES;
+            }
+            // Smoothed in log terms, so the gain moves at the same rate in dB
+            // whichever way it goes.
+            if self.gain != self.want {
+                self.gain *= (self.want / self.gain).powf(self.gain_k);
+            }
+            // A peak that would reach the limiter pulls the gain down within
+            // ~5 ms, and the aim with it, so it does not climb straight back.
+            let out = (*v * self.gain).abs();
+            if out > SOFT_KNEE {
+                self.gain *= (SOFT_KNEE / out).powf(self.limit_k);
+                self.want = self.want.min(self.gain);
             }
             *v = soft_limit(*v * self.gain);
+        }
+    }
+
+    fn end_frame(&mut self, rms: f32) {
+        if rms <= 0.0 {
+            return;
+        }
+        // The noise floor follows the quietest frames down at once and
+        // creeps up otherwise. The first frame puts it 24 dB down, taking
+        // the first sound to be speech.
+        if self.floor == 0.0 {
+            self.floor = rms / 16.0;
+        } else if rms < self.floor {
+            self.floor = rms;
+        } else {
+            self.floor *= self.floor_rise;
+        }
+        if rms < self.floor * Self::SPEECH_OVER_FLOOR {
+            return;
+        }
+        let first = self.level == 0.0;
+        self.level = if first {
+            rms
+        } else {
+            // Averaged in power: loud syllables weigh more than quiet ones,
+            // so the peaks of speech, not its pauses, set the level.
+            (self.level * self.level + self.level_k * (rms * rms - self.level * self.level)).sqrt()
+        };
+        self.want = (self.target / self.level).clamp(self.min, self.max);
+        if first {
+            self.gain = self.want;
         }
     }
 }
@@ -517,8 +573,7 @@ mod tests {
             let mut x: Vec<f32> = tone(rate, 1000.0, 24000).iter().map(|v| v * amp).collect();
             agc.process(&mut x, true);
             // Settled over the last second.
-            let peak = x[16000..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            levels.push(peak);
+            levels.push(rms(&x[16000..]));
             assert!(x.iter().all(|v| v.abs() <= 1.0));
         }
         // Inputs 30 dB apart come out within 1 dB of the target.
@@ -538,13 +593,69 @@ mod tests {
         assert!((agc.gain() - Agc::MAX_GAIN).abs() < 0.1, "{}", agc.gain());
         // Muted: the gain stays where it was, however long the silence.
         let mut agc = Agc::new(rate);
-        let mut loud: Vec<f32> = tone(rate, 1000.0, 8000).iter().map(|v| v * 0.5).collect();
+        let mut loud: Vec<f32> = tone(rate, 1000.0, 8000).iter().map(|v| v * 0.2).collect();
         agc.process(&mut loud, true);
         let g = agc.gain();
         let mut silence = vec![0.0f32; 40000];
         agc.process(&mut silence, false);
         assert_eq!(agc.gain(), g);
         assert!(silence.iter().all(|&v| v == 0.0));
+    }
+
+    /// "Speech": 1 kHz bursts of `amp` (0.3 s on, 0.1 s off) over noise
+    /// of `noise` RMS, for `secs`.
+    fn talk(rate: f64, secs: f64, amp: f32, noise: f32, seed: &mut u32) -> Vec<f32> {
+        let n = (secs * rate) as usize;
+        (0..n)
+            .map(|i| {
+                *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let r = ((*seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 3.46 * noise;
+                let t = i as f64 / rate;
+                let on = t % 0.4 < 0.3;
+                r + if on {
+                    amp * (2.0 * PI * 1000.0 * t).sin() as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agc_follows_a_new_speaker_and_ignores_pauses() {
+        // A repeater recording: one speaker, a 1.5 s pause on the carrier,
+        // then a second speaker 20 dB quieter.
+        let rate = 8000.0;
+        let mut seed = 7;
+        let mut x = talk(rate, 4.0, 0.3, 0.003, &mut seed);
+        let pause_at = x.len();
+        x.extend(talk(rate, 1.5, 0.0, 0.003, &mut seed));
+        let second_at = x.len();
+        x.extend(talk(rate, 4.0, 0.03, 0.003, &mut seed));
+        let mut agc = Agc::new(rate);
+        let mut gains = Vec::new();
+        for c in x.chunks_mut(160) {
+            agc.process(c, true);
+            gains.push(agc.gain());
+        }
+        let db = |a: &[f32]| 20.0 * (rms(a) / Agc::TARGET).log10();
+        // Each speaker's last 2 s within 1.5 dB of the target (the RMS
+        // includes the short gaps between bursts, ~1.2 dB below a burst).
+        let first = db(&x[pause_at - 16000..pause_at]);
+        let second = db(&x[x.len() - 16000..]);
+        assert!((first + 1.2).abs() < 1.5, "first {first}");
+        assert!((second + 1.2).abs() < 1.5, "second {second}");
+        // The pause does not wind the gain up.
+        let g_pause_start = gains[pause_at / 160];
+        let g_pause_end = gains[second_at / 160 - 1];
+        let drift = 20.0 * (g_pause_end / g_pause_start).log10();
+        assert!(drift.abs() < 1.0, "gain moved {drift} dB in the pause");
+        // Within a speaker the gain holds steady (no riding each word).
+        let steady = &gains[(pause_at - 16000) / 160..pause_at / 160];
+        let (lo, hi) = steady
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(l, h), &g| (l.min(g), h.max(g)));
+        assert!(20.0 * (hi / lo).log10() < 1.0, "gain range {lo}..{hi}");
     }
 
     #[test]
