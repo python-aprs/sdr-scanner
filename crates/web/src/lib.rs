@@ -1916,6 +1916,7 @@ mod tests {
             locked_out: false,
             pair_hz: None,
             overridden: false,
+            spur: false,
         });
         let (status, body) = get(&state, "/api/v1/channels", None, None).await;
         assert_eq!(status, StatusCode::OK);
@@ -1964,6 +1965,7 @@ mod tests {
             locked_out: false,
             pair_hz: None,
             overridden: false,
+            spur: false,
         });
         {
             let mut g = state.status.write().unwrap();

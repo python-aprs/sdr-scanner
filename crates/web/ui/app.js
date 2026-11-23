@@ -892,7 +892,8 @@
       h('td', {}, active.has(c.freq_hz) ? h('span', { class: 'badge live' }, 'On air') : null,
         c.priority ? h('span', { class: 'badge prio' }, 'Priority') : null,
         c.locked_out ? h('span', { class: 'badge lock' }, 'Locked out') : null,
-        c.overridden ? h('span', { class: 'badge', title: 'Changed in the web UI; Reset goes back to the config file' }, 'Edited') : null),
+        c.spur ? h('span', { class: 'badge', title: 'Locked out automatically: a carrier that stayed on with a steady level, like a birdie or a beacon. Reset or Remove to unlock.' }, 'Spur') : null,
+        c.overridden && !c.spur ? h('span', { class: 'badge', title: 'Changed in the web UI; Reset goes back to the config file' }, 'Edited') : null),
       h('td', { class: 'mono' }, c.pair_hz ? h('a', { href: `#/channels`, onclick: (e) => { e.preventDefault(); e.stopPropagation(); jump(c.pair_hz); } }, `${c.kind === 'repeater_output' ? 'in' : 'out'} ${MHZ(c.pair_hz, 4)}`) : null),
       h('td', { class: 'actions' }, isAdmin() ? actions(c) : null))) :
         [h('tr', {}, h('td', { colspan: 8, class: 'empty' }, state.channels.length ? 'No channels match.' : 'No channel list (is live status private?).'))]));

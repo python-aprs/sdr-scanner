@@ -58,7 +58,13 @@ pub struct ChannelInfo {
     /// Lockout or priority differs from the config file because of an edit
     /// (undo with `DELETE /api/v1/channels/{freq_hz}/override`).
     pub overridden: bool,
+    /// Locked out automatically as a steady carrier, until an admin
+    /// reviews it (an edit or Reset clears this).
+    pub spur: bool,
 }
+
+/// `updated_by` on a lockout the spur detector made.
+pub const SPUR_DETECTOR: &str = "spur detector";
 
 pub type ChannelsHandle = Arc<RwLock<Vec<ChannelInfo>>>;
 

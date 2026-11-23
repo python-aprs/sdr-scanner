@@ -13,6 +13,7 @@ use scanner_core::units::Hz;
 use scanner_sources::{FileSource, Source, SourceInfo, ring};
 use scanner_store::Recorder;
 use scanner_store::settings::{Override, Settings};
+use scanner_web::live::SPUR_DETECTOR;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -224,6 +225,13 @@ fn start_sdrplay(
     )
 }
 
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 /// The watched slots as the web channel list shows them.
 /// Half-width of a lockout placed on a frequency that isn't a watched slot
 /// (an off-grid signal a grid slot retunes onto, or a birdie).
@@ -285,6 +293,9 @@ fn channel_list(
                 overridden: overrides
                     .iter()
                     .any(|o| (o.freq_hz as f64 - s.freq).abs() < 1.0),
+                spur: overrides.iter().any(|o| {
+                    (o.freq_hz as f64 - s.freq).abs() < 1.0 && o.updated_by == SPUR_DETECTOR
+                }),
             }
         })
         .chain(
@@ -301,6 +312,7 @@ fn channel_list(
                     locked_out: true,
                     pair_hz: None,
                     overridden: true,
+                    spur: o.updated_by == SPUR_DETECTOR,
                 }),
         )
         .collect()
@@ -566,6 +578,29 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         scanner.set_live(live_tx.is_some() && audio_hub.wanted());
         scanner.push(&buf[..k], &mut out);
         busy += t.elapsed();
+        let spurs = scanner.take_spurs();
+        if !spurs.is_empty() {
+            for &f in &spurs {
+                eprintln!(
+                    "  spur  {} steady for {:.0} s: recording dropped, locked out (Channels page to review)",
+                    Hz(f),
+                    o.scanner.spur_secs
+                );
+                if let Err(e) =
+                    settings.set(f.round() as i64, Some(true), None, now_ns(), SPUR_DETECTOR)
+                {
+                    eprintln!("saving spur lockout: {e}");
+                }
+            }
+            match settings.overrides() {
+                Ok(list) => {
+                    apply_overrides(&mut scanner, &base, &list, &mut out);
+                    overrides = list;
+                    publish_channels(&scanner, &overrides);
+                }
+                Err(e) => eprintln!("reading overrides: {e}"),
+            }
+        }
         if let Some(tx) = &live_tx {
             let mut live = Vec::new();
             scanner.take_live(&mut live);

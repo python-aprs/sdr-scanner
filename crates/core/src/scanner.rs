@@ -43,6 +43,12 @@ pub struct ScannerConfig {
     pub noise_squelch_db: f32,
     /// Tag transmissions with their CTCSS tone or DCS code.
     pub tones: bool,
+    /// Spur detection: a transmission that has stayed on this long (s)
+    /// with its audio level steady to within `spur_spread_db` (standard
+    /// deviation of its level in 100 ms frames) is a carrier, not a voice: its
+    /// recording is thrown away and the frequency locked out. 0 disables.
+    pub spur_secs: f64,
+    pub spur_spread_db: f32,
     /// Lowest channel IQ rate.
     pub min_channel_rate: f64,
     /// Process channels in parallel.
@@ -68,6 +74,8 @@ impl Default for ScannerConfig {
             // reads 2-5 dB. 8 dB opens from about 4 dB SNR.
             noise_squelch_db: 8.0,
             tones: true,
+            spur_secs: 300.0,
+            spur_spread_db: 2.0,
             min_channel_rate: 25_000.0,
             parallel: true,
             grid_tune_step: 2500.0,
@@ -102,8 +110,15 @@ pub struct TxEnd {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
     Open(TxStart),
-    Audio { id: u64, samples: Vec<f32> },
+    Audio {
+        id: u64,
+        samples: Vec<f32>,
+    },
     Close(TxEnd),
+    /// Throw the recording away (it turned out to be a spur).
+    Discard {
+        id: u64,
+    },
 }
 
 /// Audio for live listeners, sent as soon as it is demodulated (recordings
@@ -140,6 +155,8 @@ pub struct ScannerStats {
     pub not_recorded: u64,
     /// Grid detections that retuned onto a signal already being recorded.
     pub duplicates: u64,
+    /// Steady carriers found and locked out (see `ScannerConfig::spur_secs`).
+    pub spurs: u64,
     pub max_concurrent: usize,
 }
 
@@ -155,6 +172,18 @@ struct Chain {
     resampler: Resampler,
     hp: Option<HighPass>,
     tone: Option<ToneDetector>,
+    /// Audio level (dB) after the high-pass in 100 ms frames, `None` for
+    /// a frame with any muted audio, newest last; and the frame being
+    /// summed (sum of squares, samples, any muted). Speech swings 10 dB
+    /// and more from frame to frame; a carrier, plain or with a steady
+    /// tone, barely moves.
+    levels: VecDeque<Option<f32>>,
+    level_acc: (f64, usize, bool),
+    /// Set when a new level is in.
+    level_new: bool,
+    /// Audio samples per level, and levels kept.
+    level_len: usize,
+    levels_max: usize,
     gain: f32,
     agc: Option<Agc>,
     /// Discriminator samples released unmuted so far.
@@ -265,6 +294,21 @@ impl Chain {
         if let Some(h) = &mut self.hp {
             h.process(new);
         }
+        let (acc, n, muted) = &mut self.level_acc;
+        *muted |= !play;
+        for &v in new.iter() {
+            *acc += v as f64 * v as f64;
+            *n += 1;
+            if *n == self.level_len {
+                let db = 10.0 * (*acc / *n as f64).max(1e-20).log10();
+                self.levels.push_back((!*muted).then_some(db as f32));
+                if self.levels.len() > self.levels_max {
+                    self.levels.pop_front();
+                }
+                self.level_new = true;
+                (*acc, *n, *muted) = (0.0, 0, !play);
+            }
+        }
         if let Some(agc) = &mut self.agc {
             agc.process(new, play);
         } else {
@@ -272,6 +316,24 @@ impl Chain {
                 *v = soft_limit(*v * self.gain);
             }
         }
+    }
+
+    /// Whether the levels so far say this is a steady carrier: a full
+    /// window of frames, none muted, spread under `spread_db`. Checked
+    /// once per new level.
+    fn is_spur(&mut self, spread_db: f32) -> bool {
+        if !std::mem::take(&mut self.level_new)
+            || self.levels_max == 0
+            || self.levels.len() < self.levels_max
+        {
+            return false;
+        }
+        let Some(v) = self.levels.iter().copied().collect::<Option<Vec<f32>>>() else {
+            return false;
+        };
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32;
+        var.sqrt() < spread_db
     }
 
     /// Seconds of audio released unmuted.
@@ -322,6 +384,8 @@ pub struct Scanner {
     lockouts: Vec<(f64, f64)>,
     /// Live audio for listeners, when someone is listening.
     live: Option<Vec<LiveAudio>>,
+    /// Spurs found since the last `take_spurs` (frequencies, Hz).
+    new_spurs: Vec<f64>,
 }
 
 impl Scanner {
@@ -360,6 +424,7 @@ impl Scanner {
             last_block: None,
             lockouts: Vec::new(),
             live: None,
+            new_spurs: Vec::new(),
             cfg,
         }
     }
@@ -480,6 +545,14 @@ impl Scanner {
                 c.live_sent = Some(total);
             }
         }
+    }
+
+    /// Steady carriers found since the last call (frequencies, Hz). Each
+    /// is already locked out in this scanner; keep it locked out with
+    /// [`Scanner::set_lockouts`] or the slot's flags if the lockouts are
+    /// set again.
+    pub fn take_spurs(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.new_spurs)
     }
 
     fn locked_out(&self, freq: f64) -> bool {
@@ -630,6 +703,35 @@ impl Scanner {
             }
         }
         self.stats.max_concurrent = self.stats.max_concurrent.max(self.chains.len());
+        if self.cfg.spur_secs > 0.0 {
+            self.drop_spurs(out);
+        }
+    }
+
+    /// Throw away recordings that turned out to be steady carriers, and
+    /// lock their frequencies out.
+    fn drop_spurs(&mut self, out: &mut Vec<Output>) {
+        let spread = self.cfg.spur_spread_db;
+        let found: Vec<usize> = self
+            .chains
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, c)| c.is_spur(spread).then_some(i))
+            .collect();
+        for i in found.into_iter().rev() {
+            let c = self.chains.swap_remove(i);
+            if let (Some(live), Some(_)) = (&mut self.live, c.live_sent) {
+                live.push(LiveAudio::End { id: c.id });
+            }
+            if c.confirmed {
+                out.push(Output::Discard { id: c.id });
+            }
+            let f = c.tuned.freq;
+            let half = (self.cfg.grid_tune_step / 2.0).max(500.0);
+            self.lockouts.push((f - half, f + half));
+            self.new_spurs.push(f);
+            self.stats.spurs += 1;
+        }
     }
 
     /// Audio held back so that a close can trim the hang time.
@@ -727,6 +829,11 @@ impl Scanner {
                     hp: (self.cfg.highpass_hz > 0.0)
                         .then(|| HighPass::new(audio_rate, self.cfg.highpass_hz)),
                     tone: self.cfg.tones.then(|| ToneDetector::new(audio_rate)),
+                    levels: VecDeque::new(),
+                    level_acc: (0.0, 0, false),
+                    level_new: false,
+                    level_len: self.cfg.audio_rate as usize / 10,
+                    levels_max: (self.cfg.spur_secs * 10.0).ceil() as usize,
                     gain: self.cfg.audio_gain,
                     agc: self.cfg.agc.then(|| Agc::new(audio_rate)),
                     played: 0,
@@ -1326,6 +1433,61 @@ mod tests {
             }))
         );
         assert_eq!(make(&|_| 0.0), Some(None));
+    }
+
+    #[test]
+    fn steady_carriers_are_dropped_and_locked_out() {
+        let fs = params().sample_rate;
+        let cfg = ScannerConfig {
+            spur_secs: 3.0,
+            ..Default::default()
+        };
+        // A carrier with modulation `dev(t)` from 0.3 to 6 s.
+        let run = |dev: &dyn Fn(f64) -> f64| {
+            let mut x = scene(7.0, &[]);
+            let mut ph = 0.0f64;
+            for (i, v) in x.iter_mut().enumerate() {
+                let t = i as f64 / fs;
+                if (0.3..6.0).contains(&t) {
+                    let f = 100e3 + dev(t) * (2.0 * PI * 800.0 * t).sin();
+                    ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
+                    *v += Complex32::from_polar(0.1, ph as f32);
+                }
+            }
+            let mut s = Scanner::with_params(
+                cfg.clone(),
+                params(),
+                0.0,
+                SystemTime::UNIX_EPOCH,
+                &[slot(100e3)],
+            );
+            let mut out = Vec::new();
+            for c in x.chunks(50_000) {
+                s.push(c, &mut out);
+            }
+            s.finish(&mut out);
+            (out, s.stats(), s.take_spurs())
+        };
+        // Unmodulated, and a steady tone: spurs.
+        for dev in [0.0, 2000.0] {
+            let (out, stats, spurs) = run(&|_| dev);
+            assert_eq!(stats.spurs, 1, "{dev}: {stats:?}");
+            assert_eq!(spurs, vec![100e3]);
+            assert!(closes(&out).is_empty(), "{dev}");
+            let id = out
+                .iter()
+                .find_map(|o| match o {
+                    Output::Open(s) => Some(s.id),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(out.contains(&Output::Discard { id }));
+        }
+        // Speech-like (talking in bursts with pauses): kept.
+        let (out, stats, spurs) = run(&|t| if t % 0.7 < 0.4 { 3000.0 } else { 0.0 });
+        assert_eq!(stats.spurs, 0, "{stats:?}");
+        assert!(spurs.is_empty());
+        assert_eq!(closes(&out).len(), 1);
     }
 
     #[test]

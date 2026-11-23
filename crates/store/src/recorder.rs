@@ -31,6 +31,8 @@ pub struct RecorderStats {
     pub opus_bytes: u64,
     /// Opus copies abandoned after an error (the WAV is still kept).
     pub opus_errors: u64,
+    /// Recordings thrown away part-way (a carrier found to be a spur).
+    pub discarded: u64,
     /// Index row ids completed by this recorder, in close order.
     pub rows: Vec<i64>,
 }
@@ -191,6 +193,20 @@ impl Recorder {
                     }
                 }
             }
+            Output::Discard { id } => {
+                if let Some(o) = self.open.remove(&id) {
+                    if let Err(e) = o.wav.abort() {
+                        eprintln!("discarding {}: {e}", o.rel);
+                    }
+                    if let Some((orel, w)) = o.opus
+                        && let Err(e) = w.abort()
+                    {
+                        eprintln!("discarding {orel}: {e}");
+                    }
+                    self.index.delete(o.row)?;
+                    self.stats.discarded += 1;
+                }
+            }
             Output::Close(end) => {
                 if let Some(o) = self.open.remove(&end.id) {
                     let rate = o.start.audio_rate;
@@ -297,7 +313,7 @@ mod tests {
             relative_path(&start),
             "2026/11/22/146.5200_20261122T065403.123Z.wav"
         );
-        r.handle(Output::Open(start)).unwrap();
+        r.handle(Output::Open(start.clone())).unwrap();
         r.handle(Output::Audio {
             id: 7,
             samples: vec![0.1; 8000],
@@ -327,5 +343,25 @@ mod tests {
         assert_eq!(&opus[..4], b"OggS");
         assert_eq!(r.stats().files, 1);
         assert_eq!((r.stats().opus_files, r.stats().opus_errors), (1, 0));
+
+        // A discarded recording leaves no files and no row.
+        let mut start = start;
+        start.id = 8;
+        start.start_time += Duration::from_secs(60);
+        r.handle(Output::Open(start)).unwrap();
+        r.handle(Output::Audio {
+            id: 8,
+            samples: vec![0.1; 8000],
+        })
+        .unwrap();
+        r.handle(Output::Discard { id: 8 }).unwrap();
+        assert_eq!(r.index().recent(5).unwrap().len(), 1);
+        assert_eq!(r.stats().discarded, 1);
+        let day = dir.path().join("2026/11/22");
+        let names: Vec<_> = std::fs::read_dir(&day)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 }

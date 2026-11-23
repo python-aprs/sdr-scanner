@@ -211,6 +211,12 @@ struct Tuning {
     /// channel's power out of recordings. 0 turns it off.
     #[arg(long, default_value_t = 8.0)]
     noise_squelch: f32,
+    /// Spur detection: a transmission that stays on this many seconds with
+    /// a level that hardly moves (a carrier, plain or with a steady tone)
+    /// is a spur. Its recording is dropped and the frequency locked out
+    /// until reviewed on the Channels page. 0 turns it off.
+    #[arg(long, default_value_t = 300.0)]
+    spur_secs: f64,
     /// Drop transmissions shorter than this (seconds).
     #[arg(long, default_value_t = 0.3)]
     min_len: f64,
@@ -291,6 +297,7 @@ impl Tuning {
             deemphasis: profile.deemphasis,
             min_len: self.min_len,
             noise_squelch_db: self.noise_squelch,
+            spur_secs: self.spur_secs,
             parallel: !self.serial,
             ..Default::default()
         }
@@ -666,6 +673,7 @@ fn run(a: RunArgs) -> Result<()> {
                 "recorded": stats.recorded,
                 "discarded_short": stats.discarded_short,
                 "discarded_silent": stats.discarded_silent,
+                "spurs": stats.spurs,
                 "not_recorded": stats.not_recorded,
                 "duplicates": stats.duplicates,
                 "max_concurrent": stats.max_concurrent,

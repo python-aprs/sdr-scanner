@@ -55,6 +55,16 @@ checked against the Golay code and the 104 standard codes. A DCS code and
 its inverted partner are the same waveform (023 N is 047 I); the
 normal-polarity name wins.
 
+Spur detection (`--spur-secs`, 300 by default): each recording keeps its
+audio level in 100 ms frames. Once it has been on for `--spur-secs` with no
+muted frame and a level spread (standard deviation) under 2 dB, it is a
+carrier, plain or with a steady tone, not someone talking: speech swings
+10 dB and more between frames. The recording is thrown away
+(`Output::Discard`: files and index row removed) and the frequency locked
+out. `serve` saves the lockout as a channel override by `spur detector`,
+so it survives restarts and shows as "Spur" on the Channels page until an
+admin unlocks or resets it.
+
 `scanner serve --source loop:<recording> --config ... --profile ...` is the
 long-running mode: a radio thread pushes samples into a lock-free ring
 (`scanner_sources::ring`, drops counted and zero-filled so timestamps never
