@@ -152,9 +152,19 @@ def test_scanner_decodes_aprs_packets(tmp_path):
     sc.signals = [s]
     writer.write(sc, tmp_path / "afsk")
     out = subprocess.run(
-        [SCANNER, "run", str(tmp_path / "afsk.sigmf-meta"), "--config", str(REPO / "config" / "rainier.toml"),
-         "--out", str(tmp_path / "out"), "--json"],
-        check=True, capture_output=True, text=True,
+        [
+            SCANNER,
+            "run",
+            str(tmp_path / "afsk.sigmf-meta"),
+            "--config",
+            str(REPO / "config" / "rainier.toml"),
+            "--out",
+            str(tmp_path / "out"),
+            "--json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     assert json.loads(out)["packets"] == 3
     db = sqlite3.connect(tmp_path / "out" / "index.sqlite")
