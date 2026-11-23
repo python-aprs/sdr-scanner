@@ -353,6 +353,12 @@
   }
 
   // ---------- player ----------
+  // Play the small Opus copy where the browser can (all current ones,
+  // Safari since 17), else the WAV.
+  const playsOpus = (() => {
+    try { return document.createElement('audio').canPlayType('audio/ogg; codecs=opus') !== ''; } catch (_) { return false; }
+  })();
+  const playUrl = (r) => (r.opus_path && playsOpus ? r.audio_url : r.wav_url);
   const player = {
     list: [], index: -1,
     play(list, index) {
@@ -360,7 +366,7 @@
       const r = list[index];
       if (!r) return;
       const audio = $('#audio');
-      audio.src = r.audio_url;
+      audio.src = playUrl(r);
       audio.play().catch(() => {});
       $('#player').hidden = false;
       document.body.classList.add('has-player');
@@ -783,7 +789,7 @@
             h('td', { class: 'grow' }, r.channel || channelName(r.freq_hz) || h('span', { class: 'muted' }, kindLabel[r.origin] || r.origin)),
             h('td', { class: 'num mono' }, fmtSecs(r.audio_secs)),
             h('td', { class: 'num mono' }, r.peak_snr_db === null ? '' : fmtDb(r.peak_snr_db)),
-            h('td', {}, canAudio() ? h('a', { href: r.audio_url, download: '', onclick: (e) => e.stopPropagation(), title: 'Download WAV' }, 'WAV') : null)));
+            h('td', {}, canAudio() ? h('a', { href: r.wav_url, download: '', onclick: (e) => e.stopPropagation(), title: 'Download WAV' }, 'WAV') : null)));
         }
         next = res.items.length === 100 ? res.next_before_id : null;
         more.hidden = next === null;

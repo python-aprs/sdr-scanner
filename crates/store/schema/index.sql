@@ -14,6 +14,6 @@ CREATE TABLE transmissions (
     wav_path    TEXT    NOT NULL,
     wav_bytes   INTEGER,
     status      TEXT    NOT NULL DEFAULT 'recording'
-);
+, opus_path TEXT, opus_bytes INTEGER);
 CREATE INDEX transmissions_freq ON transmissions(freq_hz, start_ns);
 CREATE INDEX transmissions_start ON transmissions(start_ns);

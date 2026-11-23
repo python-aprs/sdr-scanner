@@ -212,6 +212,9 @@ struct Tuning {
     /// Run channels on one thread.
     #[arg(long)]
     serial: bool,
+    /// Skip the Opus copy of each recording (the web UI then plays the WAV).
+    #[arg(long)]
+    no_opus: bool,
 }
 
 impl Tuning {
@@ -334,6 +337,7 @@ fn main() -> Result<()> {
                 plan: &plan.slots,
                 span: (profile.span.start.0, profile.span.stop.0),
                 out: &a.tuning.out,
+                opus: !a.tuning.no_opus,
                 status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
             })
         }
@@ -543,7 +547,7 @@ fn run(a: RunArgs) -> Result<()> {
         );
     }
 
-    let recorder = Recorder::new(&a.tuning.out)?;
+    let recorder = Recorder::new(&a.tuning.out)?.with_opus(!a.tuning.no_opus);
     let (tx, writer) = recorder.spawn(64);
 
     // Reader thread: file I/O and sample conversion overlap with DSP.
@@ -650,13 +654,14 @@ fn run(a: RunArgs) -> Result<()> {
             );
         }
         println!(
-            "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB",
+            "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB WAV, {:.1} MB Opus",
             rec.files,
             stats.opened,
             stats.discarded_short + stats.discarded_silent,
             stats.not_recorded,
             rec.audio_secs,
-            rec.bytes as f64 / 1e6
+            rec.bytes as f64 / 1e6,
+            rec.opus_bytes as f64 / 1e6
         );
         println!(
             "{:.1} s of IQ in {:.2} s ({:.1}x realtime), up to {} channels at once",

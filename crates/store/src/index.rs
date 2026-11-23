@@ -19,10 +19,19 @@ pub enum IndexError {
 pub static SCHEMA: Schema = Schema {
     name: "recordings index",
     application_id: 0x5343_4E49, // "SCNI"
-    migrations: &[Migration {
-        description: "transmissions table",
-        up: Up::Sql(V1),
-    }],
+    migrations: &[
+        Migration {
+            description: "transmissions table",
+            up: Up::Sql(V1),
+        },
+        Migration {
+            description: "Opus copies",
+            up: Up::Sql(
+                "ALTER TABLE transmissions ADD COLUMN opus_path TEXT;
+                 ALTER TABLE transmissions ADD COLUMN opus_bytes INTEGER;",
+            ),
+        },
+    ],
 };
 
 const V1: &str = "
@@ -65,6 +74,9 @@ pub struct Row {
     pub wav_path: String,
     pub wav_bytes: Option<i64>,
     pub status: String,
+    /// The compressed copy the web UI plays, when there is one.
+    pub opus_path: Option<String>,
+    pub opus_bytes: Option<i64>,
 }
 
 /// Filters for [`Index::search`]. `None` means no constraint.
@@ -167,6 +179,15 @@ impl Index {
         Ok(())
     }
 
+    /// Record the Opus copy of a transmission.
+    pub fn set_opus(&self, id: i64, path: &str, bytes: u64) -> Result<(), IndexError> {
+        self.db.execute(
+            "UPDATE transmissions SET opus_path = ?2, opus_bytes = ?3 WHERE id = ?1",
+            params![id, path, bytes as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Row>, IndexError> {
         self.db
             .query_row("SELECT * FROM transmissions WHERE id = ?1", [id], row)
@@ -235,6 +256,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         wav_path: r.get("wav_path")?,
         wav_bytes: r.get("wav_bytes")?,
         status: r.get("status")?,
+        opus_path: r.get("opus_path")?,
+        opus_bytes: r.get("opus_bytes")?,
     })
 }
 
@@ -271,6 +294,11 @@ mod tests {
         let r = ix.get(id).unwrap().unwrap();
         assert_eq!(r.status, "complete");
         assert_eq!(r.wav_bytes, Some(113_644));
+        assert_eq!(r.opus_path, None);
+        ix.set_opus(id, "2026/11/22/x.opus", 14_002).unwrap();
+        let r = ix.get(id).unwrap().unwrap();
+        assert_eq!(r.opus_path.as_deref(), Some("2026/11/22/x.opus"));
+        assert_eq!(r.opus_bytes, Some(14_002));
         assert_eq!(ix.recent(10).unwrap().len(), 1);
     }
 
@@ -370,6 +398,8 @@ mod tests {
         drop(old);
         let ix = Index::open(&p).unwrap();
         assert_eq!(ix.count().unwrap(), 1);
+        let r = ix.get(1).unwrap().unwrap();
+        assert_eq!((r.wav_path.as_str(), r.opus_path), ("a.wav", None));
         let app: i32 = ix
             .db
             .pragma_query_value(None, "application_id", |r| r.get(0))

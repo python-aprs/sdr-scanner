@@ -124,6 +124,8 @@ pub struct ServeOptions<'a> {
     /// The profile's span (Hz), which the web spectrum shows.
     pub span: (f64, f64),
     pub out: &'a Path,
+    /// Also write Opus copies for the web UI.
+    pub opus: bool,
     pub status_every: Duration,
 }
 
@@ -324,7 +326,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         bail!("no slots of the profile fall inside the capture");
     }
 
-    let recorder = Recorder::new(o.out)?;
+    let recorder = Recorder::new(o.out)?.with_opus(o.opus);
     let (tx, writer) = recorder.spawn(256);
 
     // Lockout and priority edits made in the web UI, on top of the config.
