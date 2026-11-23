@@ -6,6 +6,9 @@
 //!
 //! - Text `{"type":"hello", ...}` once, then `{"type":"status", ...}` (the
 //!   [`LiveStatus`](crate::LiveStatus) fields) about once a second.
+//! - Text `{"type":"packet", ...}` (the `/api/v1/packets` row fields) as
+//!   each AX.25 frame is decoded, to callers allowed to see packets
+//!   (`"packets": true` in the hello) while not paused.
 //! - Binary spectrum frames, little-endian: `u8` kind (1), three reserved
 //!   bytes, `f64` start Hz, `f64` stop Hz, `f32` dB of value 0, `f32` dB per
 //!   step of 255, then one `u8` per bin from start to stop.
@@ -22,9 +25,11 @@ use axum::extract::ws::{
 };
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use scanner_store::index::PacketRow;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// The latest display spectrum.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -164,12 +169,18 @@ async fn run(
     caller: Caller,
 ) -> Result<(), axum::Error> {
     let mut sock = crate::egress::Sock::new(sock, s.meter(caller.role));
+    // Packets are shown to whoever may read the packet list.
+    let mut packets = caller
+        .require(s.public.recordings)
+        .is_ok()
+        .then(|| s.packets.subscribe());
     let hello = serde_json::json!({
         "type": "hello",
         "role": caller.role,
         "bins": SPECTRUM_BINS,
         "max_rate": MAX_RATE,
         "rate": DEFAULT_RATE,
+        "packets": packets.is_some(),
     });
     sock.send(Message::Text(hello.to_string().into())).await?;
     let mut rate = DEFAULT_RATE;
@@ -206,17 +217,31 @@ async fn run(
                     _ => {}
                 }
             }
+            pkt = next_packet(&mut packets) => match pkt {
+                Ok(p) => {
+                    if !paused && sock.meter.level() != Level::Spent {
+                        let mut v = serde_json::to_value(&*p).unwrap_or_default();
+                        v["type"] = "packet".into();
+                        sock.send(Message::Text(v.to_string().into())).await?;
+                    }
+                }
+                // A slow client misses some; the Packets page has them all.
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => packets = None,
+            },
             _ = tick.tick() => {
                 let now = tokio::time::Instant::now();
-                if !s.public.live && now >= next_check {
+                let private_packets = packets.is_some() && !s.public.recordings;
+                if (!s.public.live || private_packets) && now >= next_check {
                     next_check = now + RECHECK;
-                    let ok = match s.caller(&headers).await {
-                        Ok(c) => c.require(false).is_ok(),
-                        Err(_) => false,
-                    };
-                    if !ok {
+                    let c = s.caller(&headers).await.ok();
+                    let allowed = |public| c.as_ref().is_some_and(|c| c.require(public).is_ok());
+                    if !allowed(s.public.live) {
                         let _ = sock.send(Message::Close(None)).await;
                         return Ok(());
+                    }
+                    if !allowed(s.public.recordings) {
+                        packets = None;
                     }
                 }
                 if now >= next_status {
@@ -248,6 +273,16 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+/// The next decoded packet, or never when this client gets none.
+async fn next_packet(
+    rx: &mut Option<broadcast::Receiver<Arc<PacketRow>>>,
+) -> Result<Arc<PacketRow>, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

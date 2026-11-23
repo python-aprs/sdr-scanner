@@ -151,6 +151,17 @@ pub struct AppState {
     /// Bytes sent per role and month, and the anonymous budget; `None`
     /// counts nothing.
     pub egress: Option<Arc<egress::Egress>>,
+    /// Packets as they are decoded, for the Live page (see [`live`]).
+    pub packets: PacketFeed,
+}
+
+/// Decoded packets, published by the scanner as they arrive. Sending with no
+/// one subscribed is fine (the packet is dropped).
+pub type PacketFeed = tokio::sync::broadcast::Sender<Arc<scanner_store::index::PacketRow>>;
+
+/// A packet feed with room for a burst of packets per slow client.
+pub fn packet_feed() -> PacketFeed {
+    tokio::sync::broadcast::channel(64).0
 }
 
 /// A command for the running scanner.
@@ -186,6 +197,7 @@ impl AppState {
             audio: None,
             storage: None,
             egress: None,
+            packets: packet_feed(),
         }
     }
 }

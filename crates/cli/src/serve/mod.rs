@@ -167,10 +167,10 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let disk_usage = recorder.disk_usage();
     let (tx, writer) = recorder.spawn(256);
     let kiss = o.kiss.map(Kiss::start).transpose()?;
-    let outputs = Outputs::new(tx, kiss, true);
     // Lockout and priority edits made in the web UI, on top of the config.
     let mut channels = Channels::open(o.out, &mut scanner)?;
     let web = web::Web::start(&o, &session.info, &channels, disk_usage)?;
+    let outputs = Outputs::new(tx, kiss, true).with_packets(web.packets.clone());
 
     let mut tel = telemetry::Telemetry::new();
     let mut next_publish = Instant::now();

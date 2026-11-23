@@ -1,5 +1,5 @@
-//! Where scanner outputs go: the console, KISS clients, and the recorder
-//! thread.
+//! Where scanner outputs go: the console, KISS clients, the web UI's packet
+//! feed, and the recorder thread.
 
 use crate::kiss::Kiss;
 use anyhow::{Context, Result};
@@ -12,6 +12,8 @@ pub struct Outputs {
     kiss: Option<Kiss>,
     /// Print a line per transmission opened and packet decoded.
     log: bool,
+    /// Decoded packets for the Live page.
+    packets: Option<scanner_web::PacketFeed>,
 }
 
 impl Outputs {
@@ -20,7 +22,13 @@ impl Outputs {
             recorder,
             kiss,
             log,
+            packets: None,
         }
+    }
+
+    pub fn with_packets(mut self, feed: scanner_web::PacketFeed) -> Self {
+        self.packets = Some(feed);
+        self
     }
 
     /// Hand a batch on, leaving `out` empty. The recorder takes it last, by
@@ -29,7 +37,7 @@ impl Outputs {
         if out.is_empty() {
             return Ok(());
         }
-        if self.log || self.kiss.is_some() {
+        if self.log || self.kiss.is_some() || self.packets.is_some() {
             for o in out.iter() {
                 match o {
                     Output::Open(s) if self.log => eprintln!(
@@ -43,6 +51,15 @@ impl Outputs {
                         }
                         if let Some(k) = &self.kiss {
                             k.send(&p.frame.raw);
+                        }
+                        // Only live viewers get these, so skip the work when
+                        // there are none.
+                        if let Some(f) = &self.packets
+                            && f.receiver_count() > 0
+                        {
+                            let _ = f.send(std::sync::Arc::new(
+                                scanner_store::index::PacketRow::from_decoded(p),
+                            ));
                         }
                     }
                     _ => {}

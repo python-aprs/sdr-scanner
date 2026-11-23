@@ -474,7 +474,8 @@
     const fall = waterfallCanvas;
     const tip = h('div', { class: 'scope-tip', hidden: true });
     const empty = h('div', { class: 'scope-empty' }, budgetSpent() ? 'Spectrum paused until the data allowance resets' : 'Waiting for the first spectrum…');
-    const scope = h('div', { class: 'scope' }, spec, fall, tip, empty);
+    const toasts = h('div', { class: 'toasts', 'aria-live': 'polite' });
+    const scope = h('div', { class: 'scope' }, spec, fall, tip, empty, toasts);
 
     const activeList = h('ul', { class: 'active-list' });
     const listenCtl = listenControls();
@@ -706,8 +707,25 @@
       }
     }
 
+    // --- packet toasts, just under the spectrum trace ---
+    const TOAST_MS = 6000, MAX_TOASTS = 3;
+    function onPacket(p) {
+      const when = nsDate(p.time_ns);
+      const head = [MHZ(p.freq_hz, 3), p.channel || channelName(p.freq_hz), timeFmt.format(when)].filter(Boolean).join(' · ');
+      const t = h('a', { class: 'toast', href: '#/packets', title: 'All packets' },
+        h('div', { class: 'toast-head' }, head),
+        h('div', { class: 'toast-text mono' }, p.text));
+      toasts.prepend(t);
+      while (toasts.children.length > MAX_TOASTS) toasts.lastChild.remove();
+      setTimeout(() => {
+        t.classList.add('leaving');
+        setTimeout(() => t.remove(), 300);
+      }, TOAST_MS);
+    }
+
     const listener = (kind, p) => {
       if (kind === 'spectrum') onSpectrum(p);
+      else if (kind === 'packet') onPacket(p);
       else if (kind === 'status') onStatusView(p);
       else if (kind === 'private') {
         empty.textContent = 'Live status is private on this scanner. Log in to see it.';
