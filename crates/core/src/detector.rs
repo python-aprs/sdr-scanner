@@ -135,6 +135,9 @@ pub struct Detector {
     slots: Vec<WatchedSlot>,
     states: Vec<SlotState>,
     stats: Vec<SlotStats>,
+    /// Per slot, SNR (linear) smoothed over ~50 ms; see [`Detector::squelch_db`].
+    smooth: Vec<f32>,
+    smooth_alpha: f32,
     /// Smoothed power per bin, shifted order.
     psd: Vec<f32>,
     /// Scratch: raw power per bin, shifted order.
@@ -143,6 +146,11 @@ pub struct Detector {
     seg_bounds: Vec<(usize, usize)>,
     seg_floor: Vec<f32>,
     seg_scratch: Vec<f32>,
+    /// Each segment's level this block (from its median bin).
+    seg_level: Vec<f32>,
+    /// Band-wide noise level this block over the smoothed floor (at least
+    /// 1). See [`Detector::common_ratio`].
+    common: f32,
     alpha: f32,
     floor_alpha: f32,
     blocks_seen: u64,
@@ -172,6 +180,12 @@ const RAW_MEDIAN_TO_MEAN: f32 = std::f32::consts::LOG2_E;
 /// risen as a whole (a gain step or front-end overload), not because of a
 /// few signals in it.
 const STEP_RATIO: f32 = 2.0;
+/// Time constant (s) of the SNR average that must also clear the close
+/// threshold to hold a transmission open. An FM carrier's power is steady,
+/// so averaging costs it nothing; noise alone pokes one block over the
+/// threshold now and then, and on a real RSP1A that was often enough to
+/// hold empty recordings open for minutes.
+const SQUELCH_SMOOTHING: f64 = 0.05;
 
 impl Detector {
     /// Watch the slots of a channel plan that fall inside the capture.
@@ -266,12 +280,16 @@ impl Detector {
             slots,
             states: vec![SlotState::Idle; count],
             stats: vec![SlotStats::default(); count],
+            smooth: vec![0.0; count],
+            smooth_alpha: (block / SQUELCH_SMOOTHING.max(block)).min(1.0) as f32,
             psd: vec![0.0; n],
             raw: vec![0.0; n],
             cumsum: vec![0.0; n + 1],
             seg_bounds,
             seg_floor: vec![0.0; nseg],
             seg_scratch: Vec::new(),
+            seg_level: vec![0.0; nseg],
+            common: 1.0,
             blocks_seen: 0,
             burst_blocks: 0,
             step_blocks: 0,
@@ -291,6 +309,14 @@ impl Detector {
 
     pub fn snr_db(&self, i: usize) -> f32 {
         self.stats[i].snr_db
+    }
+
+    /// The SNR that holds a transmission open and unmutes its audio: the
+    /// lower of this block's SNR and its average over the last ~50 ms. A
+    /// key-up drops it at once; a one-block noise spike does not raise it.
+    pub fn squelch_db(&self, i: usize) -> f32 {
+        let avg = 10.0 * self.smooth[i].max(1e-12).log10();
+        self.stats[i].snr_db.min(avg)
     }
 
     /// Power-weighted centre (offset from the capture centre, Hz) of the
@@ -458,6 +484,7 @@ impl Detector {
             let mid = self.seg_scratch.len() / 2;
             let (_, m, _) = self.seg_scratch.select_nth_unstable_by(mid, f32::total_cmp);
             let level = *m * RAW_MEDIAN_TO_MEAN;
+            self.seg_level[i] = level;
             {
                 let f = &mut self.seg_floor[i];
                 if *f > 0.0 && level > *f * STEP_RATIO {
@@ -498,17 +525,27 @@ impl Detector {
         if step {
             self.step_blocks += 1;
         }
+        self.common = self.common_ratio();
 
-        // SNR per slot.
+        // SNR per slot, against the floor raised by any band-wide rise this
+        // block (see `common_ratio`).
+        let common = self.common as f64;
         for (i, s) in self.slots.iter().enumerate() {
             let p = self.cumsum[s.hi] - self.cumsum[s.lo];
-            let noise = self.seg_floor[s.segment] as f64 * (s.hi - s.lo) as f64;
+            let noise = self.seg_floor[s.segment] as f64 * common * (s.hi - s.lo) as f64;
             let snr = if noise > 0.0 {
                 10.0 * (p / noise).max(1e-12).log10()
             } else {
                 0.0
             };
             self.stats[i].snr_db = snr as f32;
+            let lin = 10f32.powf(snr as f32 / 10.0);
+            let a = if self.blocks_seen <= 1 {
+                1.0
+            } else {
+                self.smooth_alpha
+            };
+            self.smooth[i] += a * (lin - self.smooth[i]);
         }
 
         let b = block.index;
@@ -576,7 +613,7 @@ impl Detector {
             // attack, because FM speech is lopsided from block to block.
             let start =
                 open && (self.slots[i].slot.origin == SlotOrigin::Grid || self.is_centred(i));
-            let stay = snr >= self.params.close_db;
+            let stay = self.squelch_db(i) >= self.params.close_db;
             let st = &mut self.stats[i];
             let next = match self.states[i] {
                 SlotState::Idle if start => SlotState::Attack { since: b },
@@ -660,6 +697,35 @@ impl Detector {
             }
             self.states[i] = next;
         }
+    }
+
+    /// How far the whole band's noise sits above the smoothed floor this
+    /// block: the median over segments of this block's level over the
+    /// floor, at least 1.
+    ///
+    /// The floor follows the noise over seconds, but the noise itself can
+    /// swell by several dB for a few hundred ms at a time across the whole
+    /// band (seen live on an RSP1A at LNA 3 / GR 40, Nov 2026: every slot
+    /// rose 2-6 dB together, several times a second). Against the slow
+    /// floor alone that reads as a weak signal in every slot, which opened
+    /// dozens of empty recordings and then held them open for minutes. A
+    /// rise shared by most segments is noise, not signals: a signal
+    /// occupies a few segments at most, so the median ignores it.
+    fn common_ratio(&mut self) -> f32 {
+        self.seg_scratch.clear();
+        self.seg_scratch.extend(
+            self.seg_level
+                .iter()
+                .zip(&self.seg_floor)
+                .filter(|&(&l, &f)| f > 0.0 && l > 0.0)
+                .map(|(&l, &f)| l / f),
+        );
+        if self.seg_scratch.is_empty() {
+            return 1.0;
+        }
+        let mid = self.seg_scratch.len() / 2;
+        let (_, m, _) = self.seg_scratch.select_nth_unstable_by(mid, f32::total_cmp);
+        m.max(1.0)
     }
 
     /// Blocks in which the broadband-burst guard held slots back.
@@ -848,6 +914,75 @@ mod tests {
         eprintln!("idle mean {mean} max {max}");
         assert!(mean.abs() < 0.5, "mean {mean}");
         assert!(max < 3.0, "max {max}");
+    }
+
+    /// Swell the noise of `x` by up to `rise_db` once a second, as the
+    /// whole band rises and falls back together: a 0.1 s ramp up, 0.4 s
+    /// held, a 0.1 s ramp down. Under 3 dB it never trips the step guard.
+    fn swell(x: &mut [Complex32], rise_db: f64) {
+        let fs = params().sample_rate;
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = (i as f64 / fs).fract();
+            let shape = if t < 0.1 {
+                t / 0.1
+            } else if t < 0.5 {
+                1.0
+            } else if t < 0.6 {
+                (0.6 - t) / 0.1
+            } else {
+                0.0
+            };
+            *v *= 10f64.powf(shape * rise_db / 20.0) as f32;
+        }
+    }
+
+    #[test]
+    fn band_wide_noise_swells_open_nothing() {
+        // Live RSP1A at LNA 3 / GR 40: the whole band's noise rose 2-6 dB
+        // together for a few hundred ms at a time; every slot read as a
+        // weak signal against the slow floor.
+        let mut x = scene(6.0, &[], 5);
+        swell(&mut x, 2.9);
+        let plan: Vec<Slot> = (-30..=30).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let (det, events, snrs) = run(&x, &plan, DetectorParams::default());
+        let opens = events
+            .iter()
+            .filter(|e| matches!(e, Event::Open { .. }))
+            .count();
+        // Blocks reading above the close threshold would hold a
+        // transmission open (and play noise into it).
+        let tail: Vec<f32> = snrs[snrs.len() / 3..].iter().flatten().copied().collect();
+        let over = tail.iter().filter(|&&v| v >= 3.0).count() as f64 / tail.len() as f64;
+        eprintln!(
+            "swell: {opens} opens, {:.3}% of slot-blocks over 3 dB, {} step blocks",
+            over * 100.0,
+            det.step_blocks()
+        );
+        assert_eq!(opens, 0, "{events:?}");
+        assert!(over < 1e-3, "{over}");
+    }
+
+    #[test]
+    fn signal_survives_band_wide_noise_swells() {
+        let mut x = scene(6.0, &[(100e3, 15.0, 1.0, 5.0)], 9);
+        swell(&mut x, 2.9);
+        let plan: Vec<Slot> = (-20..=20).map(|k| slot(k as f64 * 25e3, 16e3)).collect();
+        let (_, events, _) = run(&x, &plan, DetectorParams::default());
+        let opens: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Open { .. }))
+            .collect();
+        assert_eq!(opens.len(), 1, "{events:?}");
+        // It ends when the signal does, not whenever the swells let up.
+        let block = params().block_secs();
+        let end = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Close { end_block, .. } => Some(*end_block as f64 * block),
+                _ => None,
+            })
+            .expect("closed");
+        assert!((end - 5.0).abs() < 0.1, "ended at {end}");
     }
 
     #[test]

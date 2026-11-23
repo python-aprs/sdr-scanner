@@ -1,6 +1,6 @@
 //! Small DSP building blocks shared by the channel chains: FIR design,
-//! a rational polyphase resampler, de-emphasis, a DC-blocking high-pass and
-//! the FM discriminator.
+//! a rational polyphase resampler, de-emphasis, a DC-blocking high-pass,
+//! the FM discriminator and an audio AGC.
 
 use num_complex::Complex32;
 use std::f64::consts::PI;
@@ -264,6 +264,119 @@ impl HighPass {
     }
 }
 
+/// Automatic gain control for recorded audio.
+///
+/// NBFM transmitters differ a lot in deviation: a handheld's voice can sit
+/// 15-20 dB below a repeater's, so one fixed gain leaves some recordings
+/// barely audible and clips others. This follows the audio's peak
+/// envelope and steers the gain to put speech peaks near `target`, between
+/// `min` and `max`.
+///
+/// A transmission plays its first 0.1 s of audio at unity gain while the
+/// AGC measures its peak, then the gain jumps once to the level that peak
+/// calls for. After that it moves slowly (half a second down, three
+/// seconds up), so it settles on a level per transmission rather than
+/// riding every word; it drops within milliseconds only when the audio
+/// would reach the limiter.
+/// While the squelch is muted the gain holds, so silence never winds it
+/// up. A soft limiter catches the onsets the gain has not yet caught.
+#[derive(Debug, Clone)]
+pub struct Agc {
+    gain: f32,
+    env: f32,
+    target: f32,
+    min: f32,
+    max: f32,
+    /// Per-sample envelope decay factor.
+    env_decay: f32,
+    /// Per-sample smoothing coefficients for falling and rising gain.
+    down: f32,
+    /// Falling gain when the audio would reach the limiter.
+    down_fast: f32,
+    up: f32,
+    /// Samples of audio left to measure before the first gain setting.
+    settle: u32,
+}
+
+impl Agc {
+    /// Speech peaks land here (-6 dBFS); speech RMS then sits near -20 dBFS.
+    pub const TARGET: f32 = 0.5;
+    /// Most gain, relative to full deviation reading 1.0 (30 dB over that):
+    /// enough to bring a light-deviation handheld (~250 Hz rms, ~-44 dBFS
+    /// at the old fixed gain) up to the target.
+    pub const MAX_GAIN: f32 = 32.0;
+    pub const MIN_GAIN: f32 = 0.25;
+    /// Gain at the start of a transmission.
+    pub const START_GAIN: f32 = 1.0;
+
+    pub fn new(rate: f64) -> Self {
+        let coef = |secs: f64| (1.0 - (-1.0 / (secs * rate)).exp()) as f32;
+        Agc {
+            gain: Self::START_GAIN,
+            env: 0.0,
+            target: Self::TARGET,
+            min: Self::MIN_GAIN,
+            max: Self::MAX_GAIN,
+            env_decay: (-1.0 / (3.0 * rate)).exp() as f32,
+            down: coef(0.5),
+            down_fast: coef(0.005),
+            up: coef(3.0),
+            settle: (0.1 * rate) as u32,
+        }
+    }
+
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Apply the gain to `buf` in place. With `adapt` false (squelch
+    /// muted) the gain and envelope hold.
+    pub fn process(&mut self, buf: &mut [f32], adapt: bool) {
+        for v in buf {
+            if adapt {
+                self.env = v.abs().max(self.env * self.env_decay);
+                let want = if self.env > 0.0 {
+                    (self.target / self.env).clamp(self.min, self.max)
+                } else {
+                    self.max
+                };
+                if self.settle > 0 {
+                    self.settle -= 1;
+                    if self.settle == 0 {
+                        self.gain = want;
+                    }
+                } else {
+                    let k = if want >= self.gain {
+                        self.up
+                    } else if self.env * self.gain > SOFT_KNEE {
+                        self.down_fast
+                    } else {
+                        self.down
+                    };
+                    // Smoothed in log terms, so the gain moves at the same
+                    // rate in dB whichever way it goes.
+                    self.gain *= (want / self.gain).powf(k);
+                }
+            }
+            *v = soft_limit(*v * self.gain);
+        }
+    }
+}
+
+const SOFT_KNEE: f32 = 0.8;
+
+/// Linear up to 0.8, then a tanh knee that never exceeds 1.0.
+pub fn soft_limit(x: f32) -> f32 {
+    const KNEE: f32 = SOFT_KNEE;
+    let a = x.abs();
+    if a <= KNEE {
+        x
+    } else {
+        let y = KNEE + (1.0 - KNEE) * ((a - KNEE) / (1.0 - KNEE)).tanh();
+        y.copysign(x)
+    }
+}
+
 /// Polar FM discriminator: the phase step between successive samples,
 /// scaled so a deviation of `deviation_hz` gives an output of 1.0.
 #[derive(Debug, Clone)]
@@ -393,6 +506,57 @@ mod tests {
         let mut y = tone(rate, 1000.0, 8000);
         f.process(&mut y);
         assert!(rms(&y[2000..]) > 0.65);
+    }
+
+    #[test]
+    fn agc_levels_quiet_and_loud_audio_alike() {
+        let rate = 8000.0;
+        let mut levels = Vec::new();
+        for amp in [0.02f32, 0.1, 0.6] {
+            let mut agc = Agc::new(rate);
+            let mut x: Vec<f32> = tone(rate, 1000.0, 24000).iter().map(|v| v * amp).collect();
+            agc.process(&mut x, true);
+            // Settled over the last second.
+            let peak = x[16000..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            levels.push(peak);
+            assert!(x.iter().all(|v| v.abs() <= 1.0));
+        }
+        // Inputs 30 dB apart come out within 1 dB of the target.
+        for p in &levels {
+            let db = 20.0 * (p / Agc::TARGET).log10();
+            assert!(db.abs() < 1.0, "{levels:?}");
+        }
+    }
+
+    #[test]
+    fn agc_gain_is_bounded_and_holds_while_muted() {
+        let rate = 8000.0;
+        let mut agc = Agc::new(rate);
+        // Near-silence cannot drive the gain past the maximum.
+        let mut x: Vec<f32> = tone(rate, 1000.0, 40000).iter().map(|v| v * 1e-4).collect();
+        agc.process(&mut x, true);
+        assert!((agc.gain() - Agc::MAX_GAIN).abs() < 0.1, "{}", agc.gain());
+        // Muted: the gain stays where it was, however long the silence.
+        let mut agc = Agc::new(rate);
+        let mut loud: Vec<f32> = tone(rate, 1000.0, 8000).iter().map(|v| v * 0.5).collect();
+        agc.process(&mut loud, true);
+        let g = agc.gain();
+        let mut silence = vec![0.0f32; 40000];
+        agc.process(&mut silence, false);
+        assert_eq!(agc.gain(), g);
+        assert!(silence.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn soft_limit_is_bounded_and_monotonic() {
+        let mut last = -2.0f32;
+        for i in -400..=400 {
+            let x = i as f32 / 100.0;
+            let y = soft_limit(x);
+            assert!(y.abs() <= 1.0 && y >= last, "{x} -> {y}");
+            last = y;
+        }
+        assert_eq!(soft_limit(0.5), 0.5);
     }
 
     #[test]

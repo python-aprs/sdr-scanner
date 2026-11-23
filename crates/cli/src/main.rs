@@ -626,6 +626,7 @@ fn run(a: RunArgs) -> Result<()> {
                 "opened": stats.opened,
                 "recorded": stats.recorded,
                 "discarded_short": stats.discarded_short,
+                "discarded_silent": stats.discarded_silent,
                 "not_recorded": stats.not_recorded,
                 "duplicates": stats.duplicates,
                 "max_concurrent": stats.max_concurrent,
@@ -652,7 +653,7 @@ fn run(a: RunArgs) -> Result<()> {
             "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB",
             rec.files,
             stats.opened,
-            stats.discarded_short,
+            stats.discarded_short + stats.discarded_silent,
             stats.not_recorded,
             rec.audio_secs,
             rec.bytes as f64 / 1e6
