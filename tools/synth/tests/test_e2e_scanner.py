@@ -210,8 +210,6 @@ def test_scanner_tags_dtmf_digits(tmp_path):
     # Rescanning the folder finds the same digits.
     db.execute("UPDATE transmissions SET dtmf = NULL")
     db.commit()
-    out = subprocess.run(
-        [SCANNER, "dtmf", str(tmp_path / "out")], check=True, capture_output=True, text=True
-    ).stdout
+    out = subprocess.run([SCANNER, "dtmf", str(tmp_path / "out")], check=True, capture_output=True, text=True).stdout
     assert out.strip().endswith("\t*73 0#D"), out
     assert [d for (d,) in db.execute("SELECT dtmf FROM transmissions ORDER BY freq_hz")] == ["*73 0#D", None]
