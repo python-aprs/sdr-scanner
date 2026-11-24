@@ -812,7 +812,10 @@
     const el = h('section', { class: 'panel tl-panel', hidden: true },
       h('div', { class: 'panel-head' }, h('h2', {}, 'Timeline'), summary, h('span', { class: 'spacer' }), detail, zoomOut),
       wrap);
-    const PAD = { l: 66, r: 12, t: 10, b: 24 };
+    const PAD = { l: 66, r: 12, t: 18, b: 24 };
+    // Without a Since filter the timeline shows the past few days.
+    const DEFAULT_DAYS = 3;
+    const defaultSince = params.get('since') ? null : Date.now() - DEFAULT_DAYS * 86400e3;
     let spans = [];          // [id, freq_hz, start_ms, secs], newest first
     let view = null;         // {t0, t1, f0, f1}
     let hoverId = null, drag = null;
@@ -822,7 +825,7 @@
 
     function computeView() {
       const now = Date.now();
-      const since = params.get('since') ? new Date(params.get('since')).getTime() : NaN;
+      const since = defaultSince !== null ? defaultSince : new Date(params.get('since')).getTime();
       const until = params.get('until') ? new Date(params.get('until')).getTime() : NaN;
       let t0 = Infinity, t1 = -Infinity, f0 = Infinity, f1 = -Infinity;
       for (const [, f, s, secs] of spans) {
@@ -896,6 +899,23 @@
         const midnight = d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0;
         const label = midnight || tStep >= 86400 ? mdFmt.format(d) : tStep < 60 ? timeFmt.format(d) : hmFmt.format(d);
         ctx.fillStyle = midnight ? text : muted; ctx.fillText(label, x, H - PAD.b + 6);
+      }
+
+      // A bar at each local midnight, labelled with the day it starts.
+      const dayPx = (86400e3 / (view.t1 - view.t0)) * plotW;
+      if (dayPx >= 6) {
+        const d = new Date(view.t0); d.setHours(24, 0, 0, 0);
+        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+        ctx.font = `600 11px ${css('--sans') || 'sans-serif'}`;
+        for (; d.getTime() <= view.t1; d.setDate(d.getDate() + 1)) {
+          const x = Math.round(xOf(d.getTime(), W)) + 0.5;
+          if (x < PAD.l || x > W - PAD.r) continue;
+          ctx.strokeStyle = muted; ctx.globalAlpha = 0.7; ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(x, 2); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+          ctx.globalAlpha = 1;
+          if (dayPx >= 60) { ctx.fillStyle = muted; ctx.fillText(dayFmt.format(d).replace(/,? \d{4}$/, ''), x + 5, 3); }
+        }
+        ctx.lineWidth = 1;
       }
 
       // The calls, oldest first so the newest sit on top.
@@ -1004,16 +1024,19 @@
     async function load() {
       const q = recordingQuery(params);
       q.set('limit', '2000');
+      if (defaultSince !== null) q.set('since', String(defaultSince / 1000));
       try {
         const res = await api(`/recordings/timeline?${q}`);
         spans = res.items;
-        el.hidden = spans.length === 0;
-        if (!spans.length) return;
+        el.hidden = spans.length === 0 && defaultSince === null;
+        wrap.hidden = spans.length === 0;
+        if (!spans.length) { summary.textContent = `no calls in the past ${DEFAULT_DAYS} days`; return; }
         const freqs = new Set(spans.map((s) => s[1]));
         const n = fmtCount(spans.length);
+        const when = defaultSince !== null ? ` in the past ${DEFAULT_DAYS} days` : '';
         summary.textContent = res.truncated
-          ? `latest ${n} calls on ${fmtCount(freqs.size)} frequencies · drag to zoom in`
-          : `${n} call${spans.length === 1 ? '' : 's'} on ${fmtCount(freqs.size)} frequenc${freqs.size === 1 ? 'y' : 'ies'} · drag to zoom in`;
+          ? `latest ${n} calls on ${fmtCount(freqs.size)} frequencies${when} · drag to zoom in`
+          : `${n} call${spans.length === 1 ? '' : 's'} on ${fmtCount(freqs.size)} frequenc${freqs.size === 1 ? 'y' : 'ies'}${when} · drag to zoom in`;
         computeView();
         draw();
       } catch (_) {
