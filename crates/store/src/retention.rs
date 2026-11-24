@@ -51,6 +51,9 @@ pub struct DiskUsage {
     expired_bytes: AtomicU64,
     /// Start of the newest recording deleted so far (0: none yet).
     expired_until_ns: AtomicI64,
+    /// Bytes of recordings deleted by hand that retention hasn't taken off
+    /// its count yet.
+    released: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -66,6 +69,23 @@ pub struct StorageStatus {
 }
 
 impl DiskUsage {
+    /// Recordings of this many (counted) bytes were deleted outside
+    /// retention, e.g. from the web UI.
+    pub fn released(&self, bytes: u64) {
+        self.released.fetch_add(bytes, Ordering::Relaxed);
+        // (A plain CAS loop: `fetch_update` is deprecated on newer Rust and
+        // its replacement isn't on older ones.)
+        let mut u = self.used.load(Ordering::Relaxed);
+        while let Err(now) = self.used.compare_exchange_weak(
+            u,
+            u.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            u = now;
+        }
+    }
+
     pub fn snapshot(&self) -> StorageStatus {
         let free = self.free.load(Ordering::Relaxed);
         let until = self.expired_until_ns.load(Ordering::Relaxed);
@@ -160,6 +180,11 @@ impl Retention {
     /// Delete old recordings if the policy calls for it. Returns how many
     /// were deleted. `force` re-reads free space now.
     pub fn run(&mut self, root: &Path, index: &Index, force: bool) -> Result<u64, IndexError> {
+        let released = self.usage.released.swap(0, Ordering::Relaxed);
+        if released > 0 {
+            self.used = self.used.saturating_sub(released);
+            self.usage.used.store(self.used, Ordering::Relaxed);
+        }
         if force || self.free_at.is_none_or(|t| t.elapsed() >= FREE_EVERY) {
             self.free = (self.free_fn)(root);
             self.free_at = Some(Instant::now());
@@ -205,6 +230,31 @@ impl Retention {
         }
         Ok(deleted)
     }
+}
+
+/// Why [`delete_recording`] refused.
+#[derive(Debug, thiserror::Error)]
+pub enum DeleteError {
+    #[error("no such recording")]
+    NotFound,
+    #[error("that recording is still being written")]
+    Recording,
+    #[error(transparent)]
+    Index(#[from] IndexError),
+}
+
+/// Delete a recording by hand: its index row, WAV, Opus copy and any
+/// leftover `.part` files. Returns the bytes the index counted for it,
+/// for [`DiskUsage::released`]. Starred or not makes no difference here.
+pub fn delete_recording(root: &Path, index: &Index, id: i64) -> Result<u64, DeleteError> {
+    let row = index.get(id)?.ok_or(DeleteError::NotFound)?;
+    if row.status == "recording" {
+        return Err(DeleteError::Recording);
+    }
+    // The row goes first: a file that can't be removed is better left
+    // behind than a row pointing at audio that's gone.
+    index.delete(id)?;
+    Ok(delete_files(root, &row).0)
 }
 
 /// Delete a row's files. Returns the bytes the index counted for it and
@@ -406,6 +456,89 @@ mod tests {
         assert_eq!(ix.get(id).unwrap().unwrap().status, "expired");
         assert!(!dir.path().join("2026/11/01/c.wav.part").exists());
         assert_eq!(r.usage().snapshot().expired_bytes, 550 + 9000);
+    }
+
+    #[test]
+    fn starred_recordings_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let ix = Index::open(&dir.path().join("index.sqlite")).unwrap();
+        let ids = fill(dir.path(), &ix, 30, 8000);
+        // The two oldest are starred; the next seven go instead.
+        assert!(ix.set_starred(ids[0], true).unwrap());
+        assert!(ix.set_starred(ids[1], true).unwrap());
+        assert!(!ix.set_starred(9999, true).unwrap());
+        let mut r = Retention::new(
+            Policy {
+                budget_bytes: 250_000,
+                min_free_bytes: 0,
+                ..Policy::default()
+            },
+            &ix,
+        )
+        .unwrap();
+        assert_eq!(r.run(dir.path(), &ix, true).unwrap(), 7);
+        for (k, id) in ids.iter().enumerate().take(10) {
+            let want = if (2..9).contains(&k) {
+                "expired"
+            } else {
+                "complete"
+            };
+            assert_eq!(ix.get(*id).unwrap().unwrap().status, want, "recording {k}");
+        }
+        assert!(dir.path().join("2026/11/01/0.wav").exists());
+        // With everything left starred, retention stops rather than loop.
+        for id in &ids {
+            ix.set_starred(*id, true).unwrap();
+        }
+        r.added(1_000_000);
+        assert_eq!(r.run(dir.path(), &ix, true).unwrap(), 0);
+    }
+
+    #[test]
+    fn deleting_by_hand_removes_files_and_row_and_frees_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let ix = Index::open(&dir.path().join("index.sqlite")).unwrap();
+        let ids = fill(dir.path(), &ix, 3, 8000);
+        let mut r = Retention::new(
+            Policy {
+                budget_bytes: 1_000_000,
+                min_free_bytes: 0,
+                ..Policy::default()
+            },
+            &ix,
+        )
+        .unwrap();
+        ix.set_starred(ids[1], true).unwrap();
+        let freed = delete_recording(dir.path(), &ix, ids[1]).unwrap();
+        assert_eq!(freed, 9000);
+        assert!(ix.get(ids[1]).unwrap().is_none());
+        assert!(!dir.path().join("2026/11/01/1.wav").exists());
+        assert!(!dir.path().join("2026/11/01/1.opus").exists());
+        assert!(dir.path().join("2026/11/01/2.wav").exists());
+        let usage = r.usage();
+        usage.released(freed);
+        assert_eq!(usage.snapshot().used_bytes, 18_000);
+        r.run(dir.path(), &ix, true).unwrap();
+        assert_eq!(usage.snapshot().used_bytes, ix.usage_bytes().unwrap());
+        assert!(matches!(
+            delete_recording(dir.path(), &ix, ids[1]),
+            Err(DeleteError::NotFound)
+        ));
+        let busy = ix
+            .insert(&NewRow {
+                freq_hz: 1.0,
+                channel: None,
+                origin: "grid",
+                mode: "nbfm",
+                start_ns: 0,
+                audio_rate: 8000,
+                wav_path: "2026/11/01/busy.wav",
+            })
+            .unwrap();
+        assert!(matches!(
+            delete_recording(dir.path(), &ix, busy),
+            Err(DeleteError::Recording)
+        ));
     }
 
     #[cfg(unix)]

@@ -777,6 +777,7 @@
     if (params.get('min')) q.set('min_secs', params.get('min'));
     if (params.get('tone')) q.set('tone', params.get('tone'));
     if (params.get('dtmf')) q.set('dtmf', params.get('dtmf'));
+    if (params.get('starred') === '1') q.set('starred', 'true');
     return q;
   }
 
@@ -1069,6 +1070,7 @@
     const minSecs = h('input', { type: 'number', min: '0', step: '0.5', placeholder: '0', value: params.get('min') || '', style: 'width:80px' });
     const tone = h('input', { type: 'text', placeholder: '100.0 or D023N', value: params.get('tone') || '', style: 'width:120px', 'aria-label': 'Tone' });
     const dtmf = h('input', { type: 'text', placeholder: 'digits or any', value: params.get('dtmf') || '', style: 'width:110px', 'aria-label': 'DTMF digits' });
+    const starredOnly = h('input', { type: 'checkbox', checked: params.get('starred') === '1' });
     const form = h('form', { class: 'filters', onsubmit: (e) => { e.preventDefault(); apply(); } },
       h('label', {}, 'Channel', chan),
       h('label', {}, 'Frequency (MHz)', freq),
@@ -1077,11 +1079,12 @@
       h('label', {}, 'Min length (s)', minSecs),
       h('label', {}, 'Tone', tone),
       h('label', {}, 'DTMF', dtmf),
+      h('label', { class: 'check', title: 'Starred recordings are kept when old ones are deleted for space' }, starredOnly, 'Starred only'),
       h('button', { type: 'submit', class: 'primary' }, 'Search'),
       h('button', { type: 'button', onclick: () => { location.hash = '#/recordings'; } }, 'Clear'));
     const tbody = h('tbody');
     const table = h('table', {},
-      h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, 'Time'), h('th', {}, 'Frequency'), h('th', {}, 'Channel'), h('th', {}, 'Tone'), h('th', {}, 'DTMF'), h('th', { class: 'num' }, 'Length'), h('th', { class: 'num' }, 'Peak SNR'), h('th', {}, ''))),
+      h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', { title: 'Starred recordings are kept when old ones are deleted for space' }, '★'), h('th', {}, 'Time'), h('th', {}, 'Frequency'), h('th', {}, 'Channel'), h('th', {}, 'Tone'), h('th', {}, 'DTMF'), h('th', { class: 'num' }, 'Length'), h('th', { class: 'num' }, 'Peak SNR'), h('th', {}, ''))),
       tbody);
     const more = h('button', { type: 'button' }, 'Load older');
     const status = h('div', { class: 'empty', hidden: true });
@@ -1099,6 +1102,7 @@
       if (minSecs.value) p.set('min', minSecs.value);
       if (tone.value.trim()) p.set('tone', tone.value.trim().toUpperCase());
       if (dtmf.value.trim()) p.set('dtmf', dtmf.value.trim().toUpperCase());
+      if (starredOnly.checked) p.set('starred', '1');
       if (since.value && params.get('until')) p.set('until', params.get('until'));
       location.hash = `#/recordings${p.toString() ? '?' + p : ''}`;
     }
@@ -1118,9 +1122,12 @@
           const r = items[i];
           const when = nsDate(r.start_ns);
           const day = dayLabel(when);
-          if (day !== lastDay) { lastDay = day; tbody.append(h('tr', { class: 'day' }, h('td', { colspan: 9 }, day))); }
-          tbody.append(h('tr', { dataset: { rec: r.id }, class: canAudio() ? 'clickable' : '', onclick: canAudio() ? () => player.play(items, i) : null },
-            h('td', {}, canAudio() ? playButton(items, i) : null),
+          if (day !== lastDay) { lastDay = day; tbody.append(h('tr', { class: 'day' }, h('td', { colspan: 10 }, day))); }
+          // Rows can be deleted, so look the index up when clicked.
+          const play = () => player.play(items, items.indexOf(r));
+          const tr = h('tr', { dataset: { rec: r.id }, class: canAudio() ? 'clickable' : '', onclick: canAudio() ? play : null },
+            h('td', {}, canAudio() ? h('button', { type: 'button', class: 'icon-btn', title: 'Play', 'aria-label': 'Play', onclick: (e) => { e.stopPropagation(); play(); } }, '▶') : null),
+            h('td', { class: 'star-cell' }, starControl(r)),
             h('td', { class: 'mono' }, timeFmt.format(when)),
             h('td', { class: 'mono' }, MHZ(r.freq_hz, 4)),
             h('td', { class: 'grow' }, r.channel || channelName(r.freq_hz) || h('span', { class: 'muted' }, kindLabel[r.origin] || r.origin)),
@@ -1128,7 +1135,10 @@
             h('td', { class: 'mono dtmf', title: r.dtmf ? 'DTMF digits heard' : '' }, r.dtmf || ''),
             h('td', { class: 'num mono' }, fmtSecs(r.audio_secs)),
             h('td', { class: 'num mono' }, r.peak_snr_db === null ? '' : fmtDb(r.peak_snr_db)),
-            h('td', {}, canAudio() ? h('a', { href: r.wav_url, download: '', onclick: (e) => e.stopPropagation(), title: 'Download WAV' }, 'WAV') : null)));
+            h('td', { class: 'actions' },
+              canAudio() ? h('a', { href: r.wav_url, download: '', onclick: (e) => e.stopPropagation(), title: 'Download WAV' }, 'WAV') : null,
+              isAdmin() ? confirmButton('Delete', 'Delete?', () => removeRecording(r, tr), 'mini danger') : null));
+          tbody.append(tr);
         }
         next = res.items.length === 100 ? res.next_before_id : null;
         more.hidden = next === null;
@@ -1143,6 +1153,50 @@
         status.hidden = false; status.textContent = e.message;
       } finally { more.disabled = false; }
     }
+    /** Star toggle for admins; a plain mark for everyone else. */
+    function starControl(r) {
+      if (!isAdmin()) return r.starred ? h('span', { class: 'star on', title: 'Starred: kept when old recordings are deleted' }, '★') : null;
+      const b = h('button', { type: 'button', class: 'star-btn' });
+      const show = () => {
+        b.textContent = r.starred ? '★' : '☆';
+        b.classList.toggle('on', r.starred);
+        b.setAttribute('aria-pressed', String(r.starred));
+        b.title = r.starred ? 'Starred: kept when old recordings are deleted. Click to unstar.' : 'Star to keep it when old recordings are deleted';
+        b.setAttribute('aria-label', r.starred ? 'Unstar' : 'Star');
+      };
+      show();
+      b.onclick = async (e) => {
+        e.stopPropagation();
+        b.disabled = true;
+        try {
+          const res = await api(`/recordings/${r.id}`, { method: 'PATCH', body: { starred: !r.starred } });
+          r.starred = res.starred;
+          show();
+        } catch (ex) {
+          b.title = ex.message;
+        } finally { b.disabled = false; }
+      };
+      return b;
+    }
+
+    async function removeRecording(r, tr) {
+      await api(`/recordings/${r.id}`, { method: 'DELETE' });
+      const i = items.indexOf(r);
+      if (i < 0) return;
+      if (player.list === items && !$('#player').hidden) {
+        if (player.index === i) player.close();
+        else if (player.index > i) player.index -= 1;
+      }
+      items.splice(i, 1);
+      // Drop the day heading too when this was its last row.
+      const prev = tr.previousElementSibling, nextRow = tr.nextElementSibling;
+      tr.remove();
+      if (prev && prev.classList.contains('day') && (!nextRow || nextRow.classList.contains('day'))) prev.remove();
+      $('#rec-count').textContent = `${fmtCount(items.length)}${next !== null ? '+' : ''} shown`;
+      status.hidden = items.length > 0;
+      timeline.load();
+    }
+
     more.onclick = load;
     load();
     timeline.load();

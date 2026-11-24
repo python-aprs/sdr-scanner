@@ -188,6 +188,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 .icon-btn { padding: 4px 9px; line-height: 1; font-size: 15px; }
 button.mini { padding: 2px 9px; font-size: 12px; border-radius: 6px; }
 td.actions button + button { margin-left: 6px; }
+td.actions a + button { margin-left: 10px; }
+.star-btn { background: none; border: none; padding: 2px 4px; font-size: 16px; line-height: 1; color: var(--muted); }
+.star-btn:hover { color: var(--warn); }
+.star-btn.on, .star.on { color: var(--warn); }
+td.star-cell { padding-left: 2px; padding-right: 2px; text-align: center; }
 .active-list li.with-action .snr { grid-column: 1 / 3; }
 .active-list .lock-btn { grid-column: 3; grid-row: 2; justify-self: end; }
 .check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; cursor: pointer; }
@@ -196,6 +201,7 @@ td.actions button + button { margin-left: 6px; }
 .form .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
 .filters label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.filters label.check { display: inline-flex; align-self: center; padding-top: 16px; }
 .filters input[type="number"] { width: 112px; }
 .filters select { max-width: 320px; }
 .error { color: var(--bad); font-size: 13px; }
