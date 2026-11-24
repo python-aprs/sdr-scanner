@@ -90,7 +90,10 @@ def test_scanner_run_records_ci_smoke(tmp_path):
     import sqlite3
 
     db = sqlite3.connect(tmp_path / "out" / "index.sqlite")
-    tones = {round(f / 1e3): t for f, t in db.execute("SELECT freq_hz, tone FROM transmissions")}
+    tones = {
+        round(f / 1e3): t
+        for f, t in db.execute("SELECT freq_hz, tone FROM transmissions LEFT JOIN tones ON transmission_id = id")
+    }
     assert tones == {146520: "100.0", 146840: None, 145612: None}, tones
 
 
@@ -204,12 +207,20 @@ def test_scanner_tags_dtmf_digits(tmp_path):
         text=True,
     )
     db = sqlite3.connect(tmp_path / "out" / "index.sqlite")
-    tags = {round(f / 1e3): (d, t) for f, d, t in db.execute("SELECT freq_hz, dtmf, tone FROM transmissions")}
+    tags = {
+        round(f / 1e3): (d, t)
+        for f, d, t in db.execute(
+            "SELECT freq_hz, digits, tone FROM transmissions"
+            " LEFT JOIN dtmf ON dtmf.transmission_id = id"
+            " LEFT JOIN tones ON tones.transmission_id = id"
+        )
+    }
     assert tags == {146520: ("*73 0#D", "100.0"), 146840: (None, None)}, tags
 
     # Rescanning the folder finds the same digits.
-    db.execute("UPDATE transmissions SET dtmf = NULL")
+    db.execute("DELETE FROM dtmf")
     db.commit()
     out = subprocess.run([SCANNER, "dtmf", str(tmp_path / "out")], check=True, capture_output=True, text=True).stdout
     assert out.strip().endswith("\t*73 0#D"), out
-    assert [d for (d,) in db.execute("SELECT dtmf FROM transmissions ORDER BY freq_hz")] == ["*73 0#D", None]
+    digits = db.execute("SELECT digits FROM transmissions LEFT JOIN dtmf ON transmission_id = id ORDER BY freq_hz")
+    assert [d for (d,) in digits] == ["*73 0#D", None]
