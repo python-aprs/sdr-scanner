@@ -185,7 +185,9 @@ loaded from other sites. Edit the files and rebuild to change it.
   recordings. Click the spectrum to see that channel's recordings.
 - **Recordings**: search by channel or frequency, start time and length,
   then play in the browser (the player can step through the list, and
-  plays the small Opus copy) or download the WAV.
+  plays the small Opus copy) or download the WAV. Admins can star a
+  recording (retention never deletes it) or delete one (its WAV, Opus copy
+  and index row go at once); "Starred only" lists the starred ones.
 - **Channels**: every watched slot with its name, type, mode and lockout or
   priority flag; repeaters link their input and output.
 - **Admin**: log in and out, change your password, and create or revoke API
@@ -248,7 +250,11 @@ filesystem. Usage is the sum the index holds for finished recordings, so a
 pass never walks the folder; files added by hand and recordings still open
 don't count. A pass runs at startup and after each recording closes. The
 Admin page and `GET /api/v1/storage` show usage, free space and what was
-deleted.
+deleted. Starred recordings (`PATCH /api/v1/recordings/{id}` with
+`{"starred": true}`) are skipped, even to keep the free-space floor, so a
+disk full of starred recordings stops retention rather than losing them.
+`DELETE /api/v1/recordings/{id}` deletes one by hand, starred or not, and
+removes its row instead of marking it expired.
 
 Everything the web interface sends is counted per role and UTC calendar
 month (HTTP bodies and headers, and WebSocket messages; TCP/TLS overhead

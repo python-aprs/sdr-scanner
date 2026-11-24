@@ -56,6 +56,10 @@ pub static SCHEMA: Schema = Schema {
             description: "DTMF digits",
             up: Up::Sql("ALTER TABLE transmissions ADD COLUMN dtmf TEXT;"),
         },
+        Migration {
+            description: "starred recordings",
+            up: Up::Sql("ALTER TABLE transmissions ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;"),
+        },
     ],
 };
 
@@ -106,6 +110,8 @@ pub struct Row {
     pub tone: Option<String>,
     /// DTMF digits heard, if any, groups split by a space (`*73 1234#`).
     pub dtmf: Option<String>,
+    /// Kept by retention however old (set from the web UI).
+    pub starred: bool,
 }
 
 /// Filters for [`Index::search`]. `None` means no constraint.
@@ -121,6 +127,8 @@ pub struct Query {
     /// DTMF digits that must appear in the recording's digits; an empty
     /// string matches any recording with digits.
     pub dtmf: Option<String>,
+    /// Only starred (`true`) or only unstarred (`false`) recordings.
+    pub starred: Option<bool>,
     /// Paging: only rows with a smaller id.
     pub before_id: Option<i64>,
     pub limit: usize,
@@ -295,6 +303,15 @@ impl Index {
         .map_err(Into::into)
     }
 
+    /// Star or unstar a recording. Returns false if there is no such row.
+    pub fn set_starred(&self, id: i64, starred: bool) -> Result<bool, IndexError> {
+        let n = self.db.execute(
+            "UPDATE transmissions SET starred = ?2 WHERE id = ?1",
+            params![id, starred],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Remove a row (a recording that was thrown away).
     pub fn delete(&self, id: i64) -> Result<(), IndexError> {
         self.db
@@ -360,6 +377,7 @@ impl Index {
                AND (?6 IS NULL OR id < ?6)
                AND (?8 IS NULL OR tone = ?8)
                AND (?9 IS NULL OR instr(dtmf, ?9) > 0)
+               AND (?10 IS NULL OR starred = ?10)
              ORDER BY start_ns DESC, id DESC LIMIT ?7",
         )?;
         st.query_map(
@@ -372,7 +390,8 @@ impl Index {
                 q.before_id,
                 q.limit.clamp(1, 1000) as i64,
                 q.tone,
-                q.dtmf
+                q.dtmf,
+                q.starred
             ],
             row,
         )?
@@ -393,9 +412,11 @@ impl Index {
 
     /// The oldest rows whose files retention may delete: complete ones,
     /// and ones a crash interrupted (which may have left `.part` files).
+    /// Starred rows are never among them.
     pub fn oldest_expirable(&self, limit: usize) -> Result<Vec<Row>, IndexError> {
         let mut st = self.db.prepare(
-            "SELECT * FROM transmissions WHERE status IN ('complete', 'interrupted')
+            "SELECT * FROM transmissions
+             WHERE status IN ('complete', 'interrupted') AND starred = 0
              ORDER BY start_ns, id LIMIT ?1",
         )?;
         Ok(st
@@ -454,6 +475,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         opus_bytes: r.get("opus_bytes")?,
         tone: r.get("tone")?,
         dtmf: r.get("dtmf")?,
+        starred: r.get("starred")?,
     })
 }
 

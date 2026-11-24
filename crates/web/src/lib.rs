@@ -7,6 +7,8 @@
 //! | `GET /api/v1/status` | anonymous if `public.live` (default on), else admin |
 //! | `GET /api/v1/recordings` | anonymous if `public.recordings` (default off), else admin |
 //! | `GET /api/v1/recordings/{id}` | same as the list |
+//! | `PATCH /api/v1/recordings/{id}` | admin (+ CSRF): `{"starred": bool}`; starred recordings are kept by retention |
+//! | `DELETE /api/v1/recordings/{id}` | admin (+ CSRF): delete the recording's files and its row |
 //! | `GET /api/v1/recordings/{id}/audio` | anonymous if `public.audio` (default off), else admin: the Opus copy, or the WAV with `?format=wav` or when there's no copy |
 //! | `GET /api/v1/packets` | same as the recordings list: decoded AX.25 frames, newest first (`before_id`, `limit`) |
 //! | `GET /api/v1/channels` | same as status |
@@ -415,7 +417,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/audio", get(audio::audio_ws))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/packets", get(list_packets))
-        .route("/api/v1/recordings/{id}", get(get_recording))
+        .route(
+            "/api/v1/recordings/{id}",
+            get(get_recording)
+                .patch(edit_recording)
+                .delete(delete_recording),
+        )
         .route("/api/v1/recordings/{id}/audio", get(get_audio))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
@@ -671,6 +678,8 @@ pub struct ListParams {
     pub tone: Option<String>,
     /// DTMF digits the recording must contain; `any` for any digits.
     pub dtmf: Option<String>,
+    /// Only starred (`true`) or unstarred (`false`) recordings.
+    pub starred: Option<bool>,
     pub before_id: Option<i64>,
     pub limit: Option<usize>,
 }
@@ -717,6 +726,7 @@ async fn list_recordings(
             .map(|d| d.trim().to_ascii_uppercase())
             .filter(|d| !d.is_empty())
             .map(|d| if d == "ANY" { String::new() } else { d }),
+        starred: p.starred,
         before_id: p.before_id,
         limit: p.limit.unwrap_or(100),
     };
@@ -761,6 +771,92 @@ async fn get_recording(
         Some(r) => Ok(Json(serde_json::to_value(recording(r)).unwrap_or_default())),
         None => Err(ApiError(StatusCode::NOT_FOUND, "no such recording".into())),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordingEdit {
+    starred: bool,
+}
+
+/// Star or unstar a recording (admin). Starred recordings are never
+/// deleted by retention.
+async fn edit_recording(
+    State(s): State<AppState>,
+    Client(client): Client,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<i64>,
+    Json(req): Json<RecordingEdit>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = s.caller(&headers).await?;
+    c.require_write(&headers)?;
+    let s2 = s.clone();
+    let row = blocking(move || {
+        let ix = s2.index()?;
+        if !ix.set_starred(id, req.starred).map_err(db_err)? {
+            return Ok(None);
+        }
+        ix.get(id).map_err(db_err)
+    })
+    .await?
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no such recording".into()))?;
+    if let Some(auth) = &s.auth {
+        auth.audit(
+            now_ns(),
+            &c.actor(),
+            if req.starred {
+                "recording_starred"
+            } else {
+                "recording_unstarred"
+            },
+            &format!("#{id} {:.4} MHz", row.freq_hz / 1e6),
+            &client,
+        );
+    }
+    Ok(Json(
+        serde_json::to_value(recording(row)).unwrap_or_default(),
+    ))
+}
+
+/// Delete a recording's files and its row (admin), starred or not.
+async fn delete_recording(
+    State(s): State<AppState>,
+    Client(client): Client,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<StatusCode, ApiError> {
+    use scanner_store::retention::DeleteError;
+    let c = s.caller(&headers).await?;
+    c.require_write(&headers)?;
+    let s2 = s.clone();
+    let (freq, freed) = blocking(move || {
+        let ix = s2.index()?;
+        let freq = ix.get(id).map_err(db_err)?.map(|r| r.freq_hz);
+        match scanner_store::retention::delete_recording(&s2.recordings, &ix, id) {
+            Ok(n) => Ok((freq.unwrap_or_default(), n)),
+            Err(DeleteError::NotFound) => {
+                Err(ApiError(StatusCode::NOT_FOUND, "no such recording".into()))
+            }
+            Err(e @ DeleteError::Recording) => {
+                Err(ApiError(StatusCode::CONFLICT, e.to_string().into()))
+            }
+            Err(DeleteError::Index(e)) => Err(db_err(e)),
+        }
+    })
+    .await?;
+    if let Some(u) = &s.storage {
+        u.released(freed);
+    }
+    if let Some(auth) = &s.auth {
+        auth.audit(
+            now_ns(),
+            &c.actor(),
+            "recording_deleted",
+            &format!("#{id} {:.4} MHz", freq / 1e6),
+            &client,
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The recording's audio, with single-range support so browsers can seek.
@@ -1642,6 +1738,80 @@ mod tests {
         let log = state.auth.as_ref().unwrap().recent_audit(10).unwrap();
         let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
         assert!(actions.contains(&"token_created") && actions.contains(&"token_revoked"));
+    }
+
+    #[tokio::test]
+    async fn star_and_delete_recordings() {
+        let (dir, state, id, token) = setup(Public {
+            recordings: true,
+            ..Public::default()
+        });
+        let uri = format!("/api/v1/recordings/{id}");
+        let body = serde_json::json!({"starred": true});
+        let bearer = |method: &str, uri: &str, body: Option<serde_json::Value>| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"));
+            let b = match body {
+                Some(v) => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(v.to_string())
+                }
+                None => Body::empty(),
+            };
+            req.body(b).unwrap()
+        };
+        // Visitors may list recordings here but not change them.
+        let r = send(&state, json_req("PATCH", &uri, body.clone(), None, None)).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        let r = send(&state, Request::delete(&uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        // A session needs its CSRF token.
+        let l = login(&state, "masen", PASSWORD).await;
+        let cookie = l.cookie().unwrap();
+        let csrf = l.json()["csrf_token"].as_str().unwrap().to_string();
+        let r = send(
+            &state,
+            json_req("PATCH", &uri, body.clone(), Some(&cookie), None),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+        let r = send(
+            &state,
+            json_req("PATCH", &uri, body.clone(), Some(&cookie), Some(&csrf)),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.json()["starred"], true);
+        let count = |q: &'static str| {
+            let state = state.clone();
+            async move {
+                let (_, body) = get(&state, q, None, None).await;
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["items"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(count("/api/v1/recordings?starred=true").await, 1);
+        assert_eq!(count("/api/v1/recordings?starred=false").await, 0);
+        let r = send(
+            &state,
+            bearer("PATCH", "/api/v1/recordings/999", Some(body.clone())),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        // Delete takes the file and the row.
+        let r = send(&state, bearer("DELETE", &uri, None)).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        assert!(!dir.path().join("2026/11/22/a.wav").exists());
+        assert_eq!(count("/api/v1/recordings").await, 0);
+        let r = send(&state, bearer("DELETE", &uri, None)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        let log = state.auth.as_ref().unwrap().recent_audit(10).unwrap();
+        let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
+        assert!(actions.contains(&"recording_starred") && actions.contains(&"recording_deleted"));
     }
 
     #[tokio::test]
