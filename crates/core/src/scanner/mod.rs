@@ -182,7 +182,7 @@ pub struct ScannerStats {
     pub spurs: u64,
     /// AX.25 frames decoded on `afsk1200` slots.
     pub packets: u64,
-    /// Digital voice calls recorded.
+    /// Digital voice calls recorded (also counted in `recorded`).
     pub calls: u64,
     pub max_concurrent: usize,
 }
@@ -680,6 +680,7 @@ impl Scanner {
                     }
                     let end = stream(c, at_sample).max(rec.start);
                     stats.calls += 1;
+                    stats.recorded += 1;
                     out.push(Output::Close(TxEnd {
                         id: rec.id,
                         end_sample: end,
@@ -1526,7 +1527,7 @@ mod tests {
             "{}",
             ends[0].signal_secs
         );
-        assert_eq!(stats.calls, 1);
+        assert_eq!((stats.calls, stats.recorded), (1, 1), "{stats:?}");
     }
 
     #[test]
