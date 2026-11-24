@@ -12,6 +12,8 @@ cargo build --release -p scanner-cli
 
 The binary is `target/release/scanner`. To use an SDRplay radio, install the SDRplay API 3.x from sdrplay.com and build with `--features sdrplay`.
 
+DMR channels (`mode = "dmr"`) are decoded natively: calls are recorded per timeslot with their talkgroup, radio ids and talker alias, and the raw AMBE+2 voice frames are kept beside each recording (`.amb`). Turning those frames into audio needs an AMBE+2 decoder, which is not in the default build. Install [mbelib-neo](https://github.com/arancormonk/mbelib-neo) (or classic mbelib) and build with `--features mbelib`; set `MBELIB_DIR` to its install prefix if it isn't under `/usr/local`, `/opt/homebrew` or `/usr`. `scanner ambe <file.amb>...` converts kept frames to WAV later. mbelib is GPL and its patent status is unclear, so a binary built with it is yours to use, not to redistribute.
+
 ## Run
 
 Make an admin account, then start the scanner:

@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "scanner"
@@ -13,6 +14,9 @@ path = "src/main.rs"
 
 [features]
 sdrplay = ["scanner-sources/sdrplay"]
+# DMR voice audio through mbelib-neo (or classic mbelib); see
+# crates/core/Cargo.toml.
+mbelib = ["scanner-core/mbelib"]
 
 [dependencies]
 scanner-core.workspace = true

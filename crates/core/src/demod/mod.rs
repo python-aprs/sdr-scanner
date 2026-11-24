@@ -4,19 +4,22 @@
 //! FFT blocks into channel IQ, the transmission id and timing, pre-roll
 //! catch-up, the minimum-length check, hang-time trimming and live audio.
 //! What depends on the mode sits behind [`Demod`]: NBFM voice turns the IQ
-//! into audio, AFSK1200 into AX.25 frames. Further modes (DMR, SSB, CW)
-//! are further implementations, built by [`build`].
+//! into audio, AFSK1200 into AX.25 frames, DMR into calls. Further modes
+//! (SSB, CW) are further implementations, built by [`build`].
 
 mod afsk;
 mod audio;
+mod dmr;
 mod nbfm;
 
 pub use afsk::AfskPacket;
 pub use audio::{Levels, SquelchGate};
+pub use dmr::DmrVoice;
 pub use nbfm::NbfmVoice;
 
 use crate::afsk::Decoded;
 use crate::config::{Mode, Slot};
+use crate::dmr::{AmbeFrame, CallInfo};
 use crate::scanner::ScannerConfig;
 use crate::tone::Tone;
 use num_complex::Complex32;
@@ -26,6 +29,30 @@ use num_complex::Complex32;
 pub struct Tags {
     /// CTCSS tone or DCS code heard, if any.
     pub tone: Option<Tone>,
+}
+
+/// A digital voice call on a channel (a channel can carry more than one at
+/// a time: `key` tells them apart). Sample positions are channel IQ
+/// samples from the first block, like [`Decoded::at_sample`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Call {
+    Start {
+        key: u8,
+        at_sample: u64,
+        info: CallInfo,
+    },
+    /// 60 ms of voice: three frames and their audio (silence without a
+    /// vocoder) at [`crate::dmr::vocoder::AUDIO_RATE`].
+    Voice {
+        key: u8,
+        frames: [AmbeFrame; 3],
+        audio: Vec<f32>,
+    },
+    End {
+        key: u8,
+        at_sample: u64,
+        info: CallInfo,
+    },
 }
 
 /// One mode's signal chain for one transmission, fed channel IQ at the
@@ -67,11 +94,16 @@ pub trait Demod: Send {
     fn take_frames(&mut self) -> Vec<Decoded> {
         Vec::new()
     }
+
+    /// Digital voice call events since the last call.
+    fn take_calls(&mut self) -> Vec<Call> {
+        Vec::new()
+    }
 }
 
 /// Whether [`build`] has a demodulator for this mode.
 pub fn supports(mode: Mode) -> bool {
-    matches!(mode, Mode::Nbfm | Mode::Afsk1200)
+    matches!(mode, Mode::Nbfm | Mode::Afsk1200 | Mode::Dmr)
 }
 
 /// The demodulator for `slot`'s mode, fed channel IQ at `rate`, or `None`
@@ -80,6 +112,7 @@ pub fn build(slot: &Slot, rate: f64, cfg: &ScannerConfig) -> Option<Box<dyn Demo
     match slot.mode {
         Mode::Nbfm => Some(Box::new(NbfmVoice::new(slot, rate, cfg))),
         Mode::Afsk1200 => Some(Box::new(AfskPacket::new(slot, rate))),
+        Mode::Dmr => Some(Box::new(DmrVoice::new(rate))),
         _ => None,
     }
 }

@@ -320,6 +320,11 @@ def _q(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+# Digital modes the scanner can decode; other digital-only repeaters are
+# listed but not recorded.
+DECODED_MODES = {"dmr"}
+
+
 def to_toml(reps: list[Repeater], profile: str, digital_record: bool = False) -> str:
     out = []
     for r in reps:
@@ -345,7 +350,7 @@ def to_toml(reps: list[Repeater], profile: str, digital_record: bool = False) ->
         if mode != "nbfm":
             out.append(f'mode     = "{mode}"')
             out.append('bandwidth = "11 kHz"')
-            if not digital_record:
+            if not digital_record and mode not in DECODED_MODES:
                 out.append("record   = false  # digital-only until its decoder exists")
         elif r.narrow:
             out.append('bandwidth = "11 kHz"')

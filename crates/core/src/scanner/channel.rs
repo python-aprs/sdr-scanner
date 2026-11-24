@@ -29,7 +29,21 @@ pub(super) struct Channel {
     /// Audio samples sent to live listeners so far (counted like `emitted`),
     /// or `None` until the channel is announced to them.
     pub live_sent: Option<usize>,
+    /// Digital calls being recorded, by the demodulator's call key.
+    pub calls: [Option<CallRec>; 2],
     iq: Vec<Complex32>,
+}
+
+/// A digital call's recording.
+pub(super) struct CallRec {
+    pub id: u64,
+    /// Stream sample of its start.
+    pub start: u64,
+    pub peak_snr_db: f32,
+    pub snr_sum: f64,
+    pub blocks: u32,
+    /// Announced to live listeners.
+    pub live: bool,
 }
 
 impl Channel {
@@ -53,6 +67,7 @@ impl Channel {
             pending: Vec::new(),
             emitted: 0,
             live_sent: None,
+            calls: [None, None],
             iq: Vec::new(),
         }
     }

@@ -60,6 +60,21 @@ pub static SCHEMA: Schema = Schema {
             description: "starred recordings",
             up: Up::Sql("ALTER TABLE transmissions ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;"),
         },
+        Migration {
+            description: "digital voice calls",
+            up: Up::Sql(
+                "ALTER TABLE transmissions ADD COLUMN timeslot INTEGER;
+                 ALTER TABLE transmissions ADD COLUMN color_code INTEGER;
+                 ALTER TABLE transmissions ADD COLUMN call_type TEXT;
+                 ALTER TABLE transmissions ADD COLUMN src_id INTEGER;
+                 ALTER TABLE transmissions ADD COLUMN dst_id INTEGER;
+                 ALTER TABLE transmissions ADD COLUMN alias TEXT;
+                 ALTER TABLE transmissions ADD COLUMN encrypted INTEGER;
+                 ALTER TABLE transmissions ADD COLUMN amb_bytes INTEGER;
+                 CREATE INDEX transmissions_dst ON transmissions(dst_id, start_ns);
+                 CREATE INDEX transmissions_src ON transmissions(src_id, start_ns);",
+            ),
+        },
     ],
 };
 
@@ -112,6 +127,45 @@ pub struct Row {
     pub dtmf: Option<String>,
     /// Kept by retention however old (set from the web UI).
     pub starred: bool,
+    /// Digital voice (DMR) calls: timeslot (none for a radio heard
+    /// directly), colour code, `group`/`private`, source and destination
+    /// ids (the destination of a group call is its talkgroup), talker
+    /// alias, and whether it was encrypted.
+    pub timeslot: Option<i64>,
+    pub color_code: Option<i64>,
+    pub call_type: Option<String>,
+    pub src_id: Option<i64>,
+    pub dst_id: Option<i64>,
+    pub alias: Option<String>,
+    pub encrypted: Option<bool>,
+    /// Size of the raw voice frames kept beside the audio (`.amb`).
+    pub amb_bytes: Option<i64>,
+}
+
+/// What a digital call said about itself, for [`Index::set_digital`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Digital {
+    pub timeslot: Option<u8>,
+    pub color_code: Option<u8>,
+    pub call_type: Option<&'static str>,
+    pub src_id: Option<u32>,
+    pub dst_id: Option<u32>,
+    pub alias: Option<String>,
+    pub encrypted: bool,
+}
+
+impl Digital {
+    pub fn from_call(i: &scanner_core::dmr::CallInfo) -> Self {
+        Digital {
+            timeslot: i.timeslot,
+            color_code: i.color_code,
+            call_type: i.call_type(),
+            src_id: i.lc.map(|l| l.src),
+            dst_id: i.lc.map(|l| l.dst),
+            alias: i.alias.clone(),
+            encrypted: i.encrypted,
+        }
+    }
 }
 
 /// Filters for [`Index::search`]. `None` means no constraint.
@@ -129,6 +183,10 @@ pub struct Query {
     pub dtmf: Option<String>,
     /// Only starred (`true`) or only unstarred (`false`) recordings.
     pub starred: Option<bool>,
+    /// Digital calls to this destination (talkgroup or radio id).
+    pub dst_id: Option<i64>,
+    /// Digital calls from this radio id.
+    pub src_id: Option<i64>,
     /// Paging: only rows with a smaller id.
     pub before_id: Option<i64>,
     pub limit: usize,
@@ -143,9 +201,11 @@ const SEARCH_WHERE: &str = "status = 'complete'
     AND (?6 IS NULL OR id < ?6)
     AND (?8 IS NULL OR tone = ?8)
     AND (?9 IS NULL OR instr(dtmf, ?9) > 0)
-    AND (?10 IS NULL OR starred = ?10)";
+    AND (?10 IS NULL OR starred = ?10)
+    AND (?11 IS NULL OR dst_id = ?11)
+    AND (?12 IS NULL OR src_id = ?12)";
 
-fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 10] {
+fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 12] {
     [
         &q.freq_min,
         &q.freq_max,
@@ -157,6 +217,8 @@ fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 
         &q.tone,
         &q.dtmf,
         &q.starred,
+        &q.dst_id,
+        &q.src_id,
     ]
 }
 
@@ -364,6 +426,28 @@ impl Index {
         Ok(())
     }
 
+    /// Record what a digital call said about itself, and the size of its
+    /// raw voice frames file.
+    pub fn set_digital(&self, id: i64, d: &Digital, amb_bytes: u64) -> Result<(), IndexError> {
+        self.db.execute(
+            "UPDATE transmissions SET timeslot = ?2, color_code = ?3, call_type = ?4,
+                 src_id = ?5, dst_id = ?6, alias = ?7, encrypted = ?8, amb_bytes = ?9
+             WHERE id = ?1",
+            params![
+                id,
+                d.timeslot,
+                d.color_code,
+                d.call_type,
+                d.src_id,
+                d.dst_id,
+                d.alias,
+                d.encrypted,
+                amb_bytes as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Record the DTMF digits heard in a transmission (`None` clears them).
     pub fn set_dtmf(&self, id: i64, digits: Option<&str>) -> Result<(), IndexError> {
         self.db.execute(
@@ -450,7 +534,8 @@ impl Index {
     /// Bytes of audio (WAV and Opus) the complete rows hold on disk.
     pub fn usage_bytes(&self) -> Result<u64, IndexError> {
         let n: i64 = self.db.query_row(
-            "SELECT COALESCE(SUM(COALESCE(wav_bytes, 0) + COALESCE(opus_bytes, 0)), 0)
+            "SELECT COALESCE(SUM(COALESCE(wav_bytes, 0) + COALESCE(opus_bytes, 0)
+                 + COALESCE(amb_bytes, 0)), 0)
              FROM transmissions WHERE status = 'complete'",
             [],
             |r| r.get(0),
@@ -524,6 +609,14 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         tone: r.get("tone")?,
         dtmf: r.get("dtmf")?,
         starred: r.get("starred")?,
+        timeslot: r.get("timeslot")?,
+        color_code: r.get("color_code")?,
+        call_type: r.get("call_type")?,
+        src_id: r.get("src_id")?,
+        dst_id: r.get("dst_id")?,
+        alias: r.get("alias")?,
+        encrypted: r.get("encrypted")?,
+        amb_bytes: r.get("amb_bytes")?,
     })
 }
 

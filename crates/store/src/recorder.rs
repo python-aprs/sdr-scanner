@@ -37,6 +37,8 @@ pub struct RecorderStats {
     pub discarded: u64,
     /// Recordings tagged with DTMF digits.
     pub dtmf: u64,
+    /// Digital voice calls recorded.
+    pub calls: u64,
     /// Index row ids completed by this recorder, in close order.
     pub rows: Vec<i64>,
 }
@@ -50,6 +52,59 @@ struct Open {
     opus: Option<(String, OggOpusWriter)>,
     /// Listens to the recorded audio for DTMF digits.
     dtmf: Option<DtmfDecoder>,
+    /// A digital call's raw voice frames, once it has some.
+    amb: Option<AmbWriter>,
+}
+
+/// Raw AMBE voice frames as dsd writes them (`.amb`): a 4-byte header, then
+/// per 20 ms frame an error count and the 49 parameter bits in 7 bytes. dsd
+/// and mbelib-based tools can play them; `scanner ambe` turns them into WAV
+/// with a vocoder build. Written to `.part` and renamed when complete.
+struct AmbWriter {
+    rel: String,
+    part: PathBuf,
+    file: std::io::BufWriter<std::fs::File>,
+    bytes: u64,
+}
+
+pub const AMB_MAGIC: &[u8; 4] = b".amb";
+
+impl AmbWriter {
+    fn create(root: &Path, rel: String) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut part = root.join(&rel).into_os_string();
+        part.push(".part");
+        let part = PathBuf::from(part);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
+        file.write_all(AMB_MAGIC)?;
+        Ok(AmbWriter {
+            rel,
+            part,
+            file,
+            bytes: AMB_MAGIC.len() as u64,
+        })
+    }
+
+    fn write(&mut self, frames: &[scanner_core::dmr::AmbeFrame]) -> std::io::Result<()> {
+        use std::io::Write;
+        for f in frames {
+            self.file.write_all(&f.amb_bytes())?;
+            self.bytes += 8;
+        }
+        Ok(())
+    }
+
+    fn finish(self, root: &Path) -> std::io::Result<u64> {
+        let f = self.file.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        std::fs::rename(&self.part, root.join(&self.rel))?;
+        Ok(self.bytes)
+    }
+
+    fn abort(self) {
+        drop(self.file);
+        let _ = std::fs::remove_file(&self.part);
+    }
 }
 
 pub struct Recorder {
@@ -72,6 +127,14 @@ pub fn relative_path(start: &TxStart) -> String {
         &ts[6..8],
         start.slot.freq / 1e6
     )
+}
+
+/// The raw voice frames of a digital call sit next to the WAV (`.amb`).
+pub fn amb_path(wav_rel: &str) -> String {
+    match wav_rel.strip_suffix(".wav") {
+        Some(stem) => format!("{stem}.amb"),
+        None => format!("{wav_rel}.amb"),
+    }
 }
 
 /// Sample rates the Opus encoder accepts.
@@ -189,8 +252,19 @@ impl Recorder {
                         wav,
                         opus,
                         dtmf,
+                        amb: None,
                     },
                 );
+            }
+            Output::Ambe { id, frames } => {
+                if let Some(o) = self.open.get_mut(&id) {
+                    if o.amb.is_none() {
+                        o.amb = Some(AmbWriter::create(&self.root, amb_path(&o.rel))?);
+                    }
+                    if let Some(w) = &mut o.amb {
+                        w.write(&frames)?;
+                    }
+                }
             }
             Output::Audio { id, samples } => {
                 if let Some(o) = self.open.get_mut(&id) {
@@ -223,6 +297,9 @@ impl Recorder {
                     {
                         eprintln!("discarding {orel}: {e}");
                     }
+                    if let Some(w) = o.amb {
+                        w.abort();
+                    }
                     self.index.delete(o.row)?;
                     self.stats.discarded += 1;
                 }
@@ -252,6 +329,15 @@ impl Recorder {
                         self.index.set_dtmf(o.row, Some(&d.text()))?;
                         self.stats.dtmf += 1;
                     }
+                    let mut amb_bytes = 0;
+                    if let Some(w) = o.amb {
+                        amb_bytes = w.finish(&self.root)?;
+                    }
+                    if let Some(d) = &end.digital {
+                        let d = crate::index::Digital::from_call(d);
+                        self.index.set_digital(o.row, &d, amb_bytes)?;
+                        self.stats.calls += 1;
+                    }
                     let mut opus_bytes = 0;
                     if let Some((orel, w)) = o.opus {
                         match w.finish() {
@@ -265,7 +351,7 @@ impl Recorder {
                         }
                     }
                     if let Some(r) = &mut self.retention {
-                        r.added(bytes + opus_bytes);
+                        r.added(bytes + opus_bytes + amb_bytes);
                         // A failed pass must not stop the recording.
                         if let Err(e) = r.run(&self.root, &self.index, false) {
                             eprintln!("retention: {e}");
@@ -352,6 +438,7 @@ mod tests {
             peak_snr_db: 30.0,
             mean_snr_db: 25.0,
             tone: Some(scanner_core::tone::Tone::Ctcss(100.0)),
+            digital: None,
         }))
         .unwrap();
         let rows = r.index().recent(5).unwrap();
@@ -389,6 +476,86 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn keeps_dmr_voice_frames_and_ids() {
+        use scanner_core::dmr::{AmbeFrame, CallInfo, Lc};
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recorder::new(dir.path()).unwrap();
+        r.handle(Output::Open(TxStart {
+            id: 3,
+            slot: Slot {
+                freq: 145.79e6,
+                bandwidth: 11e3,
+                deviation: 0.0,
+                mode: Mode::Dmr,
+                priority: false,
+                record: true,
+                name: Some("DMR simplex".into()),
+                origin: SlotOrigin::Listed,
+                pair: None,
+            },
+            start_sample: 0,
+            start_time: UNIX_EPOCH + Duration::from_millis(1_795_330_443_123),
+            audio_rate: 8000,
+        }))
+        .unwrap();
+        for n in 0..4 {
+            r.handle(Output::Ambe {
+                id: 3,
+                frames: (0..3)
+                    .map(|k| AmbeFrame {
+                        bits: scanner_core::dmr::tx::test_frame(n * 3 + k),
+                        errs: 0,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+            r.handle(Output::Audio {
+                id: 3,
+                samples: vec![0.1; 480],
+            })
+            .unwrap();
+        }
+        let info = CallInfo {
+            timeslot: None,
+            color_code: Some(1),
+            lc: Some(Lc::group(99, 3_171_501)),
+            encrypted: false,
+            alias: Some("KF7HVM".into()),
+            repeater: false,
+        };
+        r.handle(Output::Close(TxEnd {
+            id: 3,
+            end_sample: 0,
+            signal_secs: 0.24,
+            peak_snr_db: 30.0,
+            mean_snr_db: 25.0,
+            tone: None,
+            digital: Some(info),
+        }))
+        .unwrap();
+        let rows = r.index().recent(5).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!((row.dst_id, row.src_id), (Some(99), Some(3_171_501)));
+        assert_eq!(row.call_type.as_deref(), Some("group"));
+        assert_eq!(row.color_code, Some(1));
+        assert_eq!(row.timeslot, None);
+        assert_eq!(row.alias.as_deref(), Some("KF7HVM"));
+        assert_eq!(row.encrypted, Some(false));
+        let amb = std::fs::read(dir.path().join(amb_path(&row.wav_path))).unwrap();
+        assert_eq!(&amb[..4], AMB_MAGIC);
+        assert_eq!(amb.len(), 4 + 12 * 8);
+        assert_eq!(row.amb_bytes, Some(amb.len() as i64));
+        let f = AmbeFrame::from_amb_bytes(amb[4 + 8..4 + 16].try_into().unwrap());
+        assert_eq!(f.bits, scanner_core::dmr::tx::test_frame(1));
+        let q = crate::index::Query {
+            dst_id: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(r.index().search(&q).unwrap().len(), 1);
     }
 
     #[test]
@@ -440,6 +607,7 @@ mod tests {
                 peak_snr_db: 30.0,
                 mean_snr_db: 25.0,
                 tone: None,
+                digital: None,
             }))
             .unwrap();
         }

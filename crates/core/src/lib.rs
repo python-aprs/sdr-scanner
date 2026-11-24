@@ -10,6 +10,7 @@ pub mod clock;
 pub mod config;
 pub mod demod;
 pub mod detector;
+pub mod dmr;
 pub mod dsp;
 pub mod dtmf;
 pub mod psd;

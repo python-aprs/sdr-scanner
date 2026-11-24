@@ -34,7 +34,7 @@ Rules:
   are merged into one slot that keeps every call and location. CTCSS tagging
   (Phase 4) will tell them apart in recordings.
 - Repeaters with FM are `mode = "nbfm"` (narrow FM gets 11 kHz / 2.5 kHz);
-  digital-only ones get their digital mode and `record = false` until that
-  decoder exists (`--record-digital` overrides).
+  digital-only ones get their digital mode, and `record = false` unless the
+  scanner decodes it (DMR does; `--record-digital` records the rest too).
 
 Tests: `python3 -m pytest tools/channels/tests`.
