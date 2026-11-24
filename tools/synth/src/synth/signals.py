@@ -52,9 +52,9 @@ def dtmf(digits: str, on: float, off: float, rate: int) -> np.ndarray:
             continue
         r = next(i for i, row in enumerate(DTMF_KEYS) if d in row)
         c = DTMF_KEYS[r].index(d)
-        t = np.arange(int(round(on * rate))) / rate
+        t = np.arange(round(on * rate)) / rate
         parts.append(0.5 * (np.sin(2 * np.pi * DTMF_ROWS[r] * t) + np.sin(2 * np.pi * DTMF_COLS[c] * t)))
-        parts.append(np.zeros(int(round(off * rate))))
+        parts.append(np.zeros(round(off * rate)))
     return np.concatenate(parts) if parts else np.zeros(0)
 
 
