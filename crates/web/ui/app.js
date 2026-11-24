@@ -779,14 +779,24 @@
     if (params.get('dtmf')) q.set('dtmf', params.get('dtmf'));
     if (params.get('tg')) q.set('dst_id', params.get('tg'));
     if (params.get('radio')) q.set('src_id', params.get('radio'));
+    if (params.get('call')) q.set('callsign', params.get('call'));
     if (params.get('starred') === '1') q.set('starred', 'true');
     return q;
   }
 
-  /** What a digital (DMR) call said about itself, as one line: timeslot,
-   * talkgroup or called radio, calling radio, talker alias. Empty for
-   * analog recordings. */
+  /** What a digital call said about itself, as one line. DMR: timeslot,
+   * talkgroup or called radio, calling radio, talker alias. System Fusion:
+   * calling and called callsigns, DG-ID, voice mode. Empty for analog
+   * recordings. */
   function callLabel(r) {
+    if (r.mode === 'ysf') {
+      const y = r.ysf || {};
+      const parts = [];
+      if (y.src) parts.push(y.dst && y.dst !== 'ALL' ? `${y.src} to ${y.dst}` : y.src);
+      if (y.dg_id) parts.push(`DG-ID ${y.dg_id}`);
+      if (y.data_type) parts.push(y.data_type.toUpperCase());
+      return parts.length ? parts.join(' · ') : 'Fusion call';
+    }
     if (r.mode !== 'dmr') return '';
     const parts = [];
     if (r.timeslot) parts.push(`TS${r.timeslot}`);
@@ -1088,6 +1098,7 @@
     const dtmf = h('input', { type: 'text', placeholder: 'digits or any', value: params.get('dtmf') || '', style: 'width:110px', 'aria-label': 'DTMF digits' });
     const tg = h('input', { type: 'number', min: '0', placeholder: '91', value: params.get('tg') || '', style: 'width:100px', 'aria-label': 'Talkgroup or called radio id' });
     const radio = h('input', { type: 'number', min: '0', placeholder: '3171501', value: params.get('radio') || '', style: 'width:110px', 'aria-label': 'Calling radio id' });
+    const callsign = h('input', { type: 'text', placeholder: 'KF7HVM', value: params.get('call') || '', style: 'width:100px', 'aria-label': 'Calling callsign' });
     const starredOnly = h('input', { type: 'checkbox', checked: params.get('starred') === '1' });
     const form = h('form', { class: 'filters', onsubmit: (e) => { e.preventDefault(); apply(); } },
       h('label', {}, 'Channel', chan),
@@ -1099,6 +1110,7 @@
       h('label', {}, 'DTMF', dtmf),
       h('label', { title: 'DMR talkgroup, or the radio a private call went to' }, 'Talkgroup', tg),
       h('label', { title: 'DMR radio id that made the call' }, 'Radio ID', radio),
+      h('label', { title: 'System Fusion callsign that made the call' }, 'Callsign', callsign),
       h('label', { class: 'check', title: 'Starred recordings are kept when old ones are deleted for space' }, starredOnly, 'Starred only'),
       h('button', { type: 'submit', class: 'primary' }, 'Search'),
       h('button', { type: 'button', onclick: () => { location.hash = '#/recordings'; } }, 'Clear'));
@@ -1124,6 +1136,7 @@
       if (dtmf.value.trim()) p.set('dtmf', dtmf.value.trim().toUpperCase());
       if (tg.value) p.set('tg', tg.value);
       if (radio.value) p.set('radio', radio.value);
+      if (callsign.value.trim()) p.set('call', callsign.value.trim().toUpperCase());
       if (starredOnly.checked) p.set('starred', '1');
       if (since.value && params.get('until')) p.set('until', params.get('until'));
       location.hash = `#/recordings${p.toString() ? '?' + p : ''}`;
@@ -1153,7 +1166,7 @@
             h('td', { class: 'mono' }, timeFmt.format(when)),
             h('td', { class: 'mono' }, MHZ(r.freq_hz, 4)),
             h('td', { class: 'grow' }, r.channel || channelName(r.freq_hz) || h('span', { class: 'muted' }, kindLabel[r.origin] || r.origin),
-              callLabel(r) ? h('div', { class: 'muted call', title: r.color_code !== null && r.color_code !== undefined ? `DMR, colour code ${r.color_code}` : 'DMR' }, callLabel(r)) : null),
+              callLabel(r) ? h('div', { class: 'muted call', title: r.mode === 'ysf' ? 'System Fusion' : r.color_code !== null && r.color_code !== undefined ? `DMR, colour code ${r.color_code}` : 'DMR' }, callLabel(r)) : null),
             h('td', { class: 'mono', title: r.tone ? (r.tone.startsWith('D') ? 'DCS code' : 'CTCSS tone (Hz)') : '' }, r.tone || ''),
             h('td', { class: 'mono dtmf', title: r.dtmf ? 'DTMF digits heard' : '' }, r.dtmf || ''),
             h('td', { class: 'num mono' }, fmtSecs(r.audio_secs)),

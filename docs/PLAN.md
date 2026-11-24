@@ -715,6 +715,16 @@ fixtures, a small recorded subset, and benchmarks with a soft regression gate.
   receiver. Not done yet: validation on a real capture, FM/DMR
   auto-classification of grid slots, a RadioID.net callsign list, and DVSI
   hardware.
+- Status (2026-11-24): the `ysf` mode (System Fusion, `crates/core/src/ysf`)
+  decodes sync, FICH, header/terminator callsigns (source, destination,
+  uplink, downlink), the callsign pieces in DN and V/D mode 1 voice frames
+  (late entry), and DG-ID, and records one call per transmission with its
+  AMBE+2 frames (`.amb`, decoded by the same vocoder as DMR). FICH and header
+  encoders match MMDVMHost bit for bit, and MMDVMHost decodes our DN frames
+  with no voice errors. Details go in the `ysf_calls` table. Not done yet: VW
+  (full-rate IMBE) voice, a real capture, and FM/YSF auto-classification
+  (442.175 near Rainier is a mixed FM/Fusion repeater, so its slot stays FM
+  until then).
 
 **Phase 7: SSB, CW and HF**
 - `usb`/`lsb`/`cw` modes, AGC, SSB/CW detectors, HF band profiles, upconverter

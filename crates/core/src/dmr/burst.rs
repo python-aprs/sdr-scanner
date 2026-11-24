@@ -285,42 +285,49 @@ fn ambe_prng(seed: u32) -> u32 {
     mask
 }
 
+/// One 72-bit AMBE+2 frame (C0, whitened C1, C2+C3, interleaved as in a
+/// DMR voice burst), bit `j` at `at(j)`. System Fusion's V/D mode 1 uses
+/// the same frame.
+pub fn ambe72_decode(at: impl Fn(usize) -> u8) -> AmbeFrame {
+    let read = |table: &[usize]| table.iter().fold(0u32, |a, &j| (a << 1) | at(j) as u32);
+    let (c0, c1, c23) = (read(&AMBE_A), read(&AMBE_B), read(&AMBE_C));
+    let (d0, e0, bad) = fec::golay24_decode(c0);
+    let (d1, e1) = fec::golay23_decode(c1 ^ ambe_prng(d0));
+    let mut bits = [0u8; 49];
+    fec::from_u32(d0, 12, &mut bits[0..]);
+    fec::from_u32(d1, 12, &mut bits[12..]);
+    fec::from_u32(c23, 25, &mut bits[24..]);
+    let errs = if bad { 10 } else { (e0 + e1) as u8 };
+    AmbeFrame { bits, errs }
+}
+
+/// Encodes 49 parameter bits as a 72-bit AMBE+2 frame, calling
+/// `set(j, bit)` for each of its bits.
+pub fn ambe72_encode(f: &[u8; 49], mut set: impl FnMut(usize, u8)) {
+    let d0 = fec::to_u32(&f[0..12]);
+    let c0 = fec::golay24_encode(d0);
+    let c1 = fec::golay23_encode(fec::to_u32(&f[12..24])) ^ ambe_prng(d0);
+    let c23 = fec::to_u32(&f[24..49]);
+    for (table, v, n) in [
+        (&AMBE_A[..], c0, 24),
+        (&AMBE_B[..], c1, 23),
+        (&AMBE_C[..], c23, 25),
+    ] {
+        for (i, &j) in table.iter().enumerate() {
+            set(j, ((v >> (n - 1 - i)) & 1) as u8);
+        }
+    }
+}
+
 /// The three voice frames of a voice burst.
 pub fn ambe_frames(b: &[u8]) -> [AmbeFrame; 3] {
-    std::array::from_fn(|k| {
-        let read = |table: &[usize]| {
-            table
-                .iter()
-                .fold(0u32, |a, &j| (a << 1) | b[ambe_pos(k, j)] as u32)
-        };
-        let (c0, c1, c23) = (read(&AMBE_A), read(&AMBE_B), read(&AMBE_C));
-        let (d0, e0, bad) = fec::golay24_decode(c0);
-        let (d1, e1) = fec::golay23_decode(c1 ^ ambe_prng(d0));
-        let mut bits = [0u8; 49];
-        fec::from_u32(d0, 12, &mut bits[0..]);
-        fec::from_u32(d1, 12, &mut bits[12..]);
-        fec::from_u32(c23, 25, &mut bits[24..]);
-        let errs = if bad { 10 } else { (e0 + e1) as u8 };
-        AmbeFrame { bits, errs }
-    })
+    std::array::from_fn(|k| ambe72_decode(|j| b[ambe_pos(k, j)]))
 }
 
 /// Writes three voice frames into a burst (for the synthesiser).
 pub fn set_ambe_frames(b: &mut [u8], frames: &[[u8; 49]; 3]) {
     for (k, f) in frames.iter().enumerate() {
-        let d0 = fec::to_u32(&f[0..12]);
-        let c0 = fec::golay24_encode(d0);
-        let c1 = fec::golay23_encode(fec::to_u32(&f[12..24])) ^ ambe_prng(d0);
-        let c23 = fec::to_u32(&f[24..49]);
-        for (table, v, n) in [
-            (&AMBE_A[..], c0, 24),
-            (&AMBE_B[..], c1, 23),
-            (&AMBE_C[..], c23, 25),
-        ] {
-            for (i, &j) in table.iter().enumerate() {
-                b[ambe_pos(k, j)] = ((v >> (n - 1 - i)) & 1) as u8;
-            }
-        }
+        ambe72_encode(f, |j, v| b[ambe_pos(k, j)] = v);
     }
 }
 

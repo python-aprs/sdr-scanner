@@ -1012,6 +1012,7 @@ dependencies = [
  "rusqlite",
  "scanner-core",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

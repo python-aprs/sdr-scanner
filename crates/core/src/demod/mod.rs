@@ -11,15 +11,17 @@ mod afsk;
 mod audio;
 mod dmr;
 mod nbfm;
+mod ysf;
 
 pub use afsk::AfskPacket;
 pub use audio::{Levels, SquelchGate};
 pub use dmr::DmrVoice;
 pub use nbfm::NbfmVoice;
+pub use ysf::YsfVoice;
 
 use crate::afsk::Decoded;
 use crate::config::{Mode, Slot};
-use crate::dmr::{AmbeFrame, CallInfo};
+use crate::dmr::AmbeFrame;
 use crate::scanner::ScannerConfig;
 use crate::tone::Tone;
 use num_complex::Complex32;
@@ -29,6 +31,13 @@ use num_complex::Complex32;
 pub struct Tags {
     /// CTCSS tone or DCS code heard, if any.
     pub tone: Option<Tone>,
+}
+
+/// What a digital voice call said about itself, by mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallInfo {
+    Dmr(crate::dmr::CallInfo),
+    Ysf(crate::ysf::CallInfo),
 }
 
 /// A digital voice call on a channel (a channel can carry more than one at
@@ -41,11 +50,11 @@ pub enum Call {
         at_sample: u64,
         info: CallInfo,
     },
-    /// 60 ms of voice: three frames and their audio (silence without a
+    /// Voice frames (20 ms each) and their audio (silence without a
     /// vocoder) at [`crate::dmr::vocoder::AUDIO_RATE`].
     Voice {
         key: u8,
-        frames: [AmbeFrame; 3],
+        frames: Vec<AmbeFrame>,
         audio: Vec<f32>,
     },
     End {
@@ -103,7 +112,7 @@ pub trait Demod: Send {
 
 /// Whether [`build`] has a demodulator for this mode.
 pub fn supports(mode: Mode) -> bool {
-    matches!(mode, Mode::Nbfm | Mode::Afsk1200 | Mode::Dmr)
+    matches!(mode, Mode::Nbfm | Mode::Afsk1200 | Mode::Dmr | Mode::Ysf)
 }
 
 /// The demodulator for `slot`'s mode, fed channel IQ at `rate`, or `None`
@@ -113,6 +122,7 @@ pub fn build(slot: &Slot, rate: f64, cfg: &ScannerConfig) -> Option<Box<dyn Demo
         Mode::Nbfm => Some(Box::new(NbfmVoice::new(slot, rate, cfg))),
         Mode::Afsk1200 => Some(Box::new(AfskPacket::new(slot, rate))),
         Mode::Dmr => Some(Box::new(DmrVoice::new(rate))),
+        Mode::Ysf => Some(Box::new(YsfVoice::new(rate))),
         _ => None,
     }
 }

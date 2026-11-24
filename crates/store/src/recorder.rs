@@ -533,7 +533,7 @@ mod tests {
             peak_snr_db: 30.0,
             mean_snr_db: 25.0,
             tone: None,
-            digital: Some(info),
+            digital: Some(scanner_core::demod::CallInfo::Dmr(info)),
         }))
         .unwrap();
         let rows = r.index().recent(5).unwrap();

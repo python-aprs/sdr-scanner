@@ -1,7 +1,7 @@
 //! DMR channels: discriminator output into the DMR receiver, calls out per
 //! timeslot (see [`crate::dmr`]).
 
-use super::{Call, Demod};
+use super::{Call, CallInfo, Demod};
 use crate::dmr::calls::{CallEvent, Calls};
 use crate::dmr::rx::{self, Receiver, RxBurst};
 use crate::dmr::vocoder::{self, FRAME_SAMPLES, Leveled, Vocoder};
@@ -46,7 +46,7 @@ impl DmrVoice {
                     self.out.push(Call::Start {
                         key,
                         at_sample: self.iq_sample(at),
-                        info,
+                        info: CallInfo::Dmr(info),
                     });
                 }
                 CallEvent::Voice { key, frames } => {
@@ -55,14 +55,18 @@ impl DmrVoice {
                         Some(v) => frames.iter().for_each(|f| v.decode(f, &mut audio)),
                         None => audio.resize(3 * FRAME_SAMPLES, 0.0),
                     }
-                    self.out.push(Call::Voice { key, frames, audio });
+                    self.out.push(Call::Voice {
+                        key,
+                        frames: frames.to_vec(),
+                        audio,
+                    });
                 }
                 CallEvent::End { key, at, info } => {
                     self.vocoders[key as usize] = None;
                     self.out.push(Call::End {
                         key,
                         at_sample: self.iq_sample(at),
-                        info,
+                        info: CallInfo::Dmr(info),
                     });
                 }
             }

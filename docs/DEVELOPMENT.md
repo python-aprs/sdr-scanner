@@ -382,6 +382,14 @@ calls and link control, `fec` and `burst` hold the codes and bit layouts, and
 encoders against bursts from MMDVMHost. `demod::dmr::DmrVoice` plugs it into
 the scanner, which opens one recording per call (`scanner::emit_calls`).
 
+`crates/core/src/ysf` does the same for System Fusion: `rx` finds the 20-symbol
+sync, fits the symbol levels from it (so deviation and polarity don't matter)
+and only locks when the FICH decodes; `calls` follows header, voice and
+terminator frames; `frame` and `fec` hold the layout, convolutional code,
+CRC and whitening; `matches_reference_header` checks against MMDVMHost.
+DN and V/D mode 1 voice is AMBE+2, so it uses the same vocoder and `.amb`
+files as DMR. VW (IMBE) calls are recorded with their callsigns but silent.
+
 Voice audio needs the `mbelib` feature, like `sdrplay`:
 
 ```sh

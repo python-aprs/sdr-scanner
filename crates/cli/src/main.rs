@@ -10,7 +10,7 @@
 //!   WAV per transmission plus the SQLite index
 //! - `scanner dtmf <wav or recordings folder>...`: decode DTMF digits, and
 //!   tag a folder's index rows with them
-//! - `scanner ambe <file.amb>...`: turn a DMR call's raw voice frames into
+//! - `scanner ambe <file.amb>...`: turn a DMR or Fusion call's raw voice frames into
 //!   WAV (needs the `mbelib` build)
 
 use anyhow::{Context, Result, bail};
@@ -70,7 +70,7 @@ enum Cmd {
     /// `index.sqlite`) has every complete recording scanned and its index
     /// rows tagged, for recordings made before DTMF tagging.
     Dtmf(DtmfArgs),
-    /// Decode DMR calls' raw voice frames (`.amb`, kept beside each call's
+    /// Decode DMR and System Fusion calls' raw voice frames (`.amb`, kept beside each call's
     /// recording) to WAV next to them. Needs a build with `--features
     /// mbelib`; for calls recorded by a build without it.
     Ambe {
@@ -340,15 +340,16 @@ impl Tuning {
         for w in &plan.warnings {
             eprintln!("warning: {w}");
         }
-        let dmr = plan
+        use scanner_core::config::Mode;
+        let ambe = plan
             .slots
             .iter()
-            .any(|s| s.mode == scanner_core::config::Mode::Dmr && s.record);
-        if dmr && !scanner_core::dmr::vocoder::available() {
+            .any(|s| matches!(s.mode, Mode::Dmr | Mode::Ysf) && s.record);
+        if ambe && !scanner_core::dmr::vocoder::available() {
             eprintln!(
-                "note: no DMR vocoder in this build: DMR calls are recorded with their ids \
-                 and raw voice frames (.amb) but silent audio. Build with --features mbelib \
-                 for audio, or decode later with `scanner ambe`."
+                "note: no AMBE+2 vocoder in this build: DMR and System Fusion calls are \
+                 recorded with their ids and raw voice frames (.amb) but silent audio. Build \
+                 with --features mbelib for audio, or decode later with `scanner ambe`."
             );
         }
         Ok((profile, plan))

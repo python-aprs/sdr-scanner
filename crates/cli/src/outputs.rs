@@ -3,6 +3,7 @@
 
 use crate::kiss::Kiss;
 use anyhow::{Context, Result};
+use scanner_core::demod::CallInfo;
 use scanner_core::scanner::Output;
 use scanner_core::units::Hz;
 use std::sync::mpsc::SyncSender;
@@ -46,7 +47,17 @@ impl Outputs {
                         s.slot.name.as_deref().unwrap_or("")
                     ),
                     Output::Close(e) if self.log => {
-                        if let Some(d) = &e.digital {
+                        if let Some(CallInfo::Ysf(d)) = &e.digital {
+                            eprintln!(
+                                "  ysf   {} -> {}{}{} {:.1} s",
+                                d.src.as_deref().unwrap_or("?"),
+                                d.dst.as_deref().unwrap_or("?"),
+                                d.dg_id.map(|g| format!(" DG-ID {g}")).unwrap_or_default(),
+                                d.mode().map(|m| format!(" {m}")).unwrap_or_default(),
+                                e.signal_secs
+                            );
+                        }
+                        if let Some(CallInfo::Dmr(d)) = &e.digital {
                             let who = match d.lc {
                                 Some(l) => format!(
                                     "{} {} -> {}",

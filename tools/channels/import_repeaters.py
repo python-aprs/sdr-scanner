@@ -322,7 +322,7 @@ def _q(s: str) -> str:
 
 # Digital modes the scanner can decode; other digital-only repeaters are
 # listed but not recorded.
-DECODED_MODES = {"dmr"}
+DECODED_MODES = {"dmr", "ysf"}
 
 
 def to_toml(reps: list[Repeater], profile: str, digital_record: bool = False) -> str:
