@@ -6,6 +6,7 @@ use crate::ogg::OggOpusWriter;
 use crate::retention::{DiskUsage, Policy, Retention};
 use crate::wav::WavWriter;
 use scanner_core::clock::{compact_utc, unix_ns};
+use scanner_core::dtmf::DtmfDecoder;
 use scanner_core::scanner::{Output, TxStart};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,8 @@ pub struct RecorderStats {
     pub packets: u64,
     /// Recordings thrown away part-way (a carrier found to be a spur).
     pub discarded: u64,
+    /// Recordings tagged with DTMF digits.
+    pub dtmf: u64,
     /// Index row ids completed by this recorder, in close order.
     pub rows: Vec<i64>,
 }
@@ -45,6 +48,8 @@ struct Open {
     wav: WavWriter,
     /// The web copy; dropped (leaving a stray `.part`) if it fails.
     opus: Option<(String, OggOpusWriter)>,
+    /// Listens to the recorded audio for DTMF digits.
+    dtmf: Option<DtmfDecoder>,
 }
 
 pub struct Recorder {
@@ -53,6 +58,7 @@ pub struct Recorder {
     open: HashMap<u64, Open>,
     stats: RecorderStats,
     opus: bool,
+    dtmf: bool,
     retention: Option<Retention>,
 }
 
@@ -89,6 +95,7 @@ impl Recorder {
             open: HashMap::new(),
             stats: RecorderStats::default(),
             opus: true,
+            dtmf: true,
             retention: None,
         })
     }
@@ -115,6 +122,13 @@ impl Recorder {
     /// 48 kHz) get no copy.
     pub fn with_opus(mut self, on: bool) -> Self {
         self.opus = on;
+        self
+    }
+
+    /// Decode DTMF digits from each recording and store them in the index
+    /// (on by default). Runs on the recorder thread, off the DSP path.
+    pub fn with_dtmf(mut self, on: bool) -> Self {
+        self.dtmf = on;
         self
     }
 
@@ -164,6 +178,8 @@ impl Recorder {
                     audio_rate: start.audio_rate,
                     wav_path: &rel,
                 })?;
+                let dtmf = (self.dtmf && start.audio_rate >= 4000)
+                    .then(|| DtmfDecoder::new(start.audio_rate as f64));
                 self.open.insert(
                     start.id,
                     Open {
@@ -172,12 +188,16 @@ impl Recorder {
                         rel,
                         wav,
                         opus,
+                        dtmf,
                     },
                 );
             }
             Output::Audio { id, samples } => {
                 if let Some(o) = self.open.get_mut(&id) {
                     o.wav.write(&samples)?;
+                    if let Some(d) = &mut o.dtmf {
+                        d.push(&samples);
+                    }
                     let failed = match &mut o.opus {
                         Some((orel, w)) => w.write(&samples).err().map(|e| (orel.clone(), e)),
                         None => None,
@@ -225,6 +245,12 @@ impl Recorder {
                     )?;
                     if let Some(t) = &end.tone {
                         self.index.set_tone(o.row, &t.label())?;
+                    }
+                    if let Some(d) = &o.dtmf
+                        && !d.digits().is_empty()
+                    {
+                        self.index.set_dtmf(o.row, Some(&d.text()))?;
+                        self.stats.dtmf += 1;
                     }
                     let mut opus_bytes = 0;
                     if let Some((orel, w)) = o.opus {
@@ -363,5 +389,64 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn tags_dtmf_digits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recorder::new(dir.path()).unwrap().with_opus(false);
+        let slot = Slot {
+            freq: 147.52e6,
+            bandwidth: 16e3,
+            deviation: 5e3,
+            mode: Mode::Nbfm,
+            priority: false,
+            record: true,
+            name: None,
+            origin: SlotOrigin::Listed,
+            pair: None,
+        };
+        for (id, audio) in [
+            (
+                1,
+                scanner_core::dtmf::synth(
+                    8000.0,
+                    &[('*', 0.1, 0.1), ('7', 0.1, 0.1), ('3', 0.1, 0.3)],
+                    0.1,
+                ),
+            ),
+            (2, vec![0.05; 8000]),
+        ] {
+            r.handle(Output::Open(TxStart {
+                id,
+                slot: slot.clone(),
+                start_sample: 0,
+                start_time: UNIX_EPOCH + Duration::from_secs(1_795_330_443 + id),
+                audio_rate: 8000,
+            }))
+            .unwrap();
+            // In uneven batches, as the scanner sends them.
+            for c in audio.chunks(700) {
+                r.handle(Output::Audio {
+                    id,
+                    samples: c.to_vec(),
+                })
+                .unwrap();
+            }
+            r.handle(Output::Close(TxEnd {
+                id,
+                end_sample: 0,
+                signal_secs: 1.0,
+                peak_snr_db: 30.0,
+                mean_snr_db: 25.0,
+                tone: None,
+            }))
+            .unwrap();
+        }
+        let rows = r.index().recent(5).unwrap();
+        let by_id = |i: usize| rows.iter().find(|row| row.id == r.stats().rows[i]).unwrap();
+        assert_eq!(by_id(0).dtmf.as_deref(), Some("*73"));
+        assert_eq!(by_id(1).dtmf, None);
+        assert_eq!(r.stats().dtmf, 1);
     }
 }

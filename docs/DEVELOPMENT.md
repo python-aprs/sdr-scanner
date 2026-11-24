@@ -55,6 +55,17 @@ checked against the Golay code and the 104 standard codes. A DCS code and
 its inverted partner are the same waveform (023 N is 047 I); the
 normal-polarity name wins.
 
+DTMF digits heard in a recording are stored too (`dtmf` in the index and
+API, groups split by a space: `*73 1234#`), from `dtmf::DtmfDecoder`. The
+recorder thread runs it on the audio it writes, so the DSP threads never
+see it; `--no-dtmf` turns it off. Goertzel filters at the 8 tones over
+25.6 ms windows every 6.4 ms; a window counts when the tone pair holds 70 %
+of its power, each tone clears the rest of its group by 8 dB, twist is under
+10 dB and the level is steady across the window. A digit needs ~40 ms of
+tone and ends after ~20 ms of gap. `scanner dtmf <wav>...` decodes files,
+and `scanner dtmf <recordings folder>` tags the rows of recordings made
+before this (rows with digits are skipped unless `--all`).
+
 Spur detection (`--spur-secs`, 300 by default): each recording keeps its
 audio level in 100 ms frames. Once it has been on for `--spur-secs` with no
 muted frame and a level spread (standard deviation) under 2 dB, it is a
@@ -117,7 +128,7 @@ radio (`--source sdrplay`, below) or a recording replayed at its real rate
 to disable), routes under `/api/v1` (see `crates/web/src/lib.rs`):
 `status` (live snapshot: active channels, noise floor, DSP load, drops),
 `recordings` (search by `freq_min`/`freq_max` Hz, `since`/`until` Unix s,
-`min_secs`, `tone`; page with `before_id`), `recordings/{id}` and
+`min_secs`, `tone`, `dtmf` (digits contained, or `any`); page with `before_id`), `recordings/{id}` and
 `recordings/{id}/audio` (the Opus copy if there is one, else the WAV;
 `?format=wav` or `?format=opus` to choose; HTTP range requests). Anonymous visitors see
 live status only unless `--public-recordings` / `--public-audio`.

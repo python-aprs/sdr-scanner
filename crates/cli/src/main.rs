@@ -8,6 +8,8 @@
 //! Phase 1:
 //! - `scanner run <recording> --config FILE`: scan a recording and write one
 //!   WAV per transmission plus the SQLite index
+//! - `scanner dtmf <wav or recordings folder>...`: decode DTMF digits, and
+//!   tag a folder's index rows with them
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -62,6 +64,10 @@ enum Cmd {
     /// Sweep the SDRplay radio's gain over the profile's band and suggest
     /// gain and detection thresholds for `serve`.
     Calibrate(CalibrateArgs),
+    /// Decode DTMF digits in WAV files. A recordings folder (one with an
+    /// `index.sqlite`) has every complete recording scanned and its index
+    /// rows tagged, for recordings made before DTMF tagging.
+    Dtmf(DtmfArgs),
     /// Work with band-profile config files.
     Config {
         #[command(subcommand)]
@@ -80,6 +86,19 @@ struct RunArgs {
     /// Print a JSON summary instead of a table.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(clap::Args)]
+struct DtmfArgs {
+    /// WAV files, or recordings folders.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    /// Also print each digit's start time and length.
+    #[arg(long, short)]
+    verbose: bool,
+    /// For a folder: rescan rows that already have digits too.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(clap::Args)]
@@ -273,6 +292,9 @@ struct Tuning {
     /// Skip the Opus copy of each recording (the web UI then plays the WAV).
     #[arg(long)]
     no_opus: bool,
+    /// Don't listen for DTMF digits in recordings.
+    #[arg(long)]
+    no_dtmf: bool,
     /// Disk budget for the recordings in GB: past 95 % of it the oldest are
     /// deleted until under 85 % (their index rows stay, marked expired).
     /// 0 means no budget.
@@ -370,6 +392,7 @@ fn main() -> Result<()> {
             json,
         } => peaks(recording, fft, threshold, merge, json),
         Cmd::Run(args) => run(args),
+        Cmd::Dtmf(args) => dtmf(args),
         Cmd::Devices => devices(),
         Cmd::Admin(a) => admin::run(a),
         Cmd::Calibrate(a) => calibrate(a),
@@ -418,6 +441,7 @@ fn main() -> Result<()> {
                 span: (profile.span.start.0, profile.span.stop.0),
                 out: &a.tuning.out,
                 opus: !a.tuning.no_opus,
+                dtmf: !a.tuning.no_dtmf,
                 retention: a.tuning.retention(),
                 anon_egress_bytes: (a.anon_egress_gb.max(0.0) * 1e9) as u64,
                 status_every: std::time::Duration::from_secs_f64(a.status_every.max(0.5)),
@@ -596,6 +620,76 @@ fn open(path: &Path) -> Result<FileSource> {
     FileSource::open(path).with_context(|| format!("opening {}", path.display()))
 }
 
+fn dtmf(a: DtmfArgs) -> Result<()> {
+    use scanner_core::dtmf::DtmfDecoder;
+    let decode = |path: &Path| -> Result<DtmfDecoder> {
+        let (rate, samples) = scanner_store::wav::read(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if rate < 4000 {
+            bail!("{}: {rate} Hz is too low for DTMF", path.display());
+        }
+        let mut d = DtmfDecoder::new(rate as f64);
+        d.push(&samples);
+        Ok(d)
+    };
+    let show = |name: &str, d: &DtmfDecoder| {
+        println!("{name}\t{}", d.text());
+        if a.verbose {
+            for g in d.digits() {
+                println!(
+                    "  {}  {:8.3} s  {:4.0} ms",
+                    g.key,
+                    g.start as f64 / d.rate(),
+                    (g.end - g.start) as f64 / d.rate() * 1e3
+                );
+            }
+        }
+    };
+    for path in &a.paths {
+        if !path.is_dir() {
+            let d = decode(path)?;
+            if !d.digits().is_empty() || a.paths.len() == 1 {
+                show(&path.display().to_string(), &d);
+            }
+            continue;
+        }
+        let index = scanner_store::Index::open(&path.join("index.sqlite"))
+            .with_context(|| format!("{} is not a recordings folder", path.display()))?;
+        let (mut scanned, mut tagged, mut after) = (0u64, 0u64, 0i64);
+        loop {
+            let rows = index.complete_after(after, 500)?;
+            let Some(last) = rows.last() else { break };
+            after = last.id;
+            for r in rows {
+                if r.dtmf.is_some() && !a.all {
+                    continue;
+                }
+                let d = match decode(&path.join(&r.wav_path)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("skipping row {}: {e:#}", r.id);
+                        continue;
+                    }
+                };
+                scanned += 1;
+                let text = (!d.digits().is_empty()).then(|| d.text());
+                if text.is_some() {
+                    tagged += 1;
+                    show(&r.wav_path, &d);
+                }
+                if text != r.dtmf {
+                    index.set_dtmf(r.id, text.as_deref())?;
+                }
+            }
+        }
+        eprintln!(
+            "{}: scanned {scanned} recordings, {tagged} with DTMF",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn info(path: PathBuf) -> Result<()> {
     let mut src = open(&path)?;
     let i = src.info().clone();
@@ -772,6 +866,7 @@ fn run(a: RunArgs) -> Result<()> {
 
     let recorder = Recorder::new(&a.tuning.out)?
         .with_opus(!a.tuning.no_opus)
+        .with_dtmf(!a.tuning.no_dtmf)
         .with_retention(a.tuning.retention())?;
     let (tx, writer) = recorder.spawn(64);
     let outputs = outputs::Outputs::new(tx, None, false);
@@ -831,6 +926,7 @@ fn run(a: RunArgs) -> Result<()> {
                     "signal_s": r.signal_secs,
                     "peak_snr_db": r.peak_snr_db,
                     "mean_snr_db": r.mean_snr_db,
+                    "dtmf": r.dtmf,
                     "wav": a.tuning.out.join(&r.wav_path),
                 })
             })
@@ -869,6 +965,9 @@ fn run(a: RunArgs) -> Result<()> {
                 r.peak_snr_db.unwrap_or(0.0),
                 r.wav_path
             );
+            if let Some(d) = &r.dtmf {
+                println!("{:>14} DTMF {d}", "");
+            }
         }
         println!(
             "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB WAV, {:.1} MB Opus",

@@ -120,6 +120,8 @@ pub struct ServeOptions<'a> {
     pub out: &'a Path,
     /// Also write Opus copies for the web UI.
     pub opus: bool,
+    /// Tag recordings with the DTMF digits heard in them.
+    pub dtmf: bool,
     pub retention: scanner_store::retention::Policy,
     /// Monthly budget for anonymous web traffic; 0 for none.
     pub anon_egress_bytes: u64,
@@ -163,6 +165,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
 
     let recorder = Recorder::new(o.out)?
         .with_opus(o.opus)
+        .with_dtmf(o.dtmf)
         .with_retention(o.retention)?;
     let disk_usage = recorder.disk_usage();
     let (tx, writer) = recorder.spawn(256);

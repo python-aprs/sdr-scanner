@@ -54,9 +54,12 @@ def parse_freq(v: Any) -> float:
 
 @dataclass
 class Audio:
-    kind: str = "tone"  # tone | speechlike | wav | silence
+    kind: str = "tone"  # tone | speechlike | wav | silence | dtmf
     freq: float = 1000.0  # tone
     path: str | None = None  # wav
+    digits: str = ""  # dtmf: 0-9 * # A-D, a space for a 1 s pause
+    on: float = 0.1  # dtmf: seconds per digit
+    off: float = 0.1  # dtmf: seconds between digits
     level: float = 1.0  # peak level relative to full deviation
 
 
@@ -151,7 +154,9 @@ class Scenario:
                 raise ValueError(f"{name}: {s.freq} Hz is outside the captured bandwidth")
             if s.start < 0 or s.duration <= 0:
                 raise ValueError(f"{name}: start must be >= 0 and duration > 0")
-            if s.audio.kind not in ("tone", "speechlike", "wav", "silence"):
+            if s.audio.kind == "dtmf" and not s.audio.digits.strip():
+                raise ValueError(f"{name}: audio kind dtmf needs digits")
+            if s.audio.kind not in ("tone", "speechlike", "wav", "silence", "dtmf"):
                 raise ValueError(f"{name}: unknown audio kind {s.audio.kind!r}")
             if s.audio.kind == "wav" and not s.audio.path:
                 raise ValueError(f"{name}: audio kind wav needs a path")

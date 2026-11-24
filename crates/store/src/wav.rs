@@ -85,9 +85,78 @@ impl WavWriter {
     }
 }
 
+/// Read a 16-bit PCM WAV (mono, or the first channel of several), as
+/// written by [`WavWriter`] or most other tools. Returns the sample rate
+/// and the samples in -1..1.
+pub fn read(path: &Path) -> io::Result<(u32, Vec<f32>)> {
+    parse(&fs::read(path)?)
+}
+
+fn parse(data: &[u8]) -> io::Result<(u32, Vec<f32>)> {
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err(bad("not a WAV file"));
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+    let mut fmt = None;
+    let mut pos = 12;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let len = u32_at(pos + 4) as usize;
+        let body = pos + 8;
+        match id {
+            b"fmt " if len >= 16 && body + 16 <= data.len() => {
+                fmt = Some((
+                    u16_at(body),
+                    u16_at(body + 2),
+                    u32_at(body + 4),
+                    u16_at(body + 14),
+                ));
+            }
+            b"data" => {
+                let (tag, channels, rate, bits) = fmt.ok_or_else(|| bad("no fmt chunk"))?;
+                // 1 = PCM; 0xFFFE = extensible, which we take as PCM too.
+                if !(tag == 1 || tag == 0xFFFE) || bits != 16 || channels == 0 {
+                    return Err(bad("only 16-bit PCM WAV is supported"));
+                }
+                // A header left at 0 (a `.part`) means "to the end".
+                let end = if len == 0 {
+                    data.len()
+                } else {
+                    (body + len).min(data.len())
+                };
+                let step = 2 * channels as usize;
+                let samples = data[body..end]
+                    .chunks_exact(step)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                    .collect();
+                return Ok((rate, samples));
+            }
+            _ => {}
+        }
+        pos = body + len + (len & 1);
+    }
+    Err(bad("no data chunk"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_back_what_it_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.wav");
+        let mut w = WavWriter::create(&p, 8000).unwrap();
+        w.write(&[0.0, 0.5, -0.25]).unwrap();
+        w.finish(8000).unwrap();
+        let (rate, s) = read(&p).unwrap();
+        assert_eq!(rate, 8000);
+        assert_eq!(s.len(), 3);
+        assert!((s[1] - 0.5).abs() < 1e-4 && (s[2] + 0.25).abs() < 1e-4);
+        assert!(parse(b"RIFF....WAVEjunk").is_err());
+    }
 
     #[test]
     fn writes_valid_header_and_renames() {

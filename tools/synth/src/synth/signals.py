@@ -37,6 +37,27 @@ def speechlike(n: int, rate: int, rng: np.random.Generator) -> np.ndarray:
     return np.clip(x / peak, -1, 1)
 
 
+DTMF_ROWS = (697.0, 770.0, 852.0, 941.0)
+DTMF_COLS = (1209.0, 1336.0, 1477.0, 1633.0)
+DTMF_KEYS = ("123A", "456B", "789C", "*0#D")
+
+
+def dtmf(digits: str, on: float, off: float, rate: int) -> np.ndarray:
+    """Touch-tone digits, `on` seconds each with `off` seconds between; a
+    space is a 1 s pause. Each tone at half amplitude, so the pair peaks at 1."""
+    parts = []
+    for d in digits.upper():
+        if d == " ":
+            parts.append(np.zeros(int(rate * 1.0)))
+            continue
+        r = next(i for i, row in enumerate(DTMF_KEYS) if d in row)
+        c = DTMF_KEYS[r].index(d)
+        t = np.arange(int(round(on * rate))) / rate
+        parts.append(0.5 * (np.sin(2 * np.pi * DTMF_ROWS[r] * t) + np.sin(2 * np.pi * DTMF_COLS[c] * t)))
+        parts.append(np.zeros(int(round(off * rate))))
+    return np.concatenate(parts) if parts else np.zeros(0)
+
+
 def preemphasize(x: np.ndarray, rate: int) -> np.ndarray:
     """6 dB/octave pre-emphasis above ~300 Hz, then limit and low-pass at 3 kHz,
     roughly what an NBFM transmitter's audio chain does."""
@@ -73,6 +94,10 @@ def modulating_audio(sc: Scenario, s: Signal, index: int) -> np.ndarray:
         data = sps.resample_poly(data / peak, AUDIO_RATE, rate)
         reps = int(np.ceil(n / len(data)))
         x = np.tile(data, reps)[:n]
+    elif a.kind == "dtmf":
+        d = dtmf(a.digits, a.on, a.off, AUDIO_RATE)[:n]
+        x = np.zeros(n)
+        x[: len(d)] = d
     else:  # validated earlier
         raise ValueError(a.kind)
     x = x * a.level
