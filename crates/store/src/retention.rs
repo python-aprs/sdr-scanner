@@ -73,11 +73,17 @@ impl DiskUsage {
     /// retention, e.g. from the web UI.
     pub fn released(&self, bytes: u64) {
         self.released.fetch_add(bytes, Ordering::Relaxed);
-        let _ = self
-            .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                Some(u.saturating_sub(bytes))
-            });
+        // (A plain CAS loop: `fetch_update` is deprecated on newer Rust and
+        // its replacement isn't on older ones.)
+        let mut u = self.used.load(Ordering::Relaxed);
+        while let Err(now) = self.used.compare_exchange_weak(
+            u,
+            u.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            u = now;
+        }
     }
 
     pub fn snapshot(&self) -> StorageStatus {
