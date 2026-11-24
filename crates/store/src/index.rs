@@ -134,6 +134,42 @@ pub struct Query {
     pub limit: usize,
 }
 
+/// The filters [`Index::search`] and [`Index::timeline`] share; parameters
+/// as [`search_params`] binds them (`?7` is the limit).
+const SEARCH_WHERE: &str = "status = 'complete'
+    AND (?1 IS NULL OR freq_hz >= ?1) AND (?2 IS NULL OR freq_hz <= ?2)
+    AND (?3 IS NULL OR start_ns >= ?3) AND (?4 IS NULL OR start_ns < ?4)
+    AND (?5 IS NULL OR audio_secs >= ?5)
+    AND (?6 IS NULL OR id < ?6)
+    AND (?8 IS NULL OR tone = ?8)
+    AND (?9 IS NULL OR instr(dtmf, ?9) > 0)
+    AND (?10 IS NULL OR starred = ?10)";
+
+fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 10] {
+    [
+        &q.freq_min,
+        &q.freq_max,
+        &q.since_ns,
+        &q.until_ns,
+        &q.min_secs,
+        &q.before_id,
+        limit,
+        &q.tone,
+        &q.dtmf,
+        &q.starred,
+    ]
+}
+
+/// One transmission on the timeline: where, when and for how long.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub id: i64,
+    pub freq_hz: f64,
+    pub start_ns: i64,
+    /// Time on air.
+    pub secs: f64,
+}
+
 /// A decoded AX.25 frame.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PacketRow {
@@ -368,36 +404,48 @@ impl Index {
 
     /// Completed transmissions matching `q`, newest first.
     pub fn search(&self, q: &Query) -> Result<Vec<Row>, IndexError> {
-        let mut st = self.db.prepare(
-            "SELECT * FROM transmissions
-             WHERE status = 'complete'
-               AND (?1 IS NULL OR freq_hz >= ?1) AND (?2 IS NULL OR freq_hz <= ?2)
-               AND (?3 IS NULL OR start_ns >= ?3) AND (?4 IS NULL OR start_ns < ?4)
-               AND (?5 IS NULL OR audio_secs >= ?5)
-               AND (?6 IS NULL OR id < ?6)
-               AND (?8 IS NULL OR tone = ?8)
-               AND (?9 IS NULL OR instr(dtmf, ?9) > 0)
-               AND (?10 IS NULL OR starred = ?10)
-             ORDER BY start_ns DESC, id DESC LIMIT ?7",
-        )?;
-        st.query_map(
-            params![
-                q.freq_min,
-                q.freq_max,
-                q.since_ns,
-                q.until_ns,
-                q.min_secs,
-                q.before_id,
-                q.limit.clamp(1, 1000) as i64,
-                q.tone,
-                q.dtmf,
-                q.starred
-            ],
-            row,
-        )?
+        let mut st = self.db.prepare(&format!(
+            "SELECT * FROM transmissions WHERE {SEARCH_WHERE}
+             ORDER BY start_ns DESC, id DESC LIMIT ?7"
+        ))?;
+        let limit = q.limit.clamp(1, 1000) as i64;
+        st.query_map(search_params(q, &limit), row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
+    }
+
+    /// Just when and where each transmission matching `q` was, newest
+    /// first: enough to draw them on a timeline. `q.limit` up to
+    /// [`Self::TIMELINE_MAX`].
+    pub fn timeline(&self, q: &Query) -> Result<Vec<Span>, IndexError> {
+        let mut st = self.db.prepare(&format!(
+            "SELECT id, freq_hz, start_ns, end_ns, audio_secs FROM transmissions
+             WHERE {SEARCH_WHERE}
+             ORDER BY start_ns DESC, id DESC LIMIT ?7"
+        ))?;
+        let limit = q.limit.clamp(1, Self::TIMELINE_MAX) as i64;
+        st.query_map(search_params(q, &limit), |r| {
+            let start_ns: i64 = r.get(2)?;
+            let end_ns: Option<i64> = r.get(3)?;
+            let audio: Option<f64> = r.get(4)?;
+            // The time on air; the audio length when the end is missing.
+            let secs = match end_ns {
+                Some(e) if e > start_ns => (e - start_ns) as f64 / 1e9,
+                _ => audio.unwrap_or(0.0),
+            };
+            Ok(Span {
+                id: r.get(0)?,
+                freq_hz: r.get(1)?,
+                start_ns,
+                secs,
+            })
+        })?
         .collect::<rusqlite::Result<_>>()
         .map_err(Into::into)
     }
+
+    /// The most rows [`Self::timeline`] returns at once.
+    pub const TIMELINE_MAX: usize = 20_000;
 
     /// Bytes of audio (WAV and Opus) the complete rows hold on disk.
     pub fn usage_bytes(&self) -> Result<u64, IndexError> {
@@ -564,6 +612,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(page.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2]);
+        // The timeline takes the same filters.
+        let spans = ix.timeline(&q).unwrap();
+        assert_eq!(spans.iter().map(|s| s.id).collect::<Vec<_>>(), vec![4, 1]);
+        assert_eq!(spans[0].freq_hz, 146.52e6);
+        assert_eq!(spans[0].start_ns, 3_000_000_000);
+        // No end time recorded, so the audio length stands in.
+        assert_eq!(spans[0].secs, 4.0);
     }
 
     #[test]

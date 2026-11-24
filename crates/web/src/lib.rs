@@ -6,6 +6,7 @@
 //! |---|---|
 //! | `GET /api/v1/status` | anonymous if `public.live` (default on), else admin |
 //! | `GET /api/v1/recordings` | anonymous if `public.recordings` (default off), else admin |
+//! | `GET /api/v1/recordings/timeline` | same as the list, same filters: compact `[id, freq_hz, start_ms, secs]` rows for the timeline (`limit` default 2000) |
 //! | `GET /api/v1/recordings/{id}` | same as the list |
 //! | `PATCH /api/v1/recordings/{id}` | admin (+ CSRF): `{"starred": bool}`; starred recordings are kept by retention |
 //! | `DELETE /api/v1/recordings/{id}` | admin (+ CSRF): delete the recording's files and its row |
@@ -416,6 +417,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/live", get(live::live_ws))
         .route("/api/v1/audio", get(audio::audio_ws))
         .route("/api/v1/recordings", get(list_recordings))
+        .route("/api/v1/recordings/timeline", get(recordings_timeline))
         .route("/api/v1/packets", get(list_packets))
         .route(
             "/api/v1/recordings/{id}",
@@ -708,13 +710,8 @@ struct AudioParams {
     format: Option<String>,
 }
 
-async fn list_recordings(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    UrlQuery(p): UrlQuery<ListParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    s.caller(&headers).await?.require(s.public.recordings)?;
-    let q = Query {
+fn list_query(p: ListParams, default_limit: usize) -> Query {
+    Query {
         freq_min: p.freq_min,
         freq_max: p.freq_max,
         since_ns: p.since.map(|t| (t * 1e9) as i64),
@@ -728,13 +725,52 @@ async fn list_recordings(
             .map(|d| if d == "ANY" { String::new() } else { d }),
         starred: p.starred,
         before_id: p.before_id,
-        limit: p.limit.unwrap_or(100),
-    };
+        limit: p.limit.unwrap_or(default_limit),
+    }
+}
+
+async fn list_recordings(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    UrlQuery(p): UrlQuery<ListParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.caller(&headers).await?.require(s.public.recordings)?;
+    let q = list_query(p, 100);
     let rows = blocking(move || s.index()?.search(&q).map_err(db_err)).await?;
     let next = rows.last().map(|r| r.id);
     let items: Vec<Recording> = rows.into_iter().map(recording).collect();
     Ok(Json(
         serde_json::json!({ "items": items, "next_before_id": next }),
+    ))
+}
+
+/// When and where the recordings matching the list's filters were, for the
+/// timeline above the recordings table. Compact, since it can be thousands
+/// of rows: `items` are `[id, freq_hz, start_ms, secs]`, newest first, and
+/// `truncated` says the limit (default 2000) cut off older ones.
+async fn recordings_timeline(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    UrlQuery(p): UrlQuery<ListParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.caller(&headers).await?.require(s.public.recordings)?;
+    let q = list_query(p, 2000);
+    let limit = q.limit.clamp(1, Index::TIMELINE_MAX);
+    let spans = blocking(move || s.index()?.timeline(&q).map_err(db_err)).await?;
+    let truncated = spans.len() == limit;
+    let items: Vec<serde_json::Value> = spans
+        .into_iter()
+        .map(|sp| {
+            serde_json::json!([
+                sp.id,
+                sp.freq_hz.round() as i64,
+                sp.start_ns / 1_000_000,
+                (sp.secs * 10.0).round() / 10.0
+            ])
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "items": items, "truncated": truncated }),
     ))
 }
 
@@ -1913,6 +1949,35 @@ mod tests {
             login(&state, "masen", PASSWORD).await.status,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn timeline_takes_the_list_filters() {
+        let (_dir, state, id, token) = setup(Public::default());
+        let (st, body) = get(
+            &state,
+            "/api/v1/recordings/timeline?freq_min=146e6&freq_max=147e6",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"][0][0], id);
+        assert_eq!(v["items"][0][1], 146_520_000);
+        assert_eq!(v["truncated"], false);
+        let (_, body) = get(
+            &state,
+            "/api/v1/recordings/timeline?freq_min=147e6",
+            Some(&token),
+            None,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 0);
+        // Private like the list.
+        let (st, _) = get(&state, "/api/v1/recordings/timeline", None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -10,5 +10,5 @@ pub mod retention;
 pub mod settings;
 pub mod wav;
 
-pub use index::{Index, Query, Row};
+pub use index::{Index, Query, Row, Span};
 pub use recorder::{Recorder, RecorderStats};

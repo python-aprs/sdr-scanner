@@ -758,6 +758,299 @@
     return out;
   }
 
+  // ----- Recordings timeline -----
+  /** The recordings list's filters (from the page's URL) as API query
+   * parameters, shared by the table and the timeline. */
+  function recordingQuery(params) {
+    const q = new URLSearchParams();
+    const f = parseFloat(params.get('freq'));
+    if (!isNaN(f)) {
+      const t = parseFloat(params.get('tol') || '0.005');
+      q.set('freq_min', String(Math.round((f - t) * 1e6)));
+      q.set('freq_max', String(Math.round((f + t) * 1e6)));
+    }
+    for (const [k, name] of [['since', 'since'], ['until', 'until']]) {
+      if (!params.get(k)) continue;
+      const t = new Date(params.get(k)).getTime();
+      if (!isNaN(t)) q.set(name, String(t / 1000));
+    }
+    if (params.get('min')) q.set('min_secs', params.get('min'));
+    if (params.get('tone')) q.set('tone', params.get('tone'));
+    if (params.get('dtmf')) q.set('dtmf', params.get('dtmf'));
+    if (params.get('starred') === '1') q.set('starred', 'true');
+    return q;
+  }
+
+  /** A local time as a datetime-local value, to the second. */
+  function localInput(ms) {
+    const d = new Date(ms);
+    const p2 = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+  }
+
+  const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+  const FREQ_STEPS = [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2];
+  const hmFmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+  const mdFmt = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+
+  /**
+   * Every call matching the page's filters drawn as a horizontal line: time
+   * across, frequency up. Hover for details, click to play, drag across to
+   * narrow the page to that time range.
+   */
+  function recordingsTimeline(params, onPick) {
+    const canvas = h('canvas', { class: 'tl-canvas', 'aria-label': 'Timeline of recordings, time across and frequency up' });
+    // Details of the hovered call sit in the header, out of the way of the
+    // calls around it.
+    const idle = () => h('span', { class: 'muted' }, canAudio() ? 'Hover a call for details, click to play' : 'Hover a call for details');
+    const detail = h('span', { class: 'tl-detail', 'aria-live': 'polite' }, idle());
+    const summary = h('span', { class: 'muted' });
+    const zoomOut = h('button', { type: 'button', hidden: !params.get('until'), onclick: () => {
+      const p = new URLSearchParams(params); p.delete('since'); p.delete('until');
+      location.hash = `#/recordings${p.toString() ? '?' + p : ''}`;
+    } }, 'Show all times');
+    const wrap = h('div', { class: 'tl' }, canvas);
+    const el = h('section', { class: 'panel tl-panel', hidden: true },
+      h('div', { class: 'panel-head' }, h('h2', {}, 'Timeline'), summary, h('span', { class: 'spacer' }), detail, zoomOut),
+      wrap);
+    const PAD = { l: 66, r: 12, t: 18, b: 24 };
+    // Without a Since filter the timeline shows the past few days.
+    const DEFAULT_DAYS = 3;
+    const defaultSince = params.get('since') ? null : Date.now() - DEFAULT_DAYS * 86400e3;
+    let spans = [];          // [id, freq_hz, start_ms, secs], newest first
+    let view = null;         // {t0, t1, f0, f1}
+    let hoverId = null, drag = null;
+
+    function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+    const playingId = () => (!$('#player').hidden && player.list[player.index] ? player.list[player.index].id : null);
+
+    function computeView() {
+      const now = Date.now();
+      const since = defaultSince !== null ? defaultSince : new Date(params.get('since')).getTime();
+      const until = params.get('until') ? new Date(params.get('until')).getTime() : NaN;
+      let t0 = Infinity, t1 = -Infinity, f0 = Infinity, f1 = -Infinity;
+      for (const [, f, s, secs] of spans) {
+        t0 = Math.min(t0, s); t1 = Math.max(t1, s + secs * 1000);
+        f0 = Math.min(f0, f); f1 = Math.max(f1, f);
+      }
+      // Up to now unless the page ends earlier, so quiet time shows as quiet.
+      t1 = !isNaN(until) ? until : Math.max(t1, now);
+      if (!isNaN(since)) t0 = since;
+      const tp = Math.max((t1 - t0) * 0.02, 5000);
+      t0 -= tp;
+      if (isNaN(until)) t1 += tp / 2;
+      // A frequency filter sets the band; otherwise the calls do.
+      const fq = parseFloat(params.get('freq'));
+      if (!isNaN(fq)) {
+        const tol = parseFloat(params.get('tol') || '0.005') * 1e6;
+        f0 = Math.min(f0, fq * 1e6 - tol); f1 = Math.max(f1, fq * 1e6 + tol);
+      }
+      const span = Math.max(f1 - f0, 25e3);
+      const mid = (f0 + f1) / 2;
+      f0 = mid - span * 0.56; f1 = mid + span * 0.56;
+      view = { t0, t1, f0, f1 };
+    }
+
+    function size() {
+      const r = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.round(r.width * dpr)), hh = Math.max(1, Math.round(r.height * dpr));
+      if (canvas.width !== w || canvas.height !== hh) { canvas.width = w; canvas.height = hh; }
+      return { W: r.width, H: r.height, dpr };
+    }
+    const xOf = (t, W) => PAD.l + ((t - view.t0) / (view.t1 - view.t0)) * (W - PAD.l - PAD.r);
+    const tOf = (x, W) => view.t0 + ((x - PAD.l) / (W - PAD.l - PAD.r)) * (view.t1 - view.t0);
+    const yOf = (f, H) => PAD.t + (1 - (f - view.f0) / (view.f1 - view.f0)) * (H - PAD.t - PAD.b);
+
+    function draw() {
+      if (!view) return;
+      const { W, H, dpr } = size();
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      const grid = css('--grid'), muted = css('--muted'), accent = css('--accent'), text = css('--text');
+      ctx.font = `11px ${css('--mono') || 'monospace'}`;
+      ctx.lineWidth = 1;
+
+      // Frequency grid, aiming for a line every ~36 px.
+      const plotH = H - PAD.t - PAD.b;
+      const fSpanMhz = (view.f1 - view.f0) / 1e6;
+      const fStep = FREQ_STEPS.find((s) => (fSpanMhz / s) <= Math.max(2, plotH / 36)) || 5;
+      const fDigits = Math.max(1, (String(fStep).split('.')[1] || '').length);
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      for (let k = Math.ceil(view.f0 / 1e6 / fStep); k * fStep <= view.f1 / 1e6; k++) {
+        const m = k * fStep;
+        const y = Math.round(yOf(m * 1e6, H)) + 0.5;
+        ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(W - PAD.r, y); ctx.stroke();
+        ctx.fillStyle = muted; ctx.fillText(m.toFixed(fDigits), PAD.l - 8, y);
+      }
+
+      // Time grid, a label every ~90 px; midnight gets the date.
+      const plotW = W - PAD.l - PAD.r;
+      const tSpan = (view.t1 - view.t0) / 1000;
+      const tStep = TIME_STEPS.find((s) => tSpan / s <= Math.max(2, plotW / 90)) || 2592000;
+      const tz = new Date().getTimezoneOffset() * 60000;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      const first = Math.ceil((view.t0 - (tStep >= 86400 ? -tz : 0)) / (tStep * 1000)) * tStep * 1000 + (tStep >= 86400 ? -tz : 0);
+      for (let t = first; t <= view.t1; t += tStep * 1000) {
+        const x = Math.round(xOf(t, W)) + 0.5;
+        if (x < PAD.l || x > W - PAD.r) continue;
+        ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+        const d = new Date(t);
+        const midnight = d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0;
+        const label = midnight || tStep >= 86400 ? mdFmt.format(d) : tStep < 60 ? timeFmt.format(d) : hmFmt.format(d);
+        ctx.fillStyle = midnight ? text : muted; ctx.fillText(label, x, H - PAD.b + 6);
+      }
+
+      // A bar at each local midnight, labelled with the day it starts.
+      const dayPx = (86400e3 / (view.t1 - view.t0)) * plotW;
+      if (dayPx >= 6) {
+        const d = new Date(view.t0); d.setHours(24, 0, 0, 0);
+        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+        ctx.font = `600 11px ${css('--sans') || 'sans-serif'}`;
+        for (; d.getTime() <= view.t1; d.setDate(d.getDate() + 1)) {
+          const x = Math.round(xOf(d.getTime(), W)) + 0.5;
+          if (x < PAD.l || x > W - PAD.r) continue;
+          ctx.strokeStyle = muted; ctx.globalAlpha = 0.7; ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(x, 2); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+          ctx.globalAlpha = 1;
+          if (dayPx >= 60) { ctx.fillStyle = muted; ctx.fillText(dayFmt.format(d).replace(/,? \d{4}$/, ''), x + 5, 3); }
+        }
+        ctx.lineWidth = 1;
+      }
+
+      // The calls, oldest first so the newest sit on top.
+      ctx.save();
+      ctx.beginPath(); ctx.rect(PAD.l, 0, plotW, H); ctx.clip();
+      ctx.lineCap = 'round'; ctx.lineWidth = 3;
+      ctx.strokeStyle = accent; ctx.globalAlpha = 0.8;
+      ctx.beginPath();
+      for (let i = spans.length - 1; i >= 0; i--) {
+        const [, f, s, secs] = spans[i];
+        const x0 = xOf(s, W), x1 = Math.max(xOf(s + secs * 1000, W), x0 + 1), y = yOf(f, H);
+        ctx.moveTo(x0, y); ctx.lineTo(x1, y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      const marks = [[playingId(), text, 4], [hoverId, text, 5]];
+      for (const [id, color, lw] of marks) {
+        const sp = id !== null && spans.find((x) => x[0] === id);
+        if (!sp) continue;
+        const x0 = xOf(sp[2], W), x1 = Math.max(xOf(sp[2] + sp[3] * 1000, W), x0 + 1), y = yOf(sp[1], H);
+        ctx.strokeStyle = color; ctx.lineWidth = lw;
+        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+      }
+      ctx.restore();
+
+      if (drag && Math.abs(drag.x1 - drag.x0) > 2) {
+        const a = Math.max(PAD.l, Math.min(drag.x0, drag.x1)), b = Math.min(W - PAD.r, Math.max(drag.x0, drag.x1));
+        ctx.fillStyle = css('--active'); ctx.fillRect(a, PAD.t, b - a, plotH);
+        ctx.strokeStyle = css('--active-edge'); ctx.lineWidth = 1;
+        ctx.strokeRect(a + 0.5, PAD.t + 0.5, b - a - 1, plotH - 1);
+      }
+    }
+
+    /** The call under the pointer: closest line within a few px. */
+    function hit(x, y) {
+      const { W, H } = size();
+      let best = null, bestD = 7;
+      for (const sp of spans) {
+        const x0 = xOf(sp[2], W) - 4, x1 = Math.max(xOf(sp[2] + sp[3] * 1000, W), x0 + 5) + 4;
+        if (x < x0 || x > x1) continue;
+        const d = Math.abs(yOf(sp[1], H) - y);
+        if (d < bestD) { best = sp; bestD = d; }
+      }
+      return best;
+    }
+
+    function local(e) {
+      const r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      if (!view || e.button !== 0) return;
+      const { x } = local(e);
+      drag = { x0: x, x1: x, id: e.pointerId };
+      canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (!view) return;
+      const { x, y } = local(e);
+      if (drag) { drag.x1 = x; showDetail(null); hoverId = null; draw(); return; }
+      const sp = hit(x, y);
+      const id = sp ? sp[0] : null;
+      canvas.classList.toggle('pointing', !!sp);
+      if (id !== hoverId) { hoverId = id; draw(); showDetail(sp); }
+    });
+    function showDetail(sp) {
+      if (!sp) { fill(detail, idle()); return; }
+      const when = new Date(sp[2]);
+      fill(detail,
+        h('span', { class: 'mono' }, `${MHZ(sp[1], 4)} MHz`),
+        channelName(sp[1]) ? h('span', {}, channelName(sp[1])) : null,
+        h('span', { class: 'muted' }, `${dayLabel(when)} ${timeFmt.format(when)}`),
+        h('span', { class: 'muted mono' }, fmtSecs(sp[3])));
+    }
+    const endDrag = (e) => {
+      if (!drag) return;
+      const d = drag; drag = null;
+      const { W } = size();
+      if (Math.abs(d.x1 - d.x0) > 6) {
+        const a = tOf(Math.min(d.x0, d.x1), W), b = tOf(Math.max(d.x0, d.x1), W);
+        const p = new URLSearchParams(params);
+        p.set('since', localInput(Math.floor(a / 1000) * 1000));
+        p.set('until', localInput(Math.ceil(b / 1000) * 1000));
+        location.hash = `#/recordings?${p}`;
+        return;
+      }
+      draw();
+      if (e.type === 'pointerup') {
+        const { x, y } = local(e);
+        const sp = hit(x, y);
+        if (sp) onPick(sp[0]);
+      }
+    };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', () => { if (!drag && hoverId !== null) { hoverId = null; draw(); showDetail(null); } });
+
+    const ro = new ResizeObserver(() => draw());
+    ro.observe(canvas);
+    const audio = $('#audio');
+    audio.addEventListener('play', draw);
+    const scheme = window.matchMedia('(prefers-color-scheme: light)');
+    scheme.addEventListener('change', draw);
+
+    async function load() {
+      const q = recordingQuery(params);
+      q.set('limit', '2000');
+      if (defaultSince !== null) q.set('since', String(defaultSince / 1000));
+      try {
+        const res = await api(`/recordings/timeline?${q}`);
+        spans = res.items;
+        el.hidden = spans.length === 0 && defaultSince === null;
+        wrap.hidden = spans.length === 0;
+        if (!spans.length) { summary.textContent = `no calls in the past ${DEFAULT_DAYS} days`; return; }
+        const freqs = new Set(spans.map((s) => s[1]));
+        const n = fmtCount(spans.length);
+        const when = defaultSince !== null ? ` in the past ${DEFAULT_DAYS} days` : '';
+        summary.textContent = res.truncated
+          ? `latest ${n} calls on ${fmtCount(freqs.size)} frequencies${when} · drag to zoom in`
+          : `${n} call${spans.length === 1 ? '' : 's'} on ${fmtCount(freqs.size)} frequenc${freqs.size === 1 ? 'y' : 'ies'}${when} · drag to zoom in`;
+        computeView();
+        draw();
+      } catch (_) {
+        el.hidden = true;
+      }
+    }
+
+    return {
+      el, load,
+      dispose() { ro.disconnect(); audio.removeEventListener('play', draw); scheme.removeEventListener('change', draw); },
+    };
+  }
+
   // ----- Recordings -----
   function viewRecordings(root, params) {
     root.append(h('div', { class: 'page-title' }, h('h1', {}, 'Recordings'), h('span', { class: 'muted', id: 'rec-count' })));
@@ -795,9 +1088,11 @@
       tbody);
     const more = h('button', { type: 'button' }, 'Load older');
     const status = h('div', { class: 'empty', hidden: true });
+    const timeline = recordingsTimeline(params, pick);
     root.append(
       h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, form)),
       h('div', { style: 'height:16px' }),
+      timeline.el,
       h('section', { class: 'panel' }, h('div', { class: 'table-wrap' }, table), status, h('div', { class: 'more' }, more)));
 
     function apply() {
@@ -808,27 +1103,15 @@
       if (tone.value.trim()) p.set('tone', tone.value.trim().toUpperCase());
       if (dtmf.value.trim()) p.set('dtmf', dtmf.value.trim().toUpperCase());
       if (starredOnly.checked) p.set('starred', '1');
+      if (since.value && params.get('until')) p.set('until', params.get('until'));
       location.hash = `#/recordings${p.toString() ? '?' + p : ''}`;
     }
 
     const items = [];
     let next = null, lastDay = null;
     async function load() {
-      const q = new URLSearchParams({ limit: '100' });
-      const f = parseFloat(params.get('freq'));
-      if (!isNaN(f)) {
-        const t = parseFloat(params.get('tol') || '0.005');
-        q.set('freq_min', String(Math.round((f - t) * 1e6)));
-        q.set('freq_max', String(Math.round((f + t) * 1e6)));
-      }
-      if (params.get('since')) {
-        const t = new Date(params.get('since')).getTime();
-        if (!isNaN(t)) q.set('since', String(t / 1000));
-      }
-      if (params.get('min')) q.set('min_secs', params.get('min'));
-      if (params.get('tone')) q.set('tone', params.get('tone'));
-      if (params.get('dtmf')) q.set('dtmf', params.get('dtmf'));
-      if (params.get('starred') === '1') q.set('starred', 'true');
+      const q = recordingQuery(params);
+      q.set('limit', '100');
       if (next !== null) q.set('before_id', String(next));
       more.disabled = true;
       try {
@@ -911,11 +1194,24 @@
       if (prev && prev.classList.contains('day') && (!nextRow || nextRow.classList.contains('day'))) prev.remove();
       $('#rec-count').textContent = `${fmtCount(items.length)}${next !== null ? '+' : ''} shown`;
       status.hidden = items.length > 0;
+      timeline.load();
     }
 
     more.onclick = load;
     load();
-    return null;
+    timeline.load();
+
+    // A call picked on the timeline: play it from the table when it's
+    // there (so next and previous follow the table), else on its own.
+    async function pick(id) {
+      const i = items.findIndex((r) => r.id === id);
+      const row = tbody.querySelector(`[data-rec="${id}"]`);
+      if (row) row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      if (!canAudio()) return;
+      if (i >= 0) { player.play(items, i); return; }
+      try { player.play([await api(`/recordings/${id}`)], 0); } catch (_) { /* gone since */ }
+    }
+    return () => timeline.dispose();
   }
 
   // ----- Packets -----
