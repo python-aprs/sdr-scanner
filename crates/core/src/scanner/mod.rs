@@ -280,6 +280,13 @@ impl Scanner {
         self.next_id = self.next_id.max(id);
     }
 
+    /// Take over what `old` learned about the band's interference (see
+    /// [`Detector::carry_learning`]), for a scanner that replaces it after
+    /// the radio is reopened.
+    pub fn carry_learning(&mut self, old: &Scanner) {
+        self.detector.carry_learning(&old.detector);
+    }
+
     pub fn clock(&self) -> &SampleClock {
         &self.clock
     }

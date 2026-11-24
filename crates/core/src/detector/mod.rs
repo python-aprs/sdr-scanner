@@ -555,6 +555,24 @@ impl Detector {
         }
     }
 
+    /// Take over the interference `old` learned: the steady background
+    /// and the pulsed comb lines. For a detector that replaces `old` after
+    /// the radio is reopened: otherwise both guards start from nothing, and
+    /// comb lines that open before they are learned again record until the
+    /// comb stops (minutes, live on the RSP1A). Does nothing unless both
+    /// watch the same slots at the same offsets.
+    pub fn carry_learning(&mut self, old: &Detector) {
+        let same = self.slots.len() == old.slots.len()
+            && self.slots.iter().zip(&old.slots).all(|(a, b)| {
+                same_freq(a.offset_hz, b.offset_hz) && same_freq(a.slot.freq, b.slot.freq)
+            });
+        if !same {
+            return;
+        }
+        self.background.carry_from(&old.background);
+        self.comb.carry_from(&old.comb);
+    }
+
     /// Pulsed comb events seen (see `DetectorParams::comb_teeth`).
     pub fn comb_events(&self) -> u64 {
         self.comb.events
@@ -730,8 +748,12 @@ mod tests {
         plan: &[Slot],
         dp: DetectorParams,
     ) -> (Detector, Vec<Event>, Vec<Vec<f32>>) {
+        run_on(Detector::new(dp, params(), 0.0, plan), x)
+    }
+
+    /// Feed `x` to `det` from block 0, as a new session.
+    fn run_on(mut det: Detector, x: &[Complex32]) -> (Detector, Vec<Event>, Vec<Vec<f32>>) {
         let p = params();
-        let mut det = Detector::new(dp, p, 0.0, plan);
         let mut an = Analyzer::new(p);
         let mut events = Vec::new();
         let mut snrs = Vec::new();
@@ -1107,6 +1129,43 @@ mod tests {
             }
         }
         assert_eq!(opened, 1, "{events:?}");
+    }
+
+    #[test]
+    fn a_reopened_detector_keeps_the_comb_it_learned() {
+        // After the radio is reopened, the scanner (and its detector) is
+        // made anew. A comb line that pulses alone at first must not open
+        // a slot in the new session when the old one had learned the comb.
+        let pulses = |ks: &[f64], secs: f64| {
+            let mut sigs: Vec<(f64, f64, f64, f64)> = Vec::new();
+            let mut t = 0.3;
+            while t < secs {
+                for &k in ks {
+                    sigs.push((k * 260e3, 12.0, t, t + 0.1));
+                }
+                t += 0.6;
+            }
+            sigs
+        };
+        let plan: Vec<Slot> = (-40..=40).map(|k| slot(k as f64 * 20e3, 16e3)).collect();
+        let dp = DetectorParams::default();
+        let full = scene(4.0, &pulses(&[-3.0, -2.0, -1.0, 1.0, 2.0, 3.0], 4.0), 43);
+        let (old, events, _) = run(&full, &plan, dp.clone());
+        assert!(old.comb_events() >= 1, "comb not learned: {events:?}");
+        let alone = scene(4.0, &pulses(&[1.0], 4.0), 47);
+        let opens = |events: &[Event]| {
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Open { .. }))
+                .count()
+        };
+        // A detector that starts from nothing opens on the lone line.
+        let (_, fresh, _) = run(&alone, &plan, dp.clone());
+        assert!(opens(&fresh) >= 1, "{fresh:?}");
+        let mut new = Detector::new(dp, params(), 0.0, &plan);
+        new.carry_learning(&old);
+        let (_, events, _) = run_on(new, &alone);
+        assert_eq!(opens(&events), 0, "{events:?}");
     }
 
     #[test]

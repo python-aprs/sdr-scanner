@@ -209,9 +209,12 @@ pub fn serve(o: ServeOptions) -> Result<()> {
             };
             session = new;
             tel.session_started();
-            let next_id = scanner.next_id();
-            scanner = new_scanner(&o, &session);
-            scanner.set_next_id(next_id);
+            let old = std::mem::replace(&mut scanner, new_scanner(&o, &session));
+            scanner.set_next_id(old.next_id());
+            // Keep the learned comb and background, or comb lines that open
+            // before they are learned again record until the comb stops.
+            scanner.carry_learning(&old);
+            drop(old);
             channels.apply(&mut scanner, &mut Vec::new());
             eprintln!("radio reopened: {}", session.info.description);
             continue;
