@@ -1,3 +1,18 @@
+CREATE TABLE dmr_calls (
+    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+    timeslot        INTEGER,
+    color_code      INTEGER,
+    call_type       TEXT,
+    src_id          INTEGER,
+    dst_id          INTEGER,
+    alias           TEXT,
+    encrypted       INTEGER NOT NULL DEFAULT 0,
+    amb_bytes       INTEGER
+);
+CREATE TABLE dtmf (
+    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+    digits          TEXT    NOT NULL
+);
 CREATE TABLE packets (
     id      INTEGER PRIMARY KEY,
     time_ns INTEGER NOT NULL,
@@ -8,6 +23,10 @@ CREATE TABLE packets (
     path    TEXT    NOT NULL,
     text    TEXT    NOT NULL,
     raw     BLOB    NOT NULL
+);
+CREATE TABLE tones (
+    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+    tone            TEXT    NOT NULL
 );
 CREATE TABLE transmissions (
     id          INTEGER PRIMARY KEY,
@@ -24,10 +43,13 @@ CREATE TABLE transmissions (
     audio_rate  INTEGER NOT NULL,
     wav_path    TEXT    NOT NULL,
     wav_bytes   INTEGER,
-    status      TEXT    NOT NULL DEFAULT 'recording'
-, opus_path TEXT, opus_bytes INTEGER, tone TEXT, dtmf TEXT, starred INTEGER NOT NULL DEFAULT 0, timeslot INTEGER, color_code INTEGER, call_type TEXT, src_id INTEGER, dst_id INTEGER, alias TEXT, encrypted INTEGER, amb_bytes INTEGER);
+    opus_path   TEXT,
+    opus_bytes  INTEGER,
+    status      TEXT    NOT NULL DEFAULT 'recording',
+    starred     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX dmr_calls_dst ON dmr_calls(dst_id);
+CREATE INDEX dmr_calls_src ON dmr_calls(src_id);
 CREATE INDEX packets_time ON packets(time_ns);
-CREATE INDEX transmissions_dst ON transmissions(dst_id, start_ns);
 CREATE INDEX transmissions_freq ON transmissions(freq_hz, start_ns);
-CREATE INDEX transmissions_src ON transmissions(src_id, start_ns);
 CREATE INDEX transmissions_start ON transmissions(start_ns);

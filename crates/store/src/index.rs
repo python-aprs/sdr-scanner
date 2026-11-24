@@ -75,8 +75,110 @@ pub static SCHEMA: Schema = Schema {
                  CREATE INDEX transmissions_src ON transmissions(src_id, start_ns);",
             ),
         },
+        Migration {
+            description: "mode-specific tags in their own tables",
+            up: Up::Sql(V8),
+        },
     ],
 };
+
+/// Moves what only some recordings have out of `transmissions` into tables
+/// keyed by the transmission's id: CTCSS/DCS tones and DTMF digits (heard in
+/// analog FM audio) and DMR call details. A tag row exists only where there
+/// is something to say, and goes when its transmission is deleted.
+/// `transmissions` is rebuilt rather than altered column by column, so its
+/// definition reads as one table again; ids are kept.
+const V8: &str = "
+ALTER TABLE transmissions RENAME TO transmissions_v7;
+CREATE TABLE transmissions (
+    id          INTEGER PRIMARY KEY,
+    freq_hz     REAL    NOT NULL,
+    channel     TEXT,
+    origin      TEXT    NOT NULL,
+    mode        TEXT    NOT NULL,
+    start_ns    INTEGER NOT NULL,
+    end_ns      INTEGER,
+    audio_secs  REAL,
+    signal_secs REAL,
+    peak_snr_db REAL,
+    mean_snr_db REAL,
+    audio_rate  INTEGER NOT NULL,
+    wav_path    TEXT    NOT NULL,
+    wav_bytes   INTEGER,
+    opus_path   TEXT,
+    opus_bytes  INTEGER,
+    status      TEXT    NOT NULL DEFAULT 'recording',
+    starred     INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO transmissions (id, freq_hz, channel, origin, mode, start_ns, end_ns, audio_secs,
+                           signal_secs, peak_snr_db, mean_snr_db, audio_rate, wav_path,
+                           wav_bytes, opus_path, opus_bytes, status, starred)
+    SELECT id, freq_hz, channel, origin, mode, start_ns, end_ns, audio_secs,
+           signal_secs, peak_snr_db, mean_snr_db, audio_rate, wav_path,
+           wav_bytes, opus_path, opus_bytes, status, starred
+    FROM transmissions_v7;
+
+CREATE TABLE tones (
+    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+    tone            TEXT    NOT NULL
+);
+INSERT INTO tones (transmission_id, tone)
+    SELECT id, tone FROM transmissions_v7 WHERE tone IS NOT NULL;
+
+CREATE TABLE dtmf (
+    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+    digits          TEXT    NOT NULL
+);
+INSERT INTO dtmf (transmission_id, digits)
+    SELECT id, dtmf FROM transmissions_v7 WHERE dtmf IS NOT NULL;
+
+CREATE TABLE dmr_calls (
+    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+    timeslot        INTEGER,
+    color_code      INTEGER,
+    call_type       TEXT,
+    src_id          INTEGER,
+    dst_id          INTEGER,
+    alias           TEXT,
+    encrypted       INTEGER NOT NULL DEFAULT 0,
+    amb_bytes       INTEGER
+);
+INSERT INTO dmr_calls (transmission_id, timeslot, color_code, call_type, src_id, dst_id,
+                       alias, encrypted, amb_bytes)
+    SELECT id, timeslot, color_code, call_type, src_id, dst_id, alias,
+           COALESCE(encrypted, 0), amb_bytes
+    FROM transmissions_v7
+    WHERE timeslot IS NOT NULL OR color_code IS NOT NULL OR call_type IS NOT NULL
+       OR src_id IS NOT NULL OR dst_id IS NOT NULL OR alias IS NOT NULL
+       OR encrypted IS NOT NULL OR amb_bytes IS NOT NULL;
+
+DROP TABLE transmissions_v7;
+CREATE INDEX transmissions_start ON transmissions(start_ns);
+CREATE INDEX transmissions_freq ON transmissions(freq_hz, start_ns);
+CREATE INDEX dmr_calls_dst ON dmr_calls(dst_id);
+CREATE INDEX dmr_calls_src ON dmr_calls(src_id);
+";
+
+/// A transmission with its tags, as [`row`] reads it. Every query that
+/// returns [`Row`]s selects from this.
+const ROWS: &str = concat!(
+    "SELECT t.*, tn.tone, d.digits AS dtmf,
+        c.timeslot, c.color_code, c.call_type, c.src_id, c.dst_id, c.alias, c.encrypted,
+        c.amb_bytes ",
+    tagged!()
+);
+
+/// `transmissions t` with its tag tables `tn` (tones), `d` (DTMF) and `c`
+/// (DMR calls) joined on.
+macro_rules! tagged {
+    () => {
+        "FROM transmissions t
+         LEFT JOIN tones tn ON tn.transmission_id = t.id
+         LEFT JOIN dtmf d ON d.transmission_id = t.id
+         LEFT JOIN dmr_calls c ON c.transmission_id = t.id"
+    };
+}
+use tagged;
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS transmissions (
@@ -192,18 +294,19 @@ pub struct Query {
     pub limit: usize,
 }
 
-/// The filters [`Index::search`] and [`Index::timeline`] share; parameters
-/// as [`search_params`] binds them (`?7` is the limit).
-const SEARCH_WHERE: &str = "status = 'complete'
-    AND (?1 IS NULL OR freq_hz >= ?1) AND (?2 IS NULL OR freq_hz <= ?2)
-    AND (?3 IS NULL OR start_ns >= ?3) AND (?4 IS NULL OR start_ns < ?4)
-    AND (?5 IS NULL OR audio_secs >= ?5)
-    AND (?6 IS NULL OR id < ?6)
-    AND (?8 IS NULL OR tone = ?8)
-    AND (?9 IS NULL OR instr(dtmf, ?9) > 0)
-    AND (?10 IS NULL OR starred = ?10)
-    AND (?11 IS NULL OR dst_id = ?11)
-    AND (?12 IS NULL OR src_id = ?12)";
+/// The filters [`Index::search`] and [`Index::timeline`] share, over
+/// [`ROWS`]' tables; parameters as [`search_params`] binds them (`?7` is
+/// the limit).
+const SEARCH_WHERE: &str = "t.status = 'complete'
+    AND (?1 IS NULL OR t.freq_hz >= ?1) AND (?2 IS NULL OR t.freq_hz <= ?2)
+    AND (?3 IS NULL OR t.start_ns >= ?3) AND (?4 IS NULL OR t.start_ns < ?4)
+    AND (?5 IS NULL OR t.audio_secs >= ?5)
+    AND (?6 IS NULL OR t.id < ?6)
+    AND (?8 IS NULL OR tn.tone = ?8)
+    AND (?9 IS NULL OR instr(d.digits, ?9) > 0)
+    AND (?10 IS NULL OR t.starred = ?10)
+    AND (?11 IS NULL OR c.dst_id = ?11)
+    AND (?12 IS NULL OR c.src_id = ?12)";
 
 fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 12] {
     [
@@ -293,9 +396,10 @@ impl Index {
     /// it. Doesn't migrate or touch rows; fails if the index is missing or
     /// at another schema version.
     pub fn open_reader(path: &Path) -> Result<Self, IndexError> {
-        Ok(Index {
-            db: migrate::open_current(path, &SCHEMA)?,
-        })
+        let db = migrate::open_current(path, &SCHEMA)?;
+        // A hand delete from the web UI takes the row's tags with it.
+        db.pragma_update(None, "foreign_keys", true)?;
+        Ok(Index { db })
     }
 
     pub fn in_memory() -> Result<Self, IndexError> {
@@ -306,6 +410,7 @@ impl Index {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
         migrate::migrate(&mut db, &SCHEMA)?;
+        db.pragma_update(None, "foreign_keys", true)?;
         // Rows left 'recording' by a crash have no finished file.
         db.execute(
             "UPDATE transmissions SET status = 'interrupted' WHERE status = 'recording'",
@@ -411,6 +516,7 @@ impl Index {
     }
 
     /// Remove a row (a recording that was thrown away).
+    /// Its tags go with it (foreign keys are on for every connection).
     pub fn delete(&self, id: i64) -> Result<(), IndexError> {
         self.db
             .execute("DELETE FROM transmissions WHERE id = ?1", [id])?;
@@ -420,7 +526,8 @@ impl Index {
     /// Record the tone a transmission carried.
     pub fn set_tone(&self, id: i64, tone: &str) -> Result<(), IndexError> {
         self.db.execute(
-            "UPDATE transmissions SET tone = ?2 WHERE id = ?1",
+            "INSERT INTO tones (transmission_id, tone) VALUES (?1, ?2)
+             ON CONFLICT (transmission_id) DO UPDATE SET tone = excluded.tone",
             params![id, tone],
         )?;
         Ok(())
@@ -430,9 +537,9 @@ impl Index {
     /// raw voice frames file.
     pub fn set_digital(&self, id: i64, d: &Digital, amb_bytes: u64) -> Result<(), IndexError> {
         self.db.execute(
-            "UPDATE transmissions SET timeslot = ?2, color_code = ?3, call_type = ?4,
-                 src_id = ?5, dst_id = ?6, alias = ?7, encrypted = ?8, amb_bytes = ?9
-             WHERE id = ?1",
+            "INSERT OR REPLACE INTO dmr_calls (transmission_id, timeslot, color_code, call_type,
+                 src_id, dst_id, alias, encrypted, amb_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 d.timeslot,
@@ -450,20 +557,25 @@ impl Index {
 
     /// Record the DTMF digits heard in a transmission (`None` clears them).
     pub fn set_dtmf(&self, id: i64, digits: Option<&str>) -> Result<(), IndexError> {
-        self.db.execute(
-            "UPDATE transmissions SET dtmf = ?2 WHERE id = ?1",
-            params![id, digits],
-        )?;
+        match digits {
+            Some(d) => self.db.execute(
+                "INSERT INTO dtmf (transmission_id, digits) VALUES (?1, ?2)
+                 ON CONFLICT (transmission_id) DO UPDATE SET digits = excluded.digits",
+                params![id, d],
+            )?,
+            None => self
+                .db
+                .execute("DELETE FROM dtmf WHERE transmission_id = ?1", [id])?,
+        };
         Ok(())
     }
 
     /// Complete rows with audio still on disk, oldest first, after `after_id`;
     /// for re-scanning recordings.
     pub fn complete_after(&self, after_id: i64, limit: usize) -> Result<Vec<Row>, IndexError> {
-        let mut st = self.db.prepare(
-            "SELECT * FROM transmissions WHERE status = 'complete' AND id > ?1
-             ORDER BY id LIMIT ?2",
-        )?;
+        let mut st = self.db.prepare(&format!(
+            "{ROWS} WHERE t.status = 'complete' AND t.id > ?1 ORDER BY t.id LIMIT ?2"
+        ))?;
         Ok(st
             .query_map(params![after_id, limit as i64], row)?
             .collect::<rusqlite::Result<_>>()?)
@@ -471,16 +583,16 @@ impl Index {
 
     pub fn get(&self, id: i64) -> Result<Option<Row>, IndexError> {
         self.db
-            .query_row("SELECT * FROM transmissions WHERE id = ?1", [id], row)
+            .query_row(&format!("{ROWS} WHERE t.id = ?1"), [id], row)
             .optional()
             .map_err(Into::into)
     }
 
     /// Most recent first.
     pub fn recent(&self, limit: usize) -> Result<Vec<Row>, IndexError> {
-        let mut st = self
-            .db
-            .prepare("SELECT * FROM transmissions ORDER BY start_ns DESC, id DESC LIMIT ?1")?;
+        let mut st = self.db.prepare(&format!(
+            "{ROWS} ORDER BY t.start_ns DESC, t.id DESC LIMIT ?1"
+        ))?;
         Ok(st
             .query_map([limit as i64], row)?
             .collect::<rusqlite::Result<_>>()?)
@@ -489,8 +601,8 @@ impl Index {
     /// Completed transmissions matching `q`, newest first.
     pub fn search(&self, q: &Query) -> Result<Vec<Row>, IndexError> {
         let mut st = self.db.prepare(&format!(
-            "SELECT * FROM transmissions WHERE {SEARCH_WHERE}
-             ORDER BY start_ns DESC, id DESC LIMIT ?7"
+            "{ROWS} WHERE {SEARCH_WHERE}
+             ORDER BY t.start_ns DESC, t.id DESC LIMIT ?7"
         ))?;
         let limit = q.limit.clamp(1, 1000) as i64;
         st.query_map(search_params(q, &limit), row)?
@@ -503,9 +615,10 @@ impl Index {
     /// [`Self::TIMELINE_MAX`].
     pub fn timeline(&self, q: &Query) -> Result<Vec<Span>, IndexError> {
         let mut st = self.db.prepare(&format!(
-            "SELECT id, freq_hz, start_ns, end_ns, audio_secs FROM transmissions
+            "SELECT t.id, t.freq_hz, t.start_ns, t.end_ns, t.audio_secs {}
              WHERE {SEARCH_WHERE}
-             ORDER BY start_ns DESC, id DESC LIMIT ?7"
+             ORDER BY t.start_ns DESC, t.id DESC LIMIT ?7",
+            tagged!()
         ))?;
         let limit = q.limit.clamp(1, Self::TIMELINE_MAX) as i64;
         st.query_map(search_params(q, &limit), |r| {
@@ -534,9 +647,10 @@ impl Index {
     /// Bytes of audio (WAV and Opus) the complete rows hold on disk.
     pub fn usage_bytes(&self) -> Result<u64, IndexError> {
         let n: i64 = self.db.query_row(
-            "SELECT COALESCE(SUM(COALESCE(wav_bytes, 0) + COALESCE(opus_bytes, 0)
-                 + COALESCE(amb_bytes, 0)), 0)
-             FROM transmissions WHERE status = 'complete'",
+            "SELECT COALESCE(SUM(COALESCE(t.wav_bytes, 0) + COALESCE(t.opus_bytes, 0)
+                 + COALESCE(c.amb_bytes, 0)), 0)
+             FROM transmissions t LEFT JOIN dmr_calls c ON c.transmission_id = t.id
+             WHERE t.status = 'complete'",
             [],
             |r| r.get(0),
         )?;
@@ -547,11 +661,10 @@ impl Index {
     /// and ones a crash interrupted (which may have left `.part` files).
     /// Starred rows are never among them.
     pub fn oldest_expirable(&self, limit: usize) -> Result<Vec<Row>, IndexError> {
-        let mut st = self.db.prepare(
-            "SELECT * FROM transmissions
-             WHERE status IN ('complete', 'interrupted') AND starred = 0
-             ORDER BY start_ns, id LIMIT ?1",
-        )?;
+        let mut st = self.db.prepare(&format!(
+            "{ROWS} WHERE t.status IN ('complete', 'interrupted') AND t.starred = 0
+             ORDER BY t.start_ns, t.id LIMIT ?1"
+        ))?;
         Ok(st
             .query_map([limit as i64], row)?
             .collect::<rusqlite::Result<_>>()?)
@@ -771,6 +884,174 @@ mod tests {
             .pragma_query_value(None, "application_id", |r| r.get(0))
             .unwrap();
         assert_eq!(app, SCHEMA.application_id);
+    }
+
+    /// Version 8 moves tones, DTMF digits and DMR call details out of
+    /// `transmissions`; what a version 7 index held reads back the same.
+    #[test]
+    fn moves_mode_tags_out_of_transmissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("index.sqlite");
+        let v7 = Schema {
+            migrations: &SCHEMA.migrations[..7],
+            ..SCHEMA
+        };
+        let mut old = Connection::open(&p).unwrap();
+        migrate::migrate(&mut old, &v7).unwrap();
+        old.execute_batch(
+            "INSERT INTO transmissions (id, freq_hz, origin, mode, start_ns, audio_rate, wav_path,
+                 wav_bytes, opus_path, opus_bytes, status, tone, dtmf, starred)
+             VALUES (1, 146.52e6, 'listed', 'nbfm', 10, 8000, 'a.wav', 100, 'a.opus', 10,
+                 'complete', '100.0', '*73 1234#', 1);
+             INSERT INTO transmissions (id, freq_hz, origin, mode, start_ns, audio_rate, wav_path,
+                 wav_bytes, status, timeslot, color_code, call_type, src_id, dst_id, alias,
+                 encrypted, amb_bytes)
+             VALUES (2, 145.79e6, 'listed', 'dmr', 20, 8000, 'b.wav', 200, 'complete', 1, 1,
+                 'group', 3171501, 99, 'KF7HVM', 0, 54);
+             INSERT INTO transmissions (id, freq_hz, origin, mode, start_ns, audio_rate, wav_path,
+                 wav_bytes, status)
+             VALUES (3, 147.52e6, 'grid', 'nbfm', 30, 8000, 'c.wav', 300, 'expired');",
+        )
+        .unwrap();
+        drop(old);
+
+        let ix = Index::open(&p).unwrap();
+        let bak = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".v7-"));
+        assert!(bak, "backup of the version 7 index");
+        let cols: Vec<String> = ix
+            .db
+            .prepare("SELECT name FROM pragma_table_info('transmissions')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for gone in ["tone", "dtmf", "timeslot", "dst_id", "amb_bytes"] {
+            assert!(!cols.iter().any(|c| c == gone), "{gone} still there");
+        }
+        let count = |t: &str| -> i64 {
+            ix.db
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            (count("tones"), count("dtmf"), count("dmr_calls")),
+            (1, 1, 1)
+        );
+
+        let fm = ix.get(1).unwrap().unwrap();
+        assert_eq!(fm.tone.as_deref(), Some("100.0"));
+        assert_eq!(fm.dtmf.as_deref(), Some("*73 1234#"));
+        assert_eq!(fm.opus_path.as_deref(), Some("a.opus"));
+        assert!(fm.starred);
+        assert_eq!((fm.dst_id, fm.encrypted, fm.amb_bytes), (None, None, None));
+        let dmr = ix.get(2).unwrap().unwrap();
+        assert_eq!(
+            (dmr.timeslot, dmr.color_code, dmr.call_type.as_deref()),
+            (Some(1), Some(1), Some("group"))
+        );
+        assert_eq!((dmr.src_id, dmr.dst_id), (Some(3_171_501), Some(99)));
+        assert_eq!(dmr.alias.as_deref(), Some("KF7HVM"));
+        assert_eq!((dmr.encrypted, dmr.amb_bytes), (Some(false), Some(54)));
+        assert_eq!((dmr.tone, dmr.dtmf), (None, None));
+        assert_eq!(ix.get(3).unwrap().unwrap().status, "expired");
+
+        // Filters on the moved tags find the same rows, and the DMR call's
+        // voice frames still count towards disk use.
+        let ids = |q: Query| -> Vec<i64> {
+            let q = Query { limit: 10, ..q };
+            ix.search(&q).unwrap().iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids(Query::default()), vec![2, 1]);
+        assert_eq!(
+            ids(Query {
+                tone: Some("100.0".into()),
+                ..Default::default()
+            }),
+            vec![1]
+        );
+        assert_eq!(
+            ids(Query {
+                dtmf: Some(String::new()),
+                ..Default::default()
+            }),
+            vec![1]
+        );
+        assert_eq!(
+            ids(Query {
+                dst_id: Some(99),
+                ..Default::default()
+            }),
+            vec![2]
+        );
+        assert_eq!(
+            ids(Query {
+                src_id: Some(3_171_501),
+                ..Default::default()
+            }),
+            vec![2]
+        );
+        assert_eq!(
+            ids(Query {
+                starred: Some(true),
+                ..Default::default()
+            }),
+            vec![1]
+        );
+        assert_eq!(ix.usage_bytes().unwrap(), 100 + 10 + 200 + 54);
+    }
+
+    #[test]
+    fn tags_follow_their_transmission() {
+        let ix = Index::in_memory().unwrap();
+        let id = ix
+            .insert(&NewRow {
+                freq_hz: 145.79e6,
+                channel: None,
+                origin: "listed",
+                mode: "dmr",
+                start_ns: 0,
+                audio_rate: 8000,
+                wav_path: "x.wav",
+            })
+            .unwrap();
+        ix.set_tone(id, "100.0").unwrap();
+        ix.set_tone(id, "D023N").unwrap();
+        ix.set_dtmf(id, Some("5")).unwrap();
+        let d = Digital {
+            color_code: Some(1),
+            call_type: Some("group"),
+            src_id: Some(1),
+            dst_id: Some(99),
+            ..Default::default()
+        };
+        ix.set_digital(id, &d, 10).unwrap();
+        ix.set_digital(
+            id,
+            &Digital {
+                dst_id: Some(9),
+                ..d
+            },
+            20,
+        )
+        .unwrap();
+        let r = ix.get(id).unwrap().unwrap();
+        assert_eq!(r.tone.as_deref(), Some("D023N"));
+        assert_eq!((r.dst_id, r.amb_bytes), (Some(9), Some(20)));
+        ix.set_dtmf(id, None).unwrap();
+        assert_eq!(ix.get(id).unwrap().unwrap().dtmf, None);
+
+        ix.delete(id).unwrap();
+        for t in ["tones", "dtmf", "dmr_calls"] {
+            let n: i64 = ix
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{t} kept a deleted transmission's tag");
+        }
     }
 
     #[test]
