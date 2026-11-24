@@ -52,6 +52,10 @@ pub static SCHEMA: Schema = Schema {
                  CREATE INDEX packets_time ON packets(time_ns);",
             ),
         },
+        Migration {
+            description: "DTMF digits",
+            up: Up::Sql("ALTER TABLE transmissions ADD COLUMN dtmf TEXT;"),
+        },
     ],
 };
 
@@ -100,6 +104,8 @@ pub struct Row {
     pub opus_bytes: Option<i64>,
     /// CTCSS tone (`100.0`) or DCS code (`D023N`) heard, if any.
     pub tone: Option<String>,
+    /// DTMF digits heard, if any, groups split by a space (`*73 1234#`).
+    pub dtmf: Option<String>,
 }
 
 /// Filters for [`Index::search`]. `None` means no constraint.
@@ -112,6 +118,9 @@ pub struct Query {
     pub min_secs: Option<f64>,
     /// Exact tone label.
     pub tone: Option<String>,
+    /// DTMF digits that must appear in the recording's digits; an empty
+    /// string matches any recording with digits.
+    pub dtmf: Option<String>,
     /// Paging: only rows with a smaller id.
     pub before_id: Option<i64>,
     pub limit: usize,
@@ -302,6 +311,27 @@ impl Index {
         Ok(())
     }
 
+    /// Record the DTMF digits heard in a transmission (`None` clears them).
+    pub fn set_dtmf(&self, id: i64, digits: Option<&str>) -> Result<(), IndexError> {
+        self.db.execute(
+            "UPDATE transmissions SET dtmf = ?2 WHERE id = ?1",
+            params![id, digits],
+        )?;
+        Ok(())
+    }
+
+    /// Complete rows with audio still on disk, oldest first, after `after_id`;
+    /// for re-scanning recordings.
+    pub fn complete_after(&self, after_id: i64, limit: usize) -> Result<Vec<Row>, IndexError> {
+        let mut st = self.db.prepare(
+            "SELECT * FROM transmissions WHERE status = 'complete' AND id > ?1
+             ORDER BY id LIMIT ?2",
+        )?;
+        Ok(st
+            .query_map(params![after_id, limit as i64], row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Row>, IndexError> {
         self.db
             .query_row("SELECT * FROM transmissions WHERE id = ?1", [id], row)
@@ -329,6 +359,7 @@ impl Index {
                AND (?5 IS NULL OR audio_secs >= ?5)
                AND (?6 IS NULL OR id < ?6)
                AND (?8 IS NULL OR tone = ?8)
+               AND (?9 IS NULL OR instr(dtmf, ?9) > 0)
              ORDER BY start_ns DESC, id DESC LIMIT ?7",
         )?;
         st.query_map(
@@ -340,7 +371,8 @@ impl Index {
                 q.min_secs,
                 q.before_id,
                 q.limit.clamp(1, 1000) as i64,
-                q.tone
+                q.tone,
+                q.dtmf
             ],
             row,
         )?
@@ -421,6 +453,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         opus_path: r.get("opus_path")?,
         opus_bytes: r.get("opus_bytes")?,
         tone: r.get("tone")?,
+        dtmf: r.get("dtmf")?,
     })
 }
 
@@ -589,5 +622,44 @@ mod tests {
             .unwrap();
         let r = Index::open_reader(&p).unwrap();
         assert_eq!(r.get(id).unwrap().unwrap().status, "recording");
+    }
+
+    #[test]
+    fn dtmf_tags_and_search() {
+        let ix = Index::in_memory().unwrap();
+        let mut ids = Vec::new();
+        for (i, digits) in [Some("*73 1234#"), None, Some("5")].into_iter().enumerate() {
+            let id = ix
+                .insert(&NewRow {
+                    freq_hz: 147.52e6,
+                    channel: None,
+                    origin: "listed",
+                    mode: "nbfm",
+                    start_ns: 1_795_330_443_000_000_000 + i as i64,
+                    audio_rate: 8000,
+                    wav_path: "x.wav",
+                })
+                .unwrap();
+            ix.complete(id, 0, 1.0, 1.0, 20.0, 10.0, "x.wav", 100)
+                .unwrap();
+            ix.set_dtmf(id, digits).unwrap();
+            ids.push(id);
+        }
+        let find = |d: &str| -> Vec<i64> {
+            let q = Query {
+                dtmf: Some(d.into()),
+                limit: 10,
+                ..Default::default()
+            };
+            ix.search(&q).unwrap().iter().map(|r| r.id).collect()
+        };
+        assert_eq!(find("1234"), vec![ids[0]]);
+        assert_eq!(find(""), vec![ids[2], ids[0]]);
+        assert_eq!(find("9"), Vec::<i64>::new());
+        assert_eq!(
+            ix.get(ids[0]).unwrap().unwrap().dtmf.as_deref(),
+            Some("*73 1234#")
+        );
+        assert_eq!(ix.complete_after(ids[0], 10).unwrap().len(), 2);
     }
 }

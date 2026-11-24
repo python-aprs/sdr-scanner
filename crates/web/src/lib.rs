@@ -669,6 +669,8 @@ pub struct ListParams {
     pub min_secs: Option<f64>,
     /// Exact tone label: `100.0` or `D023N`.
     pub tone: Option<String>,
+    /// DTMF digits the recording must contain; `any` for any digits.
+    pub dtmf: Option<String>,
     pub before_id: Option<i64>,
     pub limit: Option<usize>,
 }
@@ -710,6 +712,11 @@ async fn list_recordings(
         until_ns: p.until.map(|t| (t * 1e9) as i64),
         min_secs: p.min_secs,
         tone: p.tone.filter(|t| !t.is_empty()),
+        dtmf: p
+            .dtmf
+            .map(|d| d.trim().to_ascii_uppercase())
+            .filter(|d| !d.is_empty())
+            .map(|d| if d == "ANY" { String::new() } else { d }),
         before_id: p.before_id,
         limit: p.limit.unwrap_or(100),
     };
@@ -1736,6 +1743,32 @@ mod tests {
             login(&state, "masen", PASSWORD).await.status,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn filters_recordings_by_dtmf() {
+        let (dir, state, id, token) = setup(Public::default());
+        let ix = Index::open(&dir.path().join("index.sqlite")).unwrap();
+        let count = |q: &'static str| {
+            let state = state.clone();
+            let token = token.clone();
+            async move {
+                let (st, body) = get(&state, q, Some(&token), None).await;
+                assert_eq!(st, StatusCode::OK);
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                v["items"].as_array().unwrap().len()
+            }
+        };
+        assert_eq!(count("/api/v1/recordings?dtmf=any").await, 0);
+        ix.set_dtmf(id, Some("*73 1234#")).unwrap();
+        assert_eq!(count("/api/v1/recordings?dtmf=any").await, 1);
+        assert_eq!(count("/api/v1/recordings?dtmf=1234").await, 1);
+        assert_eq!(count("/api/v1/recordings?dtmf=%2A73").await, 1);
+        assert_eq!(count("/api/v1/recordings?dtmf=999").await, 0);
+        assert_eq!(count("/api/v1/recordings?dtmf=").await, 1);
+        let (_, body) = get(&state, "/api/v1/recordings", Some(&token), None).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"][0]["dtmf"], "*73 1234#");
     }
 
     #[tokio::test]

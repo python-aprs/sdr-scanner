@@ -170,3 +170,48 @@ def test_scanner_decodes_aprs_packets(tmp_path):
     db = sqlite3.connect(tmp_path / "out" / "index.sqlite")
     texts = [t for (t,) in db.execute("SELECT text FROM packets ORDER BY id")]
     assert texts == [f"KF7HVM-9>APRS,WIDE2-1:{i.decode()}" for i in infos], texts
+
+
+def test_scanner_tags_dtmf_digits(tmp_path):
+    """DTMF sent over pre-emphasised NBFM with CTCSS is tagged in the index;
+    speech-like audio on another channel gets no digits."""
+    import sqlite3
+
+    sc = scenario.load(Path(__file__).parent.parent / "scenarios" / "ci_smoke.yaml")
+    sc.duration = 4.0
+    dt, voice = sc.signals[0], sc.signals[1]
+    dt.start, dt.duration, dt.snr_db, dt.preemphasis = 0.2, 3.4, 20, True
+    dt.audio.kind, dt.audio.digits, dt.audio.on, dt.audio.off = "dtmf", "*73 0#D", 0.07, 0.06
+    dt.audio.level = 0.6
+    voice.start, voice.duration = 0.3, 3.5
+    sc.signals = [dt, voice]
+    writer.write(sc, tmp_path / "dtmf")
+    subprocess.run(
+        [
+            SCANNER,
+            "run",
+            str(tmp_path / "dtmf.sigmf-meta"),
+            "--config",
+            str(REPO / "config" / "example-2m.toml"),
+            "--profile",
+            "2m-25k",
+            "--out",
+            str(tmp_path / "out"),
+            "--json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    db = sqlite3.connect(tmp_path / "out" / "index.sqlite")
+    tags = {round(f / 1e3): (d, t) for f, d, t in db.execute("SELECT freq_hz, dtmf, tone FROM transmissions")}
+    assert tags == {146520: ("*73 0#D", "100.0"), 146840: (None, None)}, tags
+
+    # Rescanning the folder finds the same digits.
+    db.execute("UPDATE transmissions SET dtmf = NULL")
+    db.commit()
+    out = subprocess.run(
+        [SCANNER, "dtmf", str(tmp_path / "out")], check=True, capture_output=True, text=True
+    ).stdout
+    assert out.strip().endswith("\t*73 0#D"), out
+    assert [d for (d,) in db.execute("SELECT dtmf FROM transmissions ORDER BY freq_hz")] == ["*73 0#D", None]

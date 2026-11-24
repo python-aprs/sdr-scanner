@@ -11,6 +11,7 @@ pub mod config;
 pub mod demod;
 pub mod detector;
 pub mod dsp;
+pub mod dtmf;
 pub mod psd;
 pub mod scanner;
 pub mod tone;
