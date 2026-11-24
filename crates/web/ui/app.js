@@ -799,15 +799,18 @@
    */
   function recordingsTimeline(params, onPick) {
     const canvas = h('canvas', { class: 'tl-canvas', 'aria-label': 'Timeline of recordings, time across and frequency up' });
-    const tip = h('div', { class: 'scope-tip', hidden: true });
+    // Details of the hovered call sit in the header, out of the way of the
+    // calls around it.
+    const idle = () => h('span', { class: 'muted' }, canAudio() ? 'Hover a call for details, click to play' : 'Hover a call for details');
+    const detail = h('span', { class: 'tl-detail', 'aria-live': 'polite' }, idle());
     const summary = h('span', { class: 'muted' });
     const zoomOut = h('button', { type: 'button', hidden: !params.get('until'), onclick: () => {
       const p = new URLSearchParams(params); p.delete('since'); p.delete('until');
       location.hash = `#/recordings${p.toString() ? '?' + p : ''}`;
     } }, 'Show all times');
-    const wrap = h('div', { class: 'tl' }, canvas, tip);
+    const wrap = h('div', { class: 'tl' }, canvas);
     const el = h('section', { class: 'panel tl-panel', hidden: true },
-      h('div', { class: 'panel-head' }, h('h2', {}, 'Timeline'), summary, h('span', { class: 'spacer' }), zoomOut),
+      h('div', { class: 'panel-head' }, h('h2', {}, 'Timeline'), summary, h('span', { class: 'spacer' }), detail, zoomOut),
       wrap);
     const PAD = { l: 66, r: 12, t: 10, b: 24 };
     let spans = [];          // [id, freq_hz, start_ms, secs], newest first
@@ -953,24 +956,21 @@
     canvas.addEventListener('pointermove', (e) => {
       if (!view) return;
       const { x, y } = local(e);
-      if (drag) { drag.x1 = x; tip.hidden = true; hoverId = null; draw(); return; }
+      if (drag) { drag.x1 = x; showDetail(null); hoverId = null; draw(); return; }
       const sp = hit(x, y);
       const id = sp ? sp[0] : null;
       canvas.classList.toggle('pointing', !!sp);
-      if (id !== hoverId) { hoverId = id; draw(); }
-      if (!sp) { tip.hidden = true; return; }
-      const when = new Date(sp[2]);
-      fill(tip,
-        h('div', { class: 'mono' }, `${MHZ(sp[1], 4)} MHz`),
-        channelName(sp[1]) ? h('div', {}, channelName(sp[1])) : null,
-        h('div', { class: 'muted' }, `${dayLabel(when)} ${timeFmt.format(when)} · ${fmtSecs(sp[3])}`),
-        canAudio() ? h('div', { class: 'muted' }, 'Click to play') : null);
-      tip.hidden = false;
-      const W = wrap.clientWidth;
-      const left = Math.min(Math.max(4, x + 12), W - tip.offsetWidth - 4);
-      tip.style.left = `${left}px`;
-      tip.style.top = `${Math.max(4, y - tip.offsetHeight - 10)}px`;
+      if (id !== hoverId) { hoverId = id; draw(); showDetail(sp); }
     });
+    function showDetail(sp) {
+      if (!sp) { fill(detail, idle()); return; }
+      const when = new Date(sp[2]);
+      fill(detail,
+        h('span', { class: 'mono' }, `${MHZ(sp[1], 4)} MHz`),
+        channelName(sp[1]) ? h('span', {}, channelName(sp[1])) : null,
+        h('span', { class: 'muted' }, `${dayLabel(when)} ${timeFmt.format(when)}`),
+        h('span', { class: 'muted mono' }, fmtSecs(sp[3])));
+    }
     const endDrag = (e) => {
       if (!drag) return;
       const d = drag; drag = null;
@@ -992,7 +992,7 @@
     };
     canvas.addEventListener('pointerup', endDrag);
     canvas.addEventListener('pointercancel', endDrag);
-    canvas.addEventListener('pointerleave', () => { if (!drag) { tip.hidden = true; if (hoverId !== null) { hoverId = null; draw(); } } });
+    canvas.addEventListener('pointerleave', () => { if (!drag && hoverId !== null) { hoverId = null; draw(); showDetail(null); } });
 
     const ro = new ResizeObserver(() => draw());
     ro.observe(canvas);

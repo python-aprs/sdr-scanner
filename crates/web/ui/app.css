@@ -147,6 +147,8 @@ body.has-player main { padding-bottom: 110px; }
 .tl { position: relative; user-select: none; }
 .tl-canvas { display: block; width: 100%; height: 200px; cursor: crosshair; touch-action: pan-y; }
 .tl-canvas.pointing { cursor: pointer; }
+.tl-detail { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-size: 13px; min-height: 1.45em; }
+@media (max-width: 560px) { .tl-detail { flex-basis: 100%; } }
 @media (max-width: 560px) { .tl-canvas { height: 160px; } }
 /* Decoded packets, briefly, over the top of the waterfall. */
 .toasts {
