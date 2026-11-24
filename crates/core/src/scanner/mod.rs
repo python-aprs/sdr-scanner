@@ -13,8 +13,9 @@ use crate::clock::SampleClock;
 use crate::config::{Slot, SlotOrigin};
 use crate::demod;
 use crate::detector::{Detector, DetectorParams, Event, SlotState};
+use crate::dmr::{AmbeFrame, CallInfo};
 use crate::tone::Tone;
-use channel::Channel;
+use channel::{CallRec, Channel};
 use num_complex::Complex32;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -109,6 +110,8 @@ pub struct TxEnd {
     pub mean_snr_db: f32,
     /// CTCSS tone or DCS code heard, if any.
     pub tone: Option<Tone>,
+    /// What a digital voice call said about itself (ids, timeslot, ...).
+    pub digital: Option<CallInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +128,12 @@ pub enum Output {
     },
     /// An AX.25 frame decoded on an `afsk1200` slot.
     Packet(Packet),
+    /// A digital call's voice frames, as received (its `Audio` is what a
+    /// vocoder made of them, or silence without one).
+    Ambe {
+        id: u64,
+        frames: Vec<AmbeFrame>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +182,8 @@ pub struct ScannerStats {
     pub spurs: u64,
     /// AX.25 frames decoded on `afsk1200` slots.
     pub packets: u64,
+    /// Digital voice calls recorded.
+    pub calls: u64,
     pub max_concurrent: usize,
 }
 
@@ -498,6 +509,16 @@ impl Scanner {
         let preroll = self.detector.signal_offset_blocks();
         for c in &mut self.chains {
             Self::emit_packets(&self.clock, &mut self.stats, self.bank.params(), c, out);
+            Self::emit_calls(
+                &self.clock,
+                &mut self.stats,
+                self.bank.params(),
+                &mut self.next_id,
+                &mut self.live,
+                snrs[c.slot],
+                c,
+                out,
+            );
             if !c.records_audio() {
                 continue;
             }
@@ -566,6 +587,110 @@ impl Scanner {
                 time: clock.time_at(at.max(0) as u64),
                 frame: d.frame,
             }));
+        }
+    }
+
+    /// Turn a channel's digital call events into recordings: each call is
+    /// its own transmission, opened as it starts (sync has already shown
+    /// it is real) and streamed as its voice arrives.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_calls(
+        clock: &SampleClock,
+        stats: &mut ScannerStats,
+        p: &BankParams,
+        next_id: &mut u64,
+        live: &mut Option<Vec<LiveAudio>>,
+        snr_db: f32,
+        c: &mut Channel,
+        out: &mut Vec<Output>,
+    ) {
+        use crate::demod::Call;
+        use crate::dmr::vocoder::AUDIO_RATE;
+        for rec in c.calls.iter_mut().flatten() {
+            rec.peak_snr_db = rec.peak_snr_db.max(snr_db);
+            rec.snr_sum += snr_db as f64;
+            rec.blocks += 1;
+        }
+        let stream = |c: &Channel, at: u64| -> u64 {
+            (c.audio_t0 + (at as f64 * p.sample_rate / c.rate) as i64).max(0) as u64
+        };
+        for e in c.demod.take_calls() {
+            match e {
+                Call::Start { key, at_sample, .. } => {
+                    let start = stream(c, at_sample);
+                    let id = *next_id;
+                    *next_id += 1;
+                    out.push(Output::Open(TxStart {
+                        id,
+                        slot: c.tuned.clone(),
+                        start_sample: start,
+                        start_time: clock.time_at(start),
+                        audio_rate: AUDIO_RATE,
+                    }));
+                    if let Some(l) = live.as_mut() {
+                        l.push(LiveAudio::Start {
+                            id,
+                            freq: c.tuned.freq,
+                            priority: c.tuned.priority,
+                            audio_rate: AUDIO_RATE,
+                        });
+                    }
+                    c.calls[key as usize & 1] = Some(CallRec {
+                        id,
+                        start,
+                        peak_snr_db: snr_db,
+                        snr_sum: snr_db as f64,
+                        blocks: 1,
+                        live: live.is_some(),
+                    });
+                }
+                Call::Voice { key, frames, audio } => {
+                    let Some(rec) = &c.calls[key as usize & 1] else {
+                        continue;
+                    };
+                    if rec.live
+                        && let Some(l) = live.as_mut()
+                    {
+                        l.push(LiveAudio::Audio {
+                            id: rec.id,
+                            samples: audio.clone(),
+                        });
+                    }
+                    out.push(Output::Audio {
+                        id: rec.id,
+                        samples: audio,
+                    });
+                    out.push(Output::Ambe {
+                        id: rec.id,
+                        frames: frames.to_vec(),
+                    });
+                }
+                Call::End {
+                    key,
+                    at_sample,
+                    info,
+                } => {
+                    let Some(rec) = c.calls[key as usize & 1].take() else {
+                        continue;
+                    };
+                    if rec.live
+                        && let Some(l) = live.as_mut()
+                    {
+                        l.push(LiveAudio::End { id: rec.id });
+                    }
+                    let end = stream(c, at_sample).max(rec.start);
+                    stats.calls += 1;
+                    out.push(Output::Close(TxEnd {
+                        id: rec.id,
+                        end_sample: end,
+                        signal_secs: (end - rec.start) as f64 / p.sample_rate,
+                        peak_snr_db: rec.peak_snr_db,
+                        mean_snr_db: (rec.snr_sum / rec.blocks as f64) as f32,
+                        tone: None,
+                        digital: Some(info),
+                    }));
+                }
+            }
         }
     }
 
@@ -668,6 +793,19 @@ impl Scanner {
                 let p = *self.bank.params();
                 Self::emit_packets(&self.clock, &mut self.stats, &p, &mut c, out);
                 if !c.records_audio() {
+                    // End digital calls still open.
+                    c.flush();
+                    let snr = self.detector.snr_db(c.slot);
+                    Self::emit_calls(
+                        &self.clock,
+                        &mut self.stats,
+                        &p,
+                        &mut self.next_id,
+                        &mut self.live,
+                        snr,
+                        &mut c,
+                        out,
+                    );
                     return;
                 }
                 if let (Some(live), Some(_)) = (&mut self.live, c.live_sent) {
@@ -712,6 +850,7 @@ impl Scanner {
                     peak_snr_db,
                     mean_snr_db,
                     tone: c.demod.tags().tone,
+                    digital: None,
                 }));
             }
         }
@@ -1332,6 +1471,62 @@ mod tests {
         assert!((t - end).abs() < 0.05, "{t} vs {end}");
         assert_eq!(s_opens(&out), 0, "no audio files");
         assert_eq!(stats.packets, 1);
+    }
+
+    #[test]
+    fn dmr_slots_record_each_call_with_its_ids() {
+        use crate::dmr::burst::Source;
+        use crate::dmr::tx::{self, TxCall};
+        let fs = params().sample_rate;
+        let mut call = TxCall::group(99, 3_171_501, 3);
+        call.alias = Some("KF7HVM".into());
+        let bursts = tx::call_bursts(&call, Source::Mobile);
+        let bb = tx::modulate(&tx::mobile_symbols(&bursts), fs, 0.1);
+        let mut x = scene(2.0, &[]);
+        let on = (0.4 * fs) as usize;
+        for (i, (v, b)) in x[on..].iter_mut().zip(&bb).enumerate() {
+            let t = (on + i) as f64 / fs;
+            let ph = (2.0 * PI * 100e3 * t).rem_euclid(2.0 * PI);
+            *v += b * Complex32::from_polar(1.0, ph as f32);
+        }
+        let mut s = slot(100e3);
+        s.mode = Mode::Dmr;
+        s.bandwidth = 11e3;
+        s.origin = SlotOrigin::Listed;
+        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
+        assert_eq!(s_opens(&out), 1, "{stats:?}");
+        let Some(Output::Open(start)) = out.iter().find(|o| matches!(o, Output::Open(_))) else {
+            unreachable!()
+        };
+        assert_eq!(start.audio_rate, 8000);
+        let t0 = start
+            .start_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        // Voice starts after the two header bursts (and their 60 ms frames).
+        assert!((t0 - 0.52).abs() < 0.05, "{t0}");
+        let frames: usize = out
+            .iter()
+            .map(|o| match o {
+                Output::Ambe { frames, .. } => frames.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(frames, 3 * 6 * 3);
+        assert_eq!(audio_of(&out, start.id).len(), frames * 160);
+        let ends = closes(&out);
+        assert_eq!(ends.len(), 1);
+        let info = ends[0].digital.as_ref().expect("call info");
+        let lc = info.lc.unwrap();
+        assert_eq!((lc.dst, lc.src), (99, 3_171_501));
+        assert_eq!(info.alias.as_deref(), Some("KF7HVM"));
+        assert!(
+            (ends[0].signal_secs - 1.08).abs() < 0.1,
+            "{}",
+            ends[0].signal_secs
+        );
+        assert_eq!(stats.calls, 1);
     }
 
     #[test]

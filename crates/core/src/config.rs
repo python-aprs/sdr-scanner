@@ -55,6 +55,11 @@ impl Mode {
             Mode::Cw => "cw",
         }
     }
+
+    /// Time-division modes, where a single radio transmits in bursts.
+    pub fn is_tdma(self) -> bool {
+        matches!(self, Mode::Dmr)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]

@@ -142,6 +142,12 @@ pub struct WatchedSlot {
 /// 5. Which slots may open: stronger than overlapping neighbours, over
 ///    their raised threshold, not held back by a guard ([`BurstGuard`]).
 /// 6. The per-slot state machine (idle → attack → active → hang → idle).
+///
+/// TDMA slots (DMR) read their peak SNR over [`TDMA_HOLD_SECS`].
+/// How long a TDMA slot's SNR holds its peak: a 60 ms TDMA cycle plus a
+/// block's slack.
+pub const TDMA_HOLD_SECS: f64 = 0.065;
+
 pub struct Detector {
     params: DetectorParams,
     bank: BankParams,
@@ -150,6 +156,10 @@ pub struct Detector {
     stats: Vec<SlotStats>,
     /// Per slot, SNR (linear) smoothed over ~50 ms; see [`Detector::squelch_db`].
     smooth: Vec<f32>,
+    /// Per slot: raw SNR of the last few blocks, for TDMA slots (see
+    /// [`TDMA_HOLD_SECS`]).
+    recent: Vec<Vec<f32>>,
+    tdma_blocks: usize,
     smooth_alpha: f32,
     spectrum: Spectrum,
     floor: NoiseFloor,
@@ -283,6 +293,8 @@ impl Detector {
             states: vec![SlotState::Idle; count],
             stats: vec![SlotStats::default(); count],
             smooth: vec![0.0; count],
+            recent: vec![Vec::new(); count],
+            tdma_blocks: (TDMA_HOLD_SECS / block).ceil().max(1.0) as usize,
             smooth_alpha: (block / SQUELCH_SMOOTHING.max(block)).min(1.0) as f32,
             blocks_seen: 0,
             opens: vec![false; count],
@@ -410,11 +422,23 @@ impl Detector {
             } else {
                 0.0
             };
-            self.stats[i].snr_db = snr as f32;
+            let mut snr = snr as f32;
+            if s.slot.mode.is_tdma() {
+                // A radio keyed on one timeslot sends a 27.5 ms burst every
+                // 60 ms; a block can fall between bursts. Read the slot at its
+                // strongest over the last TDMA cycle, as a carrier would.
+                let r = &mut self.recent[i];
+                r.push(snr);
+                if r.len() > self.tdma_blocks {
+                    r.remove(0);
+                }
+                snr = r.iter().copied().fold(f32::MIN, f32::max);
+            }
+            self.stats[i].snr_db = snr;
             if !held && noise > 0.0 {
                 self.background.add(i, p / noise);
             }
-            let lin = 10f32.powf(snr as f32 / 10.0);
+            let lin = 10f32.powf(snr / 10.0);
             self.smooth[i] += a * (lin - self.smooth[i]);
         }
         if !held {

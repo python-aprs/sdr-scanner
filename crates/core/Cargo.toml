@@ -7,6 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# AMBE+2 voice for DMR through mbelib-neo (or classic mbelib), open-source
+# decoders of DVSI's patented codec; whether you may use them is for you to
+# judge. mbelib-neo is GPL-2.0-or-later, so a binary built with this feature
+# carries the GPL. Needs the library and its headers at build time: set
+# MBELIB_DIR to the install prefix if it is not /usr/local, /opt/homebrew or
+# /usr. Without the feature, DMR calls are still decoded and recorded, with
+# their voice frames kept as `.amb`.
+mbelib = ["dep:cc"]
+
 [dependencies]
 num-complex.workspace = true
 rustfft.workspace = true
@@ -14,6 +25,9 @@ serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
+
+[build-dependencies]
+cc = { version = "1", optional = true }
 
 [[bench]]
 name = "pipeline"

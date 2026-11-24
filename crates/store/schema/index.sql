@@ -25,7 +25,9 @@ CREATE TABLE transmissions (
     wav_path    TEXT    NOT NULL,
     wav_bytes   INTEGER,
     status      TEXT    NOT NULL DEFAULT 'recording'
-, opus_path TEXT, opus_bytes INTEGER, tone TEXT, dtmf TEXT, starred INTEGER NOT NULL DEFAULT 0);
+, opus_path TEXT, opus_bytes INTEGER, tone TEXT, dtmf TEXT, starred INTEGER NOT NULL DEFAULT 0, timeslot INTEGER, color_code INTEGER, call_type TEXT, src_id INTEGER, dst_id INTEGER, alias TEXT, encrypted INTEGER, amb_bytes INTEGER);
 CREATE INDEX packets_time ON packets(time_ns);
+CREATE INDEX transmissions_dst ON transmissions(dst_id, start_ns);
 CREATE INDEX transmissions_freq ON transmissions(freq_hz, start_ns);
+CREATE INDEX transmissions_src ON transmissions(src_id, start_ns);
 CREATE INDEX transmissions_start ON transmissions(start_ns);

@@ -261,17 +261,20 @@ pub fn delete_recording(root: &Path, index: &Index, id: i64) -> Result<u64, Dele
 /// the bytes actually freed.
 fn delete_files(root: &Path, r: &Row) -> (u64, u64) {
     let counted = if r.status == "complete" {
-        (r.wav_bytes.unwrap_or(0) + r.opus_bytes.unwrap_or(0)).max(0) as u64
+        (r.wav_bytes.unwrap_or(0) + r.opus_bytes.unwrap_or(0) + r.amb_bytes.unwrap_or(0)).max(0)
+            as u64
     } else {
         0
     };
     let mut freed = 0;
     let opus = crate::recorder::opus_path(&r.wav_path);
+    let amb = crate::recorder::amb_path(&r.wav_path);
     let mut dirs = Vec::new();
     for rel in [
         Some(r.wav_path.as_str()),
         r.opus_path.as_deref(),
         Some(&opus),
+        Some(&amb),
     ]
     .into_iter()
     .flatten()

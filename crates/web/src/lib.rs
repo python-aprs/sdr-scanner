@@ -682,6 +682,10 @@ pub struct ListParams {
     pub dtmf: Option<String>,
     /// Only starred (`true`) or unstarred (`false`) recordings.
     pub starred: Option<bool>,
+    /// Digital calls to this talkgroup or radio id.
+    pub dst_id: Option<i64>,
+    /// Digital calls from this radio id.
+    pub src_id: Option<i64>,
     pub before_id: Option<i64>,
     pub limit: Option<usize>,
 }
@@ -706,7 +710,8 @@ fn recording(r: Row) -> Recording {
 
 #[derive(Deserialize)]
 struct AudioParams {
-    /// `wav` or `opus`; left out, the Opus copy if there is one.
+    /// `wav`, `opus` or `amb` (a digital call's raw voice frames); left
+    /// out, the Opus copy if there is one.
     format: Option<String>,
 }
 
@@ -724,6 +729,8 @@ fn list_query(p: ListParams, default_limit: usize) -> Query {
             .filter(|d| !d.is_empty())
             .map(|d| if d == "ANY" { String::new() } else { d }),
         starred: p.starred,
+        dst_id: p.dst_id,
+        src_id: p.src_id,
         before_id: p.before_id,
         limit: p.limit.unwrap_or(default_limit),
     }
@@ -907,14 +914,15 @@ async fn get_audio(
     if s.egress_level(caller.role) == egress::Level::Spent {
         return Err(budget_spent());
     }
+    let want_amb = p.format.as_deref() == Some("amb");
     let want_opus = match p.format.as_deref() {
-        None => None,
+        None | Some("amb") => None,
         Some("wav") => Some(false),
         Some("opus") => Some(true),
         Some(_) => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
-                "format is wav or opus".into(),
+                "format is wav, opus or amb".into(),
             ));
         }
     };
@@ -923,7 +931,14 @@ async fn get_audio(
     let Some(row) = row.filter(|r| r.status == "complete") else {
         return Err(ApiError(StatusCode::NOT_FOUND, "no such recording".into()));
     };
+    let amb = scanner_store::recorder::amb_path(&row.wav_path);
     let (path, mime) = match (want_opus, row.opus_path.as_deref()) {
+        _ if want_amb => {
+            if row.amb_bytes.is_none() {
+                return Err(ApiError(StatusCode::NOT_FOUND, "no voice frames".into()));
+            }
+            (amb.as_str(), "application/octet-stream")
+        }
         (Some(false), _) | (None, None) => (row.wav_path.as_str(), "audio/wav"),
         (Some(true) | None, Some(p)) => (p, "audio/ogg; codecs=opus"),
         (Some(true), None) => {
