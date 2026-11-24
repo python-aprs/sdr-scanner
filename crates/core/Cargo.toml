@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Lets binaries read the mbelib shared library folder (DEP_SCANNER_MBE_RPATH)
+# for their rpath; see build.rs.
+links = "scanner_mbe"
 
 [features]
 default = []

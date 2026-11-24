@@ -394,7 +394,11 @@ MBELIB_DIR=$HOME/.local/mbelib-neo cargo build --release -p scanner-cli --featur
 `crates/core/build.rs` looks for mbelib-neo, then classic mbelib, under
 `MBELIB_DIR`, `/usr/local`, `/opt/homebrew` and `/usr`, and links the static
 library when there is one (mbelib-neo's shared library uses an `@rpath`
-install name on macOS). `crates/core/mbelib/shim.c` is the only code that
+install name on macOS). A prebuilt release archive whose objects are LTO
+bitcode (the macOS release tarballs are) can't be read by an older local
+linker, so when the `.a` holds bitcode and a shared library sits beside it,
+the build links the shared library and puts its folder on the binary's
+rpath instead. `MBELIB_LINK=static` or `dylib` forces either. `crates/core/mbelib/shim.c` is the only code that
 sees the header. Without a library the feature still builds with a warning
 and DMR calls are recorded as silence plus `.amb` frames; `scanner serve`
 says so at start. `cargo test -p scanner-core --features mbelib vocoder`
