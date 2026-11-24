@@ -33,12 +33,20 @@ fn mbelib() {
             println!("cargo:rerun-if-changed={}", p.join(header).display());
             build.file("mbelib/shim.c").include(p.join("include"));
             build.compile("scanner_mbe");
+            // Link the static library when there is one, so the binary runs
+            // without the library's folder on the loader path (mbelib-neo's
+            // macOS install name is @rpath).
+            let mut kind = "dylib";
             for dir in ["lib", "lib64"] {
-                if p.join(dir).exists() {
-                    println!("cargo:rustc-link-search=native={}", p.join(dir).display());
+                let d = p.join(dir);
+                if d.exists() {
+                    println!("cargo:rustc-link-search=native={}", d.display());
+                    if d.join(format!("lib{lib}.a")).exists() {
+                        kind = "static";
+                    }
                 }
             }
-            println!("cargo:rustc-link-lib={lib}");
+            println!("cargo:rustc-link-lib={kind}={lib}");
             if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
                 println!("cargo:rustc-link-lib=m");
             }

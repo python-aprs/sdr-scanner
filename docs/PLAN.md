@@ -706,6 +706,15 @@ fixtures, a small recorded subset, and benchmarks with a soft regression gate.
 - Then System Fusion, D-STAR and P25 based on local traffic.
 - Exit: on recorded local DMR traffic, frame counts, talkgroups and IDs match
   DSD-FME, and the audio is intelligible.
+- Status (2026-11-24): the `dmr` mode is in (`crates/core/src/dmr`). It
+  decodes sync, CACH, slot type, BPTC/RS full LC, embedded LC and talker
+  alias, records one call per timeslot with its ids, and keeps the raw AMBE+2
+  frames (`.amb`). Audio needs the optional `mbelib` feature (mbelib-neo
+  preferred, classic mbelib also works). The encoders match MMDVMHost bit for
+  bit, and tests run synthetic simplex and repeater traffic through the whole
+  receiver. Not done yet: validation on a real capture, FM/DMR
+  auto-classification of grid slots, a RadioID.net callsign list, and DVSI
+  hardware.
 
 **Phase 7: SSB, CW and HF**
 - `usb`/`lsb`/`cw` modes, AGC, SSB/CW detectors, HF band profiles, upconverter

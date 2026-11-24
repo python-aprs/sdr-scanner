@@ -30,6 +30,12 @@ freq   = "144.9200 MHz"
 name   = "Packet"
 mode   = "afsk1200"
 
+[[profiles.rainier-2m.channels]]
+freq      = "145.7900 MHz"
+name      = "DMR simplex"
+mode      = "dmr"            # talkgroup and radio ids; audio with the mbelib build
+bandwidth = "11 kHz"
+
 [[profiles.rainier-2m.lockouts]]
 start  = "144.000 MHz"
 stop   = "144.300 MHz"
@@ -190,7 +196,6 @@ offset   = "1000 kHz"
 modes    = ["DMR"]
 mode     = "dmr"
 bandwidth = "11 kHz"
-record   = false  # digital-only until its decoder exists
 
 [[profiles.rainier-2m.repeaters]]
 name     = "WB7DZG Gaston, OR"
@@ -600,7 +605,6 @@ offset   = "5000 kHz"
 modes    = ["DMR"]
 mode     = "dmr"
 bandwidth = "11 kHz"
-record   = false  # digital-only until its decoder exists
 
 # shared output: K7AWR Vancouver, OR; NA7A Tualatin, OR
 [[profiles.rainier-70cm.repeaters]]
@@ -1273,7 +1277,6 @@ offset   = "5000 kHz"
 modes    = ["DMR"]
 mode     = "dmr"
 bandwidth = "11 kHz"
-record   = false  # digital-only until its decoder exists
 
 # 35 km
 [[profiles.rainier-70cm.repeaters]]
@@ -1401,7 +1404,6 @@ offset   = "5000 kHz"
 modes    = ["DMR"]
 mode     = "dmr"
 bandwidth = "11 kHz"
-record   = false  # digital-only until its decoder exists
 
 # 10 km
 [[profiles.rainier-70cm.repeaters]]

@@ -400,7 +400,7 @@
       document.body.classList.add('has-player');
       $('#player-freq').textContent = `${MHZ(r.freq_hz)} MHz`;
       const when = nsDate(r.start_ns);
-      $('#player-meta').textContent = [r.channel || channelName(r.freq_hz), `${dayLabel(when)} ${timeFmt.format(when)}`, fmtSecs(r.audio_secs), r.tone && `Tone ${r.tone}`, r.dtmf && `DTMF ${r.dtmf}`]
+      $('#player-meta').textContent = [r.channel || channelName(r.freq_hz), `${dayLabel(when)} ${timeFmt.format(when)}`, fmtSecs(r.audio_secs), callLabel(r), r.tone && `Tone ${r.tone}`, r.dtmf && `DTMF ${r.dtmf}`]
         .filter(Boolean).join(' · ');
       document.querySelectorAll('tr.playing, li.playing').forEach((el) => el.classList.remove('playing'));
       document.querySelectorAll(`[data-rec="${r.id}"]`).forEach((el) => el.classList.add('playing'));
@@ -777,8 +777,24 @@
     if (params.get('min')) q.set('min_secs', params.get('min'));
     if (params.get('tone')) q.set('tone', params.get('tone'));
     if (params.get('dtmf')) q.set('dtmf', params.get('dtmf'));
+    if (params.get('tg')) q.set('dst_id', params.get('tg'));
+    if (params.get('radio')) q.set('src_id', params.get('radio'));
     if (params.get('starred') === '1') q.set('starred', 'true');
     return q;
+  }
+
+  /** What a digital (DMR) call said about itself, as one line: timeslot,
+   * talkgroup or called radio, calling radio, talker alias. Empty for
+   * analog recordings. */
+  function callLabel(r) {
+    if (r.mode !== 'dmr') return '';
+    const parts = [];
+    if (r.timeslot) parts.push(`TS${r.timeslot}`);
+    if (r.dst_id !== null && r.dst_id !== undefined) parts.push(r.call_type === 'private' ? `to ${r.dst_id}` : `TG ${r.dst_id}`);
+    if (r.src_id !== null && r.src_id !== undefined) parts.push(`from ${r.src_id}`);
+    if (r.alias) parts.push(r.alias);
+    if (r.encrypted) parts.push('encrypted');
+    return parts.length ? parts.join(' · ') : 'DMR call';
   }
 
   /** A local time as a datetime-local value, to the second. */
@@ -1070,6 +1086,8 @@
     const minSecs = h('input', { type: 'number', min: '0', step: '0.5', placeholder: '0', value: params.get('min') || '', style: 'width:80px' });
     const tone = h('input', { type: 'text', placeholder: '100.0 or D023N', value: params.get('tone') || '', style: 'width:120px', 'aria-label': 'Tone' });
     const dtmf = h('input', { type: 'text', placeholder: 'digits or any', value: params.get('dtmf') || '', style: 'width:110px', 'aria-label': 'DTMF digits' });
+    const tg = h('input', { type: 'number', min: '0', placeholder: '91', value: params.get('tg') || '', style: 'width:100px', 'aria-label': 'Talkgroup or called radio id' });
+    const radio = h('input', { type: 'number', min: '0', placeholder: '3171501', value: params.get('radio') || '', style: 'width:110px', 'aria-label': 'Calling radio id' });
     const starredOnly = h('input', { type: 'checkbox', checked: params.get('starred') === '1' });
     const form = h('form', { class: 'filters', onsubmit: (e) => { e.preventDefault(); apply(); } },
       h('label', {}, 'Channel', chan),
@@ -1079,6 +1097,8 @@
       h('label', {}, 'Min length (s)', minSecs),
       h('label', {}, 'Tone', tone),
       h('label', {}, 'DTMF', dtmf),
+      h('label', { title: 'DMR talkgroup, or the radio a private call went to' }, 'Talkgroup', tg),
+      h('label', { title: 'DMR radio id that made the call' }, 'Radio ID', radio),
       h('label', { class: 'check', title: 'Starred recordings are kept when old ones are deleted for space' }, starredOnly, 'Starred only'),
       h('button', { type: 'submit', class: 'primary' }, 'Search'),
       h('button', { type: 'button', onclick: () => { location.hash = '#/recordings'; } }, 'Clear'));
@@ -1102,6 +1122,8 @@
       if (minSecs.value) p.set('min', minSecs.value);
       if (tone.value.trim()) p.set('tone', tone.value.trim().toUpperCase());
       if (dtmf.value.trim()) p.set('dtmf', dtmf.value.trim().toUpperCase());
+      if (tg.value) p.set('tg', tg.value);
+      if (radio.value) p.set('radio', radio.value);
       if (starredOnly.checked) p.set('starred', '1');
       if (since.value && params.get('until')) p.set('until', params.get('until'));
       location.hash = `#/recordings${p.toString() ? '?' + p : ''}`;
@@ -1130,13 +1152,15 @@
             h('td', { class: 'star-cell' }, starControl(r)),
             h('td', { class: 'mono' }, timeFmt.format(when)),
             h('td', { class: 'mono' }, MHZ(r.freq_hz, 4)),
-            h('td', { class: 'grow' }, r.channel || channelName(r.freq_hz) || h('span', { class: 'muted' }, kindLabel[r.origin] || r.origin)),
+            h('td', { class: 'grow' }, r.channel || channelName(r.freq_hz) || h('span', { class: 'muted' }, kindLabel[r.origin] || r.origin),
+              callLabel(r) ? h('div', { class: 'muted call', title: r.color_code !== null && r.color_code !== undefined ? `DMR, colour code ${r.color_code}` : 'DMR' }, callLabel(r)) : null),
             h('td', { class: 'mono', title: r.tone ? (r.tone.startsWith('D') ? 'DCS code' : 'CTCSS tone (Hz)') : '' }, r.tone || ''),
             h('td', { class: 'mono dtmf', title: r.dtmf ? 'DTMF digits heard' : '' }, r.dtmf || ''),
             h('td', { class: 'num mono' }, fmtSecs(r.audio_secs)),
             h('td', { class: 'num mono' }, r.peak_snr_db === null ? '' : fmtDb(r.peak_snr_db)),
             h('td', { class: 'actions' },
               canAudio() ? h('a', { href: r.wav_url, download: '', onclick: (e) => e.stopPropagation(), title: 'Download WAV' }, 'WAV') : null,
+              canAudio() && r.amb_bytes ? h('a', { href: `/api/v1/recordings/${r.id}/audio?format=amb`, download: '', onclick: (e) => e.stopPropagation(), title: 'Download the raw AMBE voice frames (.amb, as dsd writes them)' }, 'AMB') : null,
               isAdmin() ? confirmButton('Delete', 'Delete?', () => removeRecording(r, tr), 'mini danger') : null));
           tbody.append(tr);
         }

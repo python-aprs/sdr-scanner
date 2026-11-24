@@ -10,6 +10,8 @@
 //!   WAV per transmission plus the SQLite index
 //! - `scanner dtmf <wav or recordings folder>...`: decode DTMF digits, and
 //!   tag a folder's index rows with them
+//! - `scanner ambe <file.amb>...`: turn a DMR call's raw voice frames into
+//!   WAV (needs the `mbelib` build)
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -68,6 +70,16 @@ enum Cmd {
     /// `index.sqlite`) has every complete recording scanned and its index
     /// rows tagged, for recordings made before DTMF tagging.
     Dtmf(DtmfArgs),
+    /// Decode DMR calls' raw voice frames (`.amb`, kept beside each call's
+    /// recording) to WAV next to them. Needs a build with `--features
+    /// mbelib`; for calls recorded by a build without it.
+    Ambe {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Replace WAV files that already exist.
+        #[arg(long)]
+        force: bool,
+    },
     /// Work with band-profile config files.
     Config {
         #[command(subcommand)]
@@ -328,6 +340,17 @@ impl Tuning {
         for w in &plan.warnings {
             eprintln!("warning: {w}");
         }
+        let dmr = plan
+            .slots
+            .iter()
+            .any(|s| s.mode == scanner_core::config::Mode::Dmr && s.record);
+        if dmr && !scanner_core::dmr::vocoder::available() {
+            eprintln!(
+                "note: no DMR vocoder in this build: DMR calls are recorded with their ids \
+                 and raw voice frames (.amb) but silent audio. Build with --features mbelib \
+                 for audio, or decode later with `scanner ambe`."
+            );
+        }
         Ok((profile, plan))
     }
 
@@ -393,6 +416,7 @@ fn main() -> Result<()> {
         } => peaks(recording, fft, threshold, merge, json),
         Cmd::Run(args) => run(args),
         Cmd::Dtmf(args) => dtmf(args),
+        Cmd::Ambe { files, force } => ambe(&files, force),
         Cmd::Devices => devices(),
         Cmd::Admin(a) => admin::run(a),
         Cmd::Calibrate(a) => calibrate(a),
@@ -685,6 +709,39 @@ fn dtmf(a: DtmfArgs) -> Result<()> {
         eprintln!(
             "{}: scanned {scanned} recordings, {tagged} with DTMF",
             path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ambe(files: &[PathBuf], force: bool) -> Result<()> {
+    use scanner_core::dmr::{AmbeFrame, vocoder};
+    if !vocoder::available() {
+        bail!("this build has no vocoder: rebuild with --features mbelib");
+    }
+    for path in files {
+        let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let Some(body) = data.strip_prefix(scanner_store::recorder::AMB_MAGIC) else {
+            bail!("{} is not an .amb file", path.display());
+        };
+        let out = path.with_extension("wav");
+        if out.exists() && !force {
+            eprintln!("{} exists; skipping (--force to replace)", out.display());
+            continue;
+        }
+        let mut v = vocoder::Leveled::new(vocoder::new().unwrap());
+        let mut audio = Vec::new();
+        for f in body.chunks_exact(8) {
+            let f = AmbeFrame::from_amb_bytes(f.try_into().unwrap());
+            vocoder::Vocoder::decode(&mut v, &f, &mut audio);
+        }
+        let mut w = scanner_store::wav::WavWriter::create(&out, vocoder::AUDIO_RATE)?;
+        w.write(&audio)?;
+        w.finish(vocoder::AUDIO_RATE)?;
+        println!(
+            "{}\t{:.1} s",
+            out.display(),
+            audio.len() as f64 / vocoder::AUDIO_RATE as f64
         );
     }
     Ok(())

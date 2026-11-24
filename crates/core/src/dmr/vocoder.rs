@@ -100,3 +100,59 @@ mod mbe {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "mbelib")]
+    use super::*;
+    use crate::dmr::{burst, fec};
+
+    /// A voice burst of three AMBE+2 silence frames, as MMDVMHost sends it.
+    const SILENCE_BURST: [u8; 33] = [
+        0xB9, 0xE8, 0x81, 0x52, 0x61, 0x73, 0x00, 0x2A, 0x6B, 0xB9, 0xE8, 0x81, 0x52, 0x60, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x73, 0x00, 0x2A, 0x6B, 0xB9, 0xE8, 0x81, 0x52, 0x61, 0x73,
+        0x00, 0x2A, 0x6B,
+    ];
+
+    #[test]
+    fn silence_frames_decode_without_errors() {
+        // Real AMBE+2 codewords: the frame layout, Golay codes and C1
+        // whitening all have to be right for these to come out clean.
+        let bits = fec::bytes_to_bits(&SILENCE_BURST);
+        let frames = burst::ambe_frames(&bits);
+        for f in &frames {
+            assert_eq!(f.errs, 0);
+            assert_eq!(f.bits, frames[0].bits);
+        }
+    }
+
+    #[cfg(feature = "mbelib")]
+    #[test]
+    fn mbelib_decodes_frames() {
+        let Some(mut v) = new() else {
+            eprintln!("built without the mbelib library; skipping");
+            return;
+        };
+        let bits = fec::bytes_to_bits(&SILENCE_BURST);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            for f in burst::ambe_frames(&bits) {
+                v.decode(&f, &mut out);
+            }
+        }
+        assert_eq!(out.len(), 30 * FRAME_SAMPLES);
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        let quiet = rms(&out);
+        // Voice parameters make sound.
+        let mut out = Vec::new();
+        for n in 0..30 {
+            let f = burst::AmbeFrame {
+                bits: crate::dmr::tx::test_frame(n),
+                errs: 0,
+            };
+            v.decode(&f, &mut out);
+        }
+        let loud = rms(&out);
+        assert!(loud > 10.0 * quiet, "voice {loud} vs silence {quiet}");
+    }
+}

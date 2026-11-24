@@ -45,6 +45,30 @@ impl Outputs {
                         Hz(s.slot.freq),
                         s.slot.name.as_deref().unwrap_or("")
                     ),
+                    Output::Close(e) if self.log => {
+                        if let Some(d) = &e.digital {
+                            let who = match d.lc {
+                                Some(l) => format!(
+                                    "{} {} -> {}",
+                                    d.call_type().unwrap_or("call"),
+                                    l.src,
+                                    l.dst
+                                ),
+                                None => "call (ids not heard)".into(),
+                            };
+                            eprintln!(
+                                "  dmr   {}{}{}{} {:.1} s",
+                                d.timeslot.map(|t| format!("TS{t} ")).unwrap_or_default(),
+                                who,
+                                d.alias
+                                    .as_deref()
+                                    .map(|a| format!(" \"{a}\""))
+                                    .unwrap_or_default(),
+                                if d.encrypted { " encrypted" } else { "" },
+                                e.signal_secs
+                            );
+                        }
+                    }
                     Output::Packet(p) => {
                         if self.log {
                             eprintln!("  packet {} {}", Hz(p.slot.freq), p.frame.tnc2());

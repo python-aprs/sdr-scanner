@@ -84,7 +84,8 @@ def test_toml_output_is_loadable_shape():
     text = ir.to_toml(reps, "site")
     assert text.count("[[profiles.site.repeaters]]") == len(reps)
     assert 'mode     = "dmr"' in text
-    assert "record   = false" in text
+    # D-STAR has no decoder yet, so it isn't recorded; DMR is.
+    assert text.count("record   = false") == sum(r.primary_mode not in ("nbfm", "dmr") for r in reps)
     assert 'deviation = "2.5 kHz"' in text  # narrow FM
     import tomllib
 

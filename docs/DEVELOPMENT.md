@@ -372,6 +372,35 @@ The Airspy backend (libairspy, behind an `airspy` feature) comes later; the
 feature is added along with it.
 
 
+### DMR and the AMBE+2 vocoder (`mbelib`)
+
+`crates/core/src/dmr` decodes DMR without outside code: `rx` turns the
+channel's IQ into bursts (FM discriminator, 48 kHz, RRC matched filter, sync
+search, then predicted bursts every 30 ms), `calls` follows each timeslot's
+calls and link control, `fec` and `burst` hold the codes and bit layouts, and
+`tx` is a transmitter the tests use. `matches_reference_bursts` checks our
+encoders against bursts from MMDVMHost. `demod::dmr::DmrVoice` plugs it into
+the scanner, which opens one recording per call (`scanner::emit_calls`).
+
+Voice audio needs the `mbelib` feature, like `sdrplay`:
+
+```sh
+# mbelib-neo (preferred): https://github.com/arancormonk/mbelib-neo
+cmake -S mbelib-neo -B build -DCMAKE_INSTALL_PREFIX=$HOME/.local/mbelib-neo
+cmake --build build && cmake --install build
+MBELIB_DIR=$HOME/.local/mbelib-neo cargo build --release -p scanner-cli --features mbelib
+```
+
+`crates/core/build.rs` looks for mbelib-neo, then classic mbelib, under
+`MBELIB_DIR`, `/usr/local`, `/opt/homebrew` and `/usr`, and links the static
+library when there is one (mbelib-neo's shared library uses an `@rpath`
+install name on macOS). `crates/core/mbelib/shim.c` is the only code that
+sees the header. Without a library the feature still builds with a warning
+and DMR calls are recorded as silence plus `.amb` frames; `scanner serve`
+says so at start. `cargo test -p scanner-core --features mbelib vocoder`
+decodes a few frames with the real library.
+
+
 #### Calibrating gain
 
 Needs a `--features sdrplay` build:
