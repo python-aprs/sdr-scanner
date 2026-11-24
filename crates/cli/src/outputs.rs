@@ -57,6 +57,20 @@ impl Outputs {
                                 e.signal_secs
                             );
                         }
+                        if let Some(CallInfo::Dstar(d)) = &e.digital {
+                            let h = d.header.clone().unwrap_or_default();
+                            eprintln!(
+                                "  dstar {} -> {} via {}{} {:.1} s",
+                                h.my.as_deref().unwrap_or("?"),
+                                h.your.as_deref().unwrap_or("?"),
+                                h.rpt1.as_deref().unwrap_or("-"),
+                                d.message
+                                    .as_deref()
+                                    .map(|m| format!(" \"{m}\""))
+                                    .unwrap_or_default(),
+                                e.signal_secs
+                            );
+                        }
                         if let Some(CallInfo::Dmr(d)) = &e.digital {
                             let who = match d.lc {
                                 Some(l) => format!(

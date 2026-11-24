@@ -133,6 +133,7 @@ pub enum Output {
     /// vocoder made of them, or silence without one).
     Ambe {
         id: u64,
+        codec: crate::dmr::vocoder::Codec,
         frames: Vec<AmbeFrame>,
     },
 }
@@ -617,7 +618,11 @@ impl Scanner {
         };
         for e in c.demod.take_calls() {
             match e {
-                Call::Start { key, at_sample, .. } => {
+                Call::Start {
+                    key,
+                    at_sample,
+                    info,
+                } => {
                     let start = stream(c, at_sample);
                     let id = *next_id;
                     *next_id += 1;
@@ -643,6 +648,7 @@ impl Scanner {
                         snr_sum: snr_db as f64,
                         blocks: 1,
                         live: live.is_some(),
+                        codec: info.codec(),
                     });
                 }
                 Call::Voice { key, frames, audio } => {
@@ -662,7 +668,11 @@ impl Scanner {
                         samples: audio,
                     });
                     if !frames.is_empty() {
-                        out.push(Output::Ambe { id: rec.id, frames });
+                        out.push(Output::Ambe {
+                            id: rec.id,
+                            codec: rec.codec,
+                            frames,
+                        });
                     }
                 }
                 Call::End {
@@ -1570,6 +1580,51 @@ mod tests {
         // Header, ten voice frames and the terminator: 1.2 s.
         assert!(
             (ends[0].signal_secs - 1.2).abs() < 0.1,
+            "{}",
+            ends[0].signal_secs
+        );
+    }
+
+    #[test]
+    fn dstar_slots_record_each_call_with_its_header() {
+        use crate::dstar::tx::{self, TxCall};
+        let fs = params().sample_rate;
+        let call = TxCall::new("KF7HVM", 50);
+        let bb = tx::modulate(&tx::call_bits(&call), fs, 0.1, 0);
+        let mut x = scene(2.5, &[]);
+        let on = (0.4 * fs) as usize;
+        for (i, (v, b)) in x[on..].iter_mut().zip(&bb).enumerate() {
+            let t = (on + i) as f64 / fs;
+            let ph = (2.0 * PI * 75e3 * t).rem_euclid(2.0 * PI);
+            *v += b * Complex32::from_polar(1.0, ph as f32);
+        }
+        let mut s = slot(75e3);
+        s.mode = Mode::Dstar;
+        s.bandwidth = 11e3;
+        s.origin = SlotOrigin::Listed;
+        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
+        assert_eq!(s_opens(&out), 1, "{stats:?}");
+        let frames: usize = out
+            .iter()
+            .map(|o| match o {
+                Output::Ambe { frames, codec, .. } => {
+                    assert_eq!(*codec, crate::dmr::vocoder::Codec::Ambe);
+                    frames.len()
+                }
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(frames, 50);
+        let ends = closes(&out);
+        assert_eq!(ends.len(), 1);
+        let Some(CallInfo::Dstar(info)) = ends[0].digital.as_ref() else {
+            panic!("call info {:?}", ends[0].digital)
+        };
+        let h = info.header.as_ref().expect("header");
+        assert_eq!(h.my.as_deref(), Some("KF7HVM"));
+        // Header (137.5 ms) and fifty 20 ms frames.
+        assert!(
+            (ends[0].signal_secs - 1.14).abs() < 0.1,
             "{}",
             ends[0].signal_secs
         );

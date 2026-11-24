@@ -10,12 +10,14 @@
 mod afsk;
 mod audio;
 mod dmr;
+mod dstar;
 mod nbfm;
 mod ysf;
 
 pub use afsk::AfskPacket;
 pub use audio::{Levels, SquelchGate};
 pub use dmr::DmrVoice;
+pub use dstar::DstarVoice;
 pub use nbfm::NbfmVoice;
 pub use ysf::YsfVoice;
 
@@ -38,6 +40,17 @@ pub struct Tags {
 pub enum CallInfo {
     Dmr(crate::dmr::CallInfo),
     Ysf(crate::ysf::CallInfo),
+    Dstar(crate::dstar::CallInfo),
+}
+
+impl CallInfo {
+    /// The codec of the call's voice frames.
+    pub fn codec(&self) -> crate::dmr::vocoder::Codec {
+        match self {
+            CallInfo::Dstar(_) => crate::dmr::vocoder::Codec::Ambe,
+            _ => crate::dmr::vocoder::Codec::AmbePlus2,
+        }
+    }
 }
 
 /// A digital voice call on a channel (a channel can carry more than one at
@@ -112,7 +125,10 @@ pub trait Demod: Send {
 
 /// Whether [`build`] has a demodulator for this mode.
 pub fn supports(mode: Mode) -> bool {
-    matches!(mode, Mode::Nbfm | Mode::Afsk1200 | Mode::Dmr | Mode::Ysf)
+    matches!(
+        mode,
+        Mode::Nbfm | Mode::Afsk1200 | Mode::Dmr | Mode::Ysf | Mode::Dstar
+    )
 }
 
 /// The demodulator for `slot`'s mode, fed channel IQ at `rate`, or `None`
@@ -123,6 +139,7 @@ pub fn build(slot: &Slot, rate: f64, cfg: &ScannerConfig) -> Option<Box<dyn Demo
         Mode::Afsk1200 => Some(Box::new(AfskPacket::new(slot, rate))),
         Mode::Dmr => Some(Box::new(DmrVoice::new(rate))),
         Mode::Ysf => Some(Box::new(YsfVoice::new(rate))),
+        Mode::Dstar => Some(Box::new(DstarVoice::new(rate))),
         _ => None,
     }
 }

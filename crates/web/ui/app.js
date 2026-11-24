@@ -797,6 +797,15 @@
       if (y.data_type) parts.push(y.data_type.toUpperCase());
       return parts.length ? parts.join(' · ') : 'Fusion call';
     }
+    if (r.mode === 'dstar') {
+      const d = r.dstar || {};
+      const parts = [];
+      if (d.my) parts.push(d.suffix ? `${d.my}/${d.suffix}` : d.my);
+      if (d.your && d.your !== 'CQCQCQ') parts.push(`to ${d.your}`);
+      if (d.rpt1) parts.push(`via ${d.rpt1}`);
+      if (d.message) parts.push(`“${d.message}”`);
+      return parts.length ? parts.join(' · ') : 'D-STAR call';
+    }
     if (r.mode !== 'dmr') return '';
     const parts = [];
     if (r.timeslot) parts.push(`TS${r.timeslot}`);
@@ -1110,7 +1119,7 @@
       h('label', {}, 'DTMF', dtmf),
       h('label', { title: 'DMR talkgroup, or the radio a private call went to' }, 'Talkgroup', tg),
       h('label', { title: 'DMR radio id that made the call' }, 'Radio ID', radio),
-      h('label', { title: 'System Fusion callsign that made the call' }, 'Callsign', callsign),
+      h('label', { title: 'System Fusion or D-STAR callsign that made the call' }, 'Callsign', callsign),
       h('label', { class: 'check', title: 'Starred recordings are kept when old ones are deleted for space' }, starredOnly, 'Starred only'),
       h('button', { type: 'submit', class: 'primary' }, 'Search'),
       h('button', { type: 'button', onclick: () => { location.hash = '#/recordings'; } }, 'Clear'));
@@ -1166,7 +1175,7 @@
             h('td', { class: 'mono' }, timeFmt.format(when)),
             h('td', { class: 'mono' }, MHZ(r.freq_hz, 4)),
             h('td', { class: 'grow' }, r.channel || channelName(r.freq_hz) || h('span', { class: 'muted' }, kindLabel[r.origin] || r.origin),
-              callLabel(r) ? h('div', { class: 'muted call', title: r.mode === 'ysf' ? 'System Fusion' : r.color_code !== null && r.color_code !== undefined ? `DMR, colour code ${r.color_code}` : 'DMR' }, callLabel(r)) : null),
+              callLabel(r) ? h('div', { class: 'muted call', title: r.mode === 'ysf' ? 'System Fusion' : r.mode === 'dstar' ? 'D-STAR' : r.color_code !== null && r.color_code !== undefined ? `DMR, colour code ${r.color_code}` : 'DMR' }, callLabel(r)) : null),
             h('td', { class: 'mono', title: r.tone ? (r.tone.startsWith('D') ? 'DCS code' : 'CTCSS tone (Hz)') : '' }, r.tone || ''),
             h('td', { class: 'mono dtmf', title: r.dtmf ? 'DTMF digits heard' : '' }, r.dtmf || ''),
             h('td', { class: 'num mono' }, fmtSecs(r.audio_secs)),

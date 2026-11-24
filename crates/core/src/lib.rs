@@ -12,6 +12,7 @@ pub mod demod;
 pub mod detector;
 pub mod dmr;
 pub mod dsp;
+pub mod dstar;
 pub mod dtmf;
 pub mod psd;
 pub mod scanner;

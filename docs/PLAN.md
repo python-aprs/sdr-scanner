@@ -725,6 +725,14 @@ fixtures, a small recorded subset, and benchmarks with a soft regression gate.
   (full-rate IMBE) voice, a real capture, and FM/YSF auto-classification
   (442.175 near Rainier is a mixed FM/Fusion repeater, so its slot stays FM
   until then).
+- Status (2026-11-24): the `dstar` mode (`crates/core/src/dstar`) finds the
+  frame and data syncs in the GMSK bit stream, decodes the radio header
+  (convolutional code, interleave, scrambler, CRC; matches the MMDVM
+  firmware's encoder bit for bit), the slow data message and the header copy
+  it carries (late entry), and records one call per transmission with its
+  AMBE frames (`.amb` with a `.dst` header: D-STAR's codec is AMBE 3600x2400,
+  decoded by mbelib's 2400 path). Details go in `dstar_calls`. 146.62
+  (WB7DZG) is recorded now. Not done yet: a real capture, fast data, GPS.
 
 **Phase 7: SSB, CW and HF**
 - `usb`/`lsb`/`cw` modes, AGC, SSB/CW detectors, HF band profiles, upconverter

@@ -44,6 +44,7 @@ pub(super) struct CallRec {
     pub blocks: u32,
     /// Announced to live listeners.
     pub live: bool,
+    pub codec: crate::dmr::vocoder::Codec,
 }
 
 impl Channel {

@@ -390,6 +390,15 @@ CRC and whitening; `matches_reference_header` checks against MMDVMHost.
 DN and V/D mode 1 voice is AMBE+2, so it uses the same vocoder and `.amb`
 files as DMR. VW (IMBE) calls are recorded with their callsigns but silent.
 
+`crates/core/src/dstar` is D-STAR: `rx` averages the discriminator over a bit,
+finds the 24-bit frame and data syncs by correlation (timing, slicing level
+and polarity come from the fit), decodes the header, then steps 96-bit frames,
+re-aligning on the data sync every 21st frame. A data sync found without a
+header holds its frames until the next one confirms it. `header` is the
+header's coding, `frame` the AMBE layout and slow data. D-STAR's AMBE is the
+older 3600x2400 codec, so its frames are written with a `.dst` file header
+and decoded with `vocoder::Codec::Ambe`.
+
 Voice audio needs the `mbelib` feature, like `sdrplay`:
 
 ```sh
