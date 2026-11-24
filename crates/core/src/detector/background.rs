@@ -77,6 +77,15 @@ impl SteadyBackground {
     }
 }
 
+impl SteadyBackground {
+    /// Take over what `old` learned (same slots), so a new session
+    /// doesn't start from nothing. The second being summed starts over.
+    pub fn carry_from(&mut self, old: &SteadyBackground) {
+        self.hist.clone_from(&old.hist);
+        self.db.clone_from(&old.db);
+    }
+}
+
 /// Pulsed comb guard (see `DetectorParams::comb_teeth`).
 pub(super) struct PulsedComb {
     teeth: usize,
@@ -141,6 +150,19 @@ impl PulsedComb {
         } else {
             self.run[i] = 0;
         }
+    }
+
+    /// Take over the comb lines `old` knows (same slots), so a new session
+    /// doesn't have to see the comb rise again. Block numbers start over
+    /// with a new session, so each line's hold starts again from block 0
+    /// (it runs a little longer than it would have). Recent rises are
+    /// dropped.
+    pub fn carry_from(&mut self, old: &PulsedComb) {
+        for i in 0..self.level.len() {
+            self.level[i] = old.level[i];
+            self.seen[i] = 0;
+        }
+        self.events = old.events;
     }
 
     /// Expire old lines and rises, then look for a comb among the slots
