@@ -911,6 +911,7 @@ mod tests {
             name: None,
             origin: SlotOrigin::Grid,
             pair: None,
+            sites: Vec::new(),
         }
     }
 

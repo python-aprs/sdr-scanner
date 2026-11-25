@@ -343,6 +343,13 @@ impl Recorder {
                     if let Some(t) = &end.tone {
                         self.index.set_tone(o.row, &t.label())?;
                     }
+                    let slot = &o.start.slot;
+                    if !slot.sites.is_empty() {
+                        let name = slot.name_for(end.tone.as_ref());
+                        if name != slot.name {
+                            self.index.set_channel(o.row, name.as_deref())?;
+                        }
+                    }
                     if let Some(d) = &o.dtmf
                         && !d.digits().is_empty()
                     {
@@ -421,6 +428,68 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
+    fn shared_output_is_renamed_by_its_tone() {
+        use scanner_core::config::SlotSite;
+        use scanner_core::tone::Tone;
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Recorder::new(dir.path()).unwrap();
+        let slot = Slot {
+            freq: 147.18e6,
+            bandwidth: 16e3,
+            deviation: 5e3,
+            mode: Mode::Nbfm,
+            priority: false,
+            record: true,
+            name: Some("NM7R / W7LT".into()),
+            origin: SlotOrigin::RepeaterOutput,
+            pair: None,
+            sites: vec![
+                SlotSite {
+                    name: "NM7R".into(),
+                    tone: Some(Tone::Ctcss(82.5)),
+                },
+                SlotSite {
+                    name: "W7LT".into(),
+                    tone: Some(Tone::Ctcss(103.5)),
+                },
+            ],
+        };
+        for (id, tone) in [
+            (1, Some(Tone::Ctcss(103.5))),
+            (2, None),
+            (3, Some(Tone::Ctcss(82.5))),
+        ] {
+            r.handle(Output::Open(TxStart {
+                id,
+                slot: slot.clone(),
+                start_sample: 0,
+                start_time: UNIX_EPOCH + Duration::from_secs(1_795_330_443 + id),
+                audio_rate: 8000,
+            }))
+            .unwrap();
+            r.handle(Output::Audio {
+                id,
+                samples: vec![0.1; 800],
+            })
+            .unwrap();
+            r.handle(Output::Close(TxEnd {
+                id,
+                end_sample: 0,
+                signal_secs: 0.1,
+                peak_snr_db: 30.0,
+                mean_snr_db: 25.0,
+                tone,
+                digital: None,
+            }))
+            .unwrap();
+        }
+        let mut rows = r.index().recent(5).unwrap();
+        rows.sort_by_key(|r| r.start_ns);
+        let names: Vec<_> = rows.iter().map(|r| r.channel.as_deref()).collect();
+        assert_eq!(names, [Some("W7LT"), Some("NM7R / W7LT"), Some("NM7R")]);
+    }
+
+    #[test]
     fn writes_file_and_row() {
         let dir = tempfile::tempdir().unwrap();
         let mut r = Recorder::new(dir.path()).unwrap();
@@ -436,6 +505,7 @@ mod tests {
                 name: Some("Calling".into()),
                 origin: SlotOrigin::Listed,
                 pair: None,
+                sites: Vec::new(),
             },
             start_sample: 0,
             start_time: UNIX_EPOCH + Duration::from_millis(1_795_330_443_123),
@@ -515,6 +585,7 @@ mod tests {
                 name: Some("DMR simplex".into()),
                 origin: SlotOrigin::Listed,
                 pair: None,
+                sites: Vec::new(),
             },
             start_sample: 0,
             start_time: UNIX_EPOCH + Duration::from_millis(1_795_330_443_123),
@@ -593,6 +664,7 @@ mod tests {
             name: None,
             origin: SlotOrigin::Listed,
             pair: None,
+            sites: Vec::new(),
         };
         for (id, audio) in [
             (

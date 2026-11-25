@@ -66,6 +66,19 @@ pub struct ChannelInfo {
     /// Locked out automatically as a steady carrier, until an admin
     /// reviews it (an edit or Reset clears this).
     pub spur: bool,
+    /// For an output several repeaters share (and its input): each one
+    /// with its tone. Recordings are named after the one whose tone they
+    /// carried. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<ChannelSite>,
+}
+
+/// One of the repeaters sharing a channel.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ChannelSite {
+    pub name: String,
+    /// `103.5` (CTCSS) or `D023N` (DCS), as recordings' `tone` is written.
+    pub tone: Option<String>,
 }
 
 /// `updated_by` on a lockout the spur detector made.

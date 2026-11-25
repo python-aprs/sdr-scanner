@@ -55,6 +55,18 @@ checked against the Golay code and the 104 standard codes. A DCS code and
 its inverted partner are the same waveform (023 N is 047 I); the
 normal-polarity name wins.
 
+The tone also picks the repeater on an output several repeaters share. A
+`[[repeaters]]` entry can list `sites = [{ call, location, tone | dcs }, ...]`;
+the slot (output and input) keeps the entry's combined `name`, and a
+recording on it whose tone matches one site's (CTCSS within 1 Hz, DCS by
+code in either polarity) has its `channel` set to that site's name, or to
+the matching sites joined with ` / ` when linked sites share a tone. No
+tone, or one no site lists, leaves the combined name: the recording could
+be any of them. The channel list (`/api/v1/channels`) carries `sites` and
+the Channels page shows each with its tone. `scanner config retag <config>
+<recordings folder>` (`-n` to preview) re-applies the rule to recordings
+already in the index, after a tone is added or corrected.
+
 DTMF digits heard in a recording are stored too (`dtmf` in the index and
 API, groups split by a space: `*73 1234#`), from `dtmf::DtmfDecoder`. The
 recorder thread runs it on the audio it writes, so the DSP threads never

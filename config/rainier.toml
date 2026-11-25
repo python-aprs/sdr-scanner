@@ -151,7 +151,7 @@ modes    = ["FM"]
 
 # 76 km
 # shared output: W7BU Meglar Mtn, WA; KB7CNN Alder, WA; WB7DZG North Plains, OR
-# tones differ [110.9, 118.8]
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-2m.repeaters]]
 name     = "W7BU / KB7CNN / WB7DZG Meglar Mtn, WA / Alder, WA / North Plains, OR"
 call     = "W7BU / KB7CNN / WB7DZG"
@@ -159,11 +159,15 @@ location = "Meglar Mtn, WA / Alder, WA / North Plains, OR"
 source   = "WWARA+ORRC"
 output   = "145.4500 MHz"
 offset   = "-600 kHz"
+sites    = [
+    { call = "W7BU", location = "Meglar Mtn, WA", tone = 118.8 },
+    { call = "KB7CNN", location = "Alder, WA", tone = 110.9 },
+    { call = "WB7DZG", location = "North Plains, OR" },
+]
 modes    = ["FM"]
 
 # 100 km
 # shared output: K7CPR Olympia, WA; KR7IS Newberg, OR
-# tones differ [100.0, 107.2]
 [[profiles.rainier-2m.repeaters]]
 name     = "K7CPR / KR7IS Olympia, WA / Newberg, OR"
 call     = "K7CPR / KR7IS"
@@ -171,6 +175,10 @@ location = "Olympia, WA / Newberg, OR"
 source   = "WWARA+ORRC"
 output   = "145.4700 MHz"
 offset   = "-600 kHz"
+sites    = [
+    { call = "K7CPR", location = "Olympia, WA", tone = 100 },
+    { call = "KR7IS", location = "Newberg, OR", tone = 107.2 },
+]
 modes    = ["FM"]
 
 # 70 km
@@ -230,7 +238,6 @@ modes    = ["FM"]
 
 # 98 km
 # shared output: W7EAT Eatonville, WA; KE7AWR Portland, OR
-# tones differ [100.0, 103.5]
 [[profiles.rainier-2m.repeaters]]
 name     = "W7EAT / KE7AWR Eatonville, WA / Portland, OR"
 call     = "W7EAT / KE7AWR"
@@ -238,11 +245,14 @@ location = "Eatonville, WA / Portland, OR"
 source   = "WWARA+ORRC"
 output   = "146.7000 MHz"
 offset   = "-600 kHz"
+sites    = [
+    { call = "W7EAT", location = "Eatonville, WA", tone = 103.5 },
+    { call = "KE7AWR", location = "Portland, OR", tone = 100 },
+]
 modes    = ["FM"]
 
 # 54 km
 # shared output: K7KFM Chehalis, WA; K7KFL Packwood, WA
-# tones differ [110.9, 131.8]
 [[profiles.rainier-2m.repeaters]]
 name     = "K7KFM / K7KFL Chehalis, WA / Packwood, WA"
 call     = "K7KFM / K7KFL"
@@ -250,10 +260,15 @@ location = "Chehalis, WA / Packwood, WA"
 source   = "WWARA"
 output   = "146.7400 MHz"
 offset   = "-600 kHz"
+sites    = [
+    { call = "K7KFM", location = "Chehalis, WA", tone = 110.9 },
+    { call = "K7KFL", location = "Packwood, WA", tone = 131.8 },
+]
 modes    = ["FM"]
 
 # 85 km
-# shared output: KC7CKO Crawford Mtn, WA; KJ7IY Sandy, OR; KJ7IY Welches, OR; KJ7IY Portland, OR; KJ7IY Westlinn, OR
+# shared output: KC7CKO Crawford Mtn, WA; KJ7IY Sandy, OR / Welches, OR / Portland, OR / Westlinn, OR
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-2m.repeaters]]
 name     = "KC7CKO / KJ7IY Crawford Mtn, WA / Sandy, OR / Welches, OR / Portland, OR / Westlinn, OR"
 call     = "KC7CKO / KJ7IY"
@@ -261,7 +276,10 @@ location = "Crawford Mtn, WA / Sandy, OR / Welches, OR / Portland, OR / Westlinn
 source   = "WWARA+ORRC"
 output   = "146.8000 MHz"
 offset   = "-600 kHz"
-tone     = 110.9
+sites    = [
+    { call = "KC7CKO", location = "Crawford Mtn, WA", tone = 110.9 },
+    { call = "KJ7IY", location = "Sandy, OR / Welches, OR / Portland, OR / Westlinn, OR" },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-2m.repeaters]]
@@ -296,7 +314,6 @@ modes    = ["FM"]
 
 # 54 km
 # shared output: WA7LM Mossyrock, WA; AH6LE Newberg, OR
-# tones differ [100.0, 123.0]
 [[profiles.rainier-2m.repeaters]]
 name     = "WA7LM / AH6LE Mossyrock, WA / Newberg, OR"
 call     = "WA7LM / AH6LE"
@@ -304,6 +321,10 @@ location = "Mossyrock, WA / Newberg, OR"
 source   = "WWARA+ORRC"
 output   = "146.9200 MHz"
 offset   = "-600 kHz"
+sites    = [
+    { call = "WA7LM", location = "Mossyrock, WA", tone = 123 },
+    { call = "AH6LE", location = "Newberg, OR", tone = 100 },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-2m.repeaters]]
@@ -322,6 +343,7 @@ location = "Portland, OR"
 source   = "ORRC"
 output   = "146.9800 MHz"
 offset   = "-600 kHz"
+dcs      = "023"
 modes    = ["FM"]
 
 # 90 km
@@ -398,6 +420,7 @@ offset   = "600 kHz"
 modes    = ["FM"]
 
 # 77 km
+# W7LT tone 103.5 from --tone
 # shared output: NM7R Meglar Mtn, WA; W7LT Portland, OR
 [[profiles.rainier-2m.repeaters]]
 name     = "NM7R / W7LT Meglar Mtn, WA / Portland, OR"
@@ -406,11 +429,15 @@ location = "Meglar Mtn, WA / Portland, OR"
 source   = "WWARA+ORRC"
 output   = "147.1800 MHz"
 offset   = "600 kHz"
-tone     = 82.5
+sites    = [
+    { call = "NM7R", location = "Meglar Mtn, WA", tone = 82.5 },
+    { call = "W7LT", location = "Portland, OR", tone = 103.5 },
+]
 modes    = ["FM"]
 
 # 93 km
 # shared output: KA7DNK Raymond, WA; W7AIA Vancouver, WA
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-2m.repeaters]]
 name     = "KA7DNK / W7AIA Raymond, WA / Vancouver, WA"
 call     = "KA7DNK / W7AIA"
@@ -418,7 +445,10 @@ location = "Raymond, WA / Vancouver, WA"
 source   = "WWARA+ORRC"
 output   = "147.2400 MHz"
 offset   = "600 kHz"
-tone     = 103.5
+sites    = [
+    { call = "KA7DNK", location = "Raymond, WA", tone = 103.5 },
+    { call = "W7AIA", location = "Vancouver, WA" },
+]
 modes    = ["FM"]
 
 # 10 km
@@ -478,7 +508,6 @@ modes    = ["FM"]
 
 # 85 km
 # shared output: W7DK Crawford Mtn, WA; K7RPT Midway, OR
-# tones differ [100.0, 103.5]
 [[profiles.rainier-2m.repeaters]]
 name     = "W7DK / K7RPT Crawford Mtn, WA / Midway, OR"
 call     = "W7DK / K7RPT"
@@ -486,6 +515,10 @@ location = "Crawford Mtn, WA / Midway, OR"
 source   = "WWARA+ORRC"
 output   = "147.3800 MHz"
 offset   = "600 kHz"
+sites    = [
+    { call = "W7DK", location = "Crawford Mtn, WA", tone = 103.5 },
+    { call = "K7RPT", location = "Midway, OR", tone = 100 },
+]
 modes    = ["FM"]
 
 # ---------------------------------------------------------------- 70 cm repeaters
@@ -560,6 +593,7 @@ location = "PORTLAND, OR"
 source   = "ORRC"
 output   = "440.5000 MHz"
 offset   = "5000 kHz"
+dcs      = "125"
 modes    = ["FM"]
 
 [[profiles.rainier-70cm.repeaters]]
@@ -573,7 +607,6 @@ modes    = ["FM"]
 
 # 76 km
 # shared output: NM7R Naselle Ridge, WA; WB2QHS Portland, OR
-# tones differ [118.8, 136.5]
 [[profiles.rainier-70cm.repeaters]]
 name     = "NM7R / WB2QHS Naselle Ridge, WA / Portland, OR"
 call     = "NM7R / WB2QHS"
@@ -581,6 +614,10 @@ location = "Naselle Ridge, WA / Portland, OR"
 source   = "WWARA+ORRC"
 output   = "440.6750 MHz"
 offset   = "5000 kHz"
+sites    = [
+    { call = "NM7R", location = "Naselle Ridge, WA", tone = 118.8 },
+    { call = "WB2QHS", location = "Portland, OR", tone = 136.5 },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-70cm.repeaters]]
@@ -606,6 +643,7 @@ mode     = "dmr"
 bandwidth = "11 kHz"
 
 # shared output: K7AWR Vancouver, OR; NA7A Tualatin, OR
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-70cm.repeaters]]
 name     = "K7AWR / NA7A Vancouver, OR / Tualatin, OR"
 call     = "K7AWR / NA7A"
@@ -613,6 +651,10 @@ location = "Vancouver, OR / Tualatin, OR"
 source   = "ORRC"
 output   = "440.7500 MHz"
 offset   = "5000 kHz"
+sites    = [
+    { call = "K7AWR", location = "Vancouver, OR" },
+    { call = "NA7A", location = "Tualatin, OR" },
+]
 modes    = ["FM"]
 
 # 76 km
@@ -677,11 +719,11 @@ location = "Portland, OR"
 source   = "ORRC"
 output   = "441.3500 MHz"
 offset   = "5000 kHz"
+dcs      = "023"
 modes    = ["FM"]
 
 # 85 km
 # shared output: NT7H Olympia, WA; WB6EGS Colton, OR
-# tones differ [88.5, 103.5]
 [[profiles.rainier-70cm.repeaters]]
 name     = "NT7H / WB6EGS Olympia, WA / Colton, OR"
 call     = "NT7H / WB6EGS"
@@ -689,6 +731,10 @@ location = "Olympia, WA / Colton, OR"
 source   = "WWARA+ORRC"
 output   = "441.4000 MHz"
 offset   = "5000 kHz"
+sites    = [
+    { call = "NT7H", location = "Olympia, WA", tone = 103.5 },
+    { call = "WB6EGS", location = "Colton, OR", tone = 88.5 },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-70cm.repeaters]]
@@ -921,6 +967,7 @@ modes    = ["FM"]
 
 # 93 km
 # shared output: NM7R South Bend, WA; AH6LE Sherwood, OR
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-70cm.repeaters]]
 name     = "NM7R / AH6LE South Bend, WA / Sherwood, OR"
 call     = "NM7R / AH6LE"
@@ -928,7 +975,10 @@ location = "South Bend, WA / Sherwood, OR"
 source   = "WWARA+ORRC"
 output   = "442.6750 MHz"
 offset   = "5000 kHz"
-tone     = 118.8
+sites    = [
+    { call = "NM7R", location = "South Bend, WA", tone = 118.8 },
+    { call = "AH6LE", location = "Sherwood, OR" },
+]
 modes    = ["FM"]
 
 # 98 km
@@ -982,7 +1032,6 @@ offset   = "5000 kHz"
 tone     = 107.2
 modes    = ["FM"]
 
-# shared output: WA7BND West Linn, OR; WA7BND Portland, OR
 [[profiles.rainier-70cm.repeaters]]
 name     = "WA7BND West Linn, OR / Portland, OR"
 call     = "WA7BND"
@@ -1181,6 +1230,7 @@ modes    = ["FM"]
 
 # 93 km
 # shared output: KA7DNK Raymond, WA; W7AIA Vancouver, OR
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-70cm.repeaters]]
 name     = "KA7DNK / W7AIA Raymond, WA / Vancouver, OR"
 call     = "KA7DNK / W7AIA"
@@ -1188,7 +1238,10 @@ location = "Raymond, WA / Vancouver, OR"
 source   = "WWARA+ORRC"
 output   = "443.8250 MHz"
 offset   = "5000 kHz"
-tone     = 103.5
+sites    = [
+    { call = "KA7DNK", location = "Raymond, WA", tone = 103.5 },
+    { call = "W7AIA", location = "Vancouver, OR" },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-70cm.repeaters]]
@@ -1318,6 +1371,7 @@ modes    = ["FM"]
 
 # 49 km
 # shared output: KD7HTE Baw Faw Peak, WA; K7CFD Canby, OR
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-70cm.repeaters]]
 name     = "KD7HTE / K7CFD Baw Faw Peak, WA / Canby, OR"
 call     = "KD7HTE / K7CFD"
@@ -1325,7 +1379,10 @@ location = "Baw Faw Peak, WA / Canby, OR"
 source   = "WWARA+ORRC"
 output   = "444.4500 MHz"
 offset   = "5000 kHz"
-tone     = 100
+sites    = [
+    { call = "KD7HTE", location = "Baw Faw Peak, WA", tone = 100 },
+    { call = "K7CFD", location = "Canby, OR" },
+]
 modes    = ["FM"]
 
 # 23 km
@@ -1340,7 +1397,6 @@ tone     = 100
 modes    = ["FM"]
 
 # shared output: KE7AWR Camas, OR; KJ7ECQ Tualatin, OR
-# tones differ [103.5, 136.5]
 [[profiles.rainier-70cm.repeaters]]
 name     = "KE7AWR / KJ7ECQ Camas, OR / Tualatin, OR"
 call     = "KE7AWR / KJ7ECQ"
@@ -1348,6 +1404,10 @@ location = "Camas, OR / Tualatin, OR"
 source   = "ORRC"
 output   = "444.5250 MHz"
 offset   = "5000 kHz"
+sites    = [
+    { call = "KE7AWR", location = "Camas, OR", tone = 103.5 },
+    { call = "KJ7ECQ", location = "Tualatin, OR", tone = 136.5 },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-70cm.repeaters]]
@@ -1429,6 +1489,7 @@ modes    = ["FM"]
 
 # 91 km
 # shared output: NM7R Longbeach, WA; N7PRM Portland, OR
+# a site has no tone listed: add it with --tone so recordings can be told apart
 [[profiles.rainier-70cm.repeaters]]
 name     = "NM7R / N7PRM Longbeach, WA / Portland, OR"
 call     = "NM7R / N7PRM"
@@ -1436,7 +1497,10 @@ location = "Longbeach, WA / Portland, OR"
 source   = "WWARA+ORRC"
 output   = "444.8000 MHz"
 offset   = "5000 kHz"
-tone     = 118.8
+sites    = [
+    { call = "NM7R", location = "Longbeach, WA", tone = 118.8 },
+    { call = "N7PRM", location = "Portland, OR" },
+]
 modes    = ["FM"]
 
 [[profiles.rainier-70cm.repeaters]]

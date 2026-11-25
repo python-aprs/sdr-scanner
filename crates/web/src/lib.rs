@@ -2243,12 +2243,14 @@ mod tests {
             pair_hz: None,
             overridden: false,
             spur: false,
+            sites: Vec::new(),
         });
         let (status, body) = get(&state, "/api/v1/channels", None, None).await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v[0]["name"], "Calling");
         assert_eq!(v[0]["kind"], "channel");
+        assert!(v[0].get("sites").is_none(), "empty sites are left out");
         assert_eq!(v[0]["priority"], true);
         let (_, body) = get(&state, "/api/v1/auth/session", None, None).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2292,6 +2294,7 @@ mod tests {
             pair_hz: None,
             overridden: false,
             spur: false,
+            sites: Vec::new(),
         });
         {
             let mut g = state.status.write().unwrap();

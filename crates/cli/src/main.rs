@@ -4,6 +4,8 @@
 //! - `scanner info <recording>`: SigMF metadata and signal level
 //! - `scanner peaks <recording>`: averaged spectrum peaks, in RF frequency
 //! - `scanner config check <file> [--profile NAME]`: validate band profiles
+//! - `scanner config retag <file> <recordings>`: name recordings on shared
+//!   repeater outputs after the repeater their tone picks out
 //!
 //! Phase 1:
 //! - `scanner run <recording> --config FILE`: scan a recording and write one
@@ -403,6 +405,20 @@ enum ConfigCmd {
         #[arg(long)]
         slots: bool,
     },
+    /// Rename recordings on outputs several repeaters share (`sites`) after
+    /// the repeater whose tone each one carried: for recordings made before
+    /// tone matching, or after a site's tone was added or changed.
+    Retag {
+        file: PathBuf,
+        /// Recordings folder (the one with `index.sqlite`).
+        recordings: PathBuf,
+        /// Only use this profile's repeaters (default: all).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Print what would change without changing it.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -481,6 +497,15 @@ fn main() -> Result<()> {
                     slots,
                 },
         } => config_check(file, profile, slots),
+        Cmd::Config {
+            cmd:
+                ConfigCmd::Retag {
+                    file,
+                    recordings,
+                    profile,
+                    dry_run,
+                },
+        } => config_retag(&file, &recordings, profile, dry_run),
     }
 }
 
@@ -888,12 +913,79 @@ fn config_check(file: PathBuf, only: Option<String>, list_slots: bool) -> Result
                     if s.record { "" } else { " no-record" },
                     s.label()
                 );
+                for site in &s.sites {
+                    let tone = site.tone.map_or("no tone".into(), |t| t.label());
+                    println!("{:>16}  {tone:>9}  {}", "", site.name);
+                }
             }
         }
     }
     if warned {
         eprintln!("config has warnings");
     }
+    Ok(())
+}
+
+fn config_retag(file: &Path, dir: &Path, only: Option<String>, dry_run: bool) -> Result<()> {
+    use scanner_core::config::same_freq;
+    use scanner_core::tone::Tone;
+    let cfg = ConfigFile::load(file)?;
+    let names: Vec<String> = match only {
+        Some(n) => vec![n],
+        None => cfg.profiles.keys().cloned().collect(),
+    };
+    let mut shared = Vec::new();
+    for name in names {
+        let plan = cfg.profile(&name)?.channel_plan();
+        shared.extend(plan.slots.into_iter().filter(|s| !s.sites.is_empty()));
+    }
+    if shared.is_empty() {
+        eprintln!(
+            "{}: no repeater lists `sites`; nothing to do",
+            file.display()
+        );
+        return Ok(());
+    }
+    let index = scanner_store::Index::open(&dir.join("index.sqlite"))
+        .with_context(|| format!("{} is not a recordings folder", dir.display()))?;
+    let (mut seen, mut renamed, mut after) = (0u64, 0u64, 0i64);
+    loop {
+        let rows = index.complete_after(after, 500)?;
+        let Some(last) = rows.last() else { break };
+        after = last.id;
+        for r in rows {
+            let Some(slot) = shared
+                .iter()
+                .find(|s| s.origin.as_str() == r.origin && same_freq(s.freq, r.freq_hz))
+            else {
+                continue;
+            };
+            seen += 1;
+            let tone = r.tone.as_deref().and_then(Tone::parse);
+            let name = slot.name_for(tone.as_ref());
+            if name != r.channel {
+                renamed += 1;
+                println!(
+                    "{}\t{}\t{}",
+                    r.wav_path,
+                    r.tone.as_deref().unwrap_or("-"),
+                    name.as_deref().unwrap_or("-")
+                );
+                if !dry_run {
+                    index.set_channel(r.id, name.as_deref())?;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{}: {seen} recordings on shared outputs, {renamed} {}",
+        dir.display(),
+        if dry_run {
+            "would be renamed"
+        } else {
+            "renamed"
+        }
+    );
     Ok(())
 }
 

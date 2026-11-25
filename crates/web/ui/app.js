@@ -1316,7 +1316,7 @@
     root.append(h('div', { class: 'page-title' }, h('h1', {}, 'Channels'), h('span', { class: 'muted', id: 'ch-count' })));
     const filters = [['named', 'Named'], ['repeaters', 'Repeaters'], ['all', 'All'], ['grid', 'Grid'], ['priority', 'Priority'], ['locked', 'Locked out']];
     let filter = 'named';
-    const search = h('input', { type: 'search', placeholder: 'Search name or MHz', 'aria-label': 'Search channels' });
+    const search = h('input', { type: 'search', placeholder: 'Search name, tone or MHz', 'aria-label': 'Search channels' });
     const chips = h('div', { class: 'chips' }, filters.map(([k, t]) =>
       h('button', { type: 'button', class: 'chip', 'aria-pressed': String(k === filter), onclick: () => { filter = k; chips.querySelectorAll('.chip').forEach((c, i) => c.setAttribute('aria-pressed', String(filters[i][0] === k))); render(); } }, t)));
     const tbody = h('tbody');
@@ -1338,7 +1338,8 @@
         default: break;
       }
       const q = search.value.trim().toLowerCase();
-      return !q || (c.name || '').toLowerCase().includes(q) || MHZ(c.freq_hz, 4).includes(q);
+      const sites = (c.sites || []).map((st) => `${st.name} ${st.tone || ''}`).join(' ');
+      return !q || `${c.name || ''} ${sites}`.toLowerCase().includes(q) || MHZ(c.freq_hz, 4).includes(q);
     }
 
     function render() {
@@ -1354,7 +1355,10 @@
         onclick: canRecordings() ? () => { location.hash = `#/recordings?freq=${MHZ(c.freq_hz, 4)}`; } : null,
       },
       h('td', { class: 'mono' }, MHZ(c.freq_hz, 4)),
-      h('td', { class: 'grow' }, c.name || h('span', { class: 'muted' }, '–')),
+      h('td', { class: 'grow' }, c.name || h('span', { class: 'muted' }, '–'),
+        // Repeaters sharing this frequency, told apart by tone.
+        c.sites ? h('ul', { class: 'sites' }, c.sites.map((st) =>
+          h('li', {}, h('span', { class: 'mono' }, st.tone || 'no tone'), ' ', st.name))) : null),
       h('td', {}, kindLabel[c.kind] || c.kind),
       h('td', {}, c.mode.toUpperCase()),
       h('td', { class: 'mono' }, `${(c.bandwidth_hz / 1e3).toFixed(c.bandwidth_hz % 1e3 ? 1 : 0)} kHz`),

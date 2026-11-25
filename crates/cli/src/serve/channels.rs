@@ -8,6 +8,7 @@ use scanner_core::detector::WatchedSlot;
 use scanner_core::scanner::{Output, Scanner};
 use scanner_core::units::Hz;
 use scanner_store::settings::{Override, Settings};
+use scanner_web::live::ChannelSite;
 use scanner_web::live::SPUR_DETECTOR;
 use scanner_web::{ChannelInfo, ChannelsHandle};
 use std::path::Path;
@@ -149,6 +150,14 @@ fn channel_list(slots: &[WatchedSlot], overrides: &[Override]) -> Vec<ChannelInf
                 spur: overrides
                     .iter()
                     .any(|o| same_freq(o.freq_hz as f64, s.freq) && o.updated_by == SPUR_DETECTOR),
+                sites: s
+                    .sites
+                    .iter()
+                    .map(|site| ChannelSite {
+                        name: site.name.clone(),
+                        tone: site.tone.map(|t| t.label()),
+                    })
+                    .collect(),
             }
         })
         .chain(
@@ -166,6 +175,7 @@ fn channel_list(slots: &[WatchedSlot], overrides: &[Override]) -> Vec<ChannelInf
                     pair_hz: None,
                     overridden: true,
                     spur: o.updated_by == SPUR_DETECTOR,
+                    sites: Vec::new(),
                 }),
         )
         .collect()
