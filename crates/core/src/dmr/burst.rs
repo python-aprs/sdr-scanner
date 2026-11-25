@@ -222,8 +222,22 @@ pub fn cach(ts: u8) -> [u8; 24] {
     c
 }
 
-/// Positions within a 72-bit AMBE+2 frame of its Golay (24,12) word C0,
-/// whitened Golay (23,12) word C1, and unprotected bits C2+C3.
+/// Where a 72-bit AMBE frame's bits sit: positions of its Golay (24,12)
+/// word C0, whitened Golay (23,12) word C1, and unprotected bits C2+C3,
+/// each most significant first.
+pub struct Ambe72Layout {
+    pub c0: [usize; 24],
+    pub c1: [usize; 23],
+    pub c23: [usize; 25],
+}
+
+/// DMR's (and System Fusion V/D mode 1's) layout.
+pub const DMR_LAYOUT: Ambe72Layout = Ambe72Layout {
+    c0: AMBE_A,
+    c1: AMBE_B,
+    c23: AMBE_C,
+};
+
 const AMBE_A: [usize; 24] = [
     0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 1, 5, 9, 13, 17, 21,
 ];
@@ -285,42 +299,59 @@ fn ambe_prng(seed: u32) -> u32 {
     mask
 }
 
+/// One 72-bit AMBE+2 frame (C0, whitened C1, C2+C3, interleaved as in a
+/// DMR voice burst), bit `j` at `at(j)`. System Fusion's V/D mode 1 uses
+/// the same frame.
+pub fn ambe72_decode(at: impl Fn(usize) -> u8) -> AmbeFrame {
+    ambe72_decode_with(&DMR_LAYOUT, at)
+}
+
+/// [`ambe72_decode`] for a frame laid out as `l` says (D-STAR's AMBE has
+/// the same codes in another order).
+pub fn ambe72_decode_with(l: &Ambe72Layout, at: impl Fn(usize) -> u8) -> AmbeFrame {
+    let read = |table: &[usize]| table.iter().fold(0u32, |a, &j| (a << 1) | at(j) as u32);
+    let (c0, c1, c23) = (read(&l.c0), read(&l.c1), read(&l.c23));
+    let (d0, e0, bad) = fec::golay24_decode(c0);
+    let (d1, e1) = fec::golay23_decode(c1 ^ ambe_prng(d0));
+    let mut bits = [0u8; 49];
+    fec::from_u32(d0, 12, &mut bits[0..]);
+    fec::from_u32(d1, 12, &mut bits[12..]);
+    fec::from_u32(c23, 25, &mut bits[24..]);
+    let errs = if bad { 10 } else { (e0 + e1) as u8 };
+    AmbeFrame { bits, errs }
+}
+
+/// Encodes 49 parameter bits as a 72-bit AMBE+2 frame, calling
+/// `set(j, bit)` for each of its bits.
+pub fn ambe72_encode(f: &[u8; 49], set: impl FnMut(usize, u8)) {
+    ambe72_encode_with(&DMR_LAYOUT, f, set)
+}
+
+pub fn ambe72_encode_with(l: &Ambe72Layout, f: &[u8; 49], mut set: impl FnMut(usize, u8)) {
+    let d0 = fec::to_u32(&f[0..12]);
+    let c0 = fec::golay24_encode(d0);
+    let c1 = fec::golay23_encode(fec::to_u32(&f[12..24])) ^ ambe_prng(d0);
+    let c23 = fec::to_u32(&f[24..49]);
+    for (table, v, n) in [
+        (&l.c0[..], c0, 24),
+        (&l.c1[..], c1, 23),
+        (&l.c23[..], c23, 25),
+    ] {
+        for (i, &j) in table.iter().enumerate() {
+            set(j, ((v >> (n - 1 - i)) & 1) as u8);
+        }
+    }
+}
+
 /// The three voice frames of a voice burst.
 pub fn ambe_frames(b: &[u8]) -> [AmbeFrame; 3] {
-    std::array::from_fn(|k| {
-        let read = |table: &[usize]| {
-            table
-                .iter()
-                .fold(0u32, |a, &j| (a << 1) | b[ambe_pos(k, j)] as u32)
-        };
-        let (c0, c1, c23) = (read(&AMBE_A), read(&AMBE_B), read(&AMBE_C));
-        let (d0, e0, bad) = fec::golay24_decode(c0);
-        let (d1, e1) = fec::golay23_decode(c1 ^ ambe_prng(d0));
-        let mut bits = [0u8; 49];
-        fec::from_u32(d0, 12, &mut bits[0..]);
-        fec::from_u32(d1, 12, &mut bits[12..]);
-        fec::from_u32(c23, 25, &mut bits[24..]);
-        let errs = if bad { 10 } else { (e0 + e1) as u8 };
-        AmbeFrame { bits, errs }
-    })
+    std::array::from_fn(|k| ambe72_decode(|j| b[ambe_pos(k, j)]))
 }
 
 /// Writes three voice frames into a burst (for the synthesiser).
 pub fn set_ambe_frames(b: &mut [u8], frames: &[[u8; 49]; 3]) {
     for (k, f) in frames.iter().enumerate() {
-        let d0 = fec::to_u32(&f[0..12]);
-        let c0 = fec::golay24_encode(d0);
-        let c1 = fec::golay23_encode(fec::to_u32(&f[12..24])) ^ ambe_prng(d0);
-        let c23 = fec::to_u32(&f[24..49]);
-        for (table, v, n) in [
-            (&AMBE_A[..], c0, 24),
-            (&AMBE_B[..], c1, 23),
-            (&AMBE_C[..], c23, 25),
-        ] {
-            for (i, &j) in table.iter().enumerate() {
-                b[ambe_pos(k, j)] = ((v >> (n - 1 - i)) & 1) as u8;
-            }
-        }
+        ambe72_encode(f, |j, v| b[ambe_pos(k, j)] = v);
     }
 }
 

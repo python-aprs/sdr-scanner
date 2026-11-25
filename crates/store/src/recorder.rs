@@ -6,6 +6,7 @@ use crate::ogg::OggOpusWriter;
 use crate::retention::{DiskUsage, Policy, Retention};
 use crate::wav::WavWriter;
 use scanner_core::clock::{compact_utc, unix_ns};
+use scanner_core::dmr::vocoder::Codec;
 use scanner_core::dtmf::DtmfDecoder;
 use scanner_core::scanner::{Output, TxStart};
 use std::collections::HashMap;
@@ -68,20 +69,39 @@ struct AmbWriter {
 }
 
 pub const AMB_MAGIC: &[u8; 4] = b".amb";
+/// The same for D-STAR's (older) AMBE codec, which reads the parameter bits
+/// differently.
+pub const DSTAR_AMB_MAGIC: &[u8; 4] = b".dst";
+
+/// The file header for `codec`'s frames.
+pub fn amb_magic(codec: Codec) -> &'static [u8; 4] {
+    match codec {
+        Codec::AmbePlus2 => AMB_MAGIC,
+        Codec::Ambe => DSTAR_AMB_MAGIC,
+    }
+}
+
+/// The codec an `.amb` file's header names.
+pub fn amb_codec(data: &[u8]) -> Option<Codec> {
+    [Codec::AmbePlus2, Codec::Ambe]
+        .into_iter()
+        .find(|&c| data.starts_with(amb_magic(c)))
+}
 
 impl AmbWriter {
-    fn create(root: &Path, rel: String) -> std::io::Result<Self> {
+    fn create(root: &Path, rel: String, codec: Codec) -> std::io::Result<Self> {
         use std::io::Write;
+        let magic = amb_magic(codec);
         let mut part = root.join(&rel).into_os_string();
         part.push(".part");
         let part = PathBuf::from(part);
         let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
-        file.write_all(AMB_MAGIC)?;
+        file.write_all(magic)?;
         Ok(AmbWriter {
             rel,
             part,
             file,
-            bytes: AMB_MAGIC.len() as u64,
+            bytes: magic.len() as u64,
         })
     }
 
@@ -256,10 +276,10 @@ impl Recorder {
                     },
                 );
             }
-            Output::Ambe { id, frames } => {
+            Output::Ambe { id, codec, frames } => {
                 if let Some(o) = self.open.get_mut(&id) {
                     if o.amb.is_none() {
-                        o.amb = Some(AmbWriter::create(&self.root, amb_path(&o.rel))?);
+                        o.amb = Some(AmbWriter::create(&self.root, amb_path(&o.rel), codec)?);
                     }
                     if let Some(w) = &mut o.amb {
                         w.write(&frames)?;
@@ -503,6 +523,7 @@ mod tests {
         .unwrap();
         for n in 0..4 {
             r.handle(Output::Ambe {
+                codec: Default::default(),
                 id: 3,
                 frames: (0..3)
                     .map(|k| AmbeFrame {
@@ -533,7 +554,7 @@ mod tests {
             peak_snr_db: 30.0,
             mean_snr_db: 25.0,
             tone: None,
-            digital: Some(info),
+            digital: Some(scanner_core::demod::CallInfo::Dmr(info)),
         }))
         .unwrap();
         let rows = r.index().recent(5).unwrap();

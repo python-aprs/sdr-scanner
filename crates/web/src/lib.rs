@@ -686,6 +686,8 @@ pub struct ListParams {
     pub dst_id: Option<i64>,
     /// Digital calls from this radio id.
     pub src_id: Option<i64>,
+    /// System Fusion calls from this callsign.
+    pub callsign: Option<String>,
     pub before_id: Option<i64>,
     pub limit: Option<usize>,
 }
@@ -731,6 +733,10 @@ fn list_query(p: ListParams, default_limit: usize) -> Query {
         starred: p.starred,
         dst_id: p.dst_id,
         src_id: p.src_id,
+        callsign: p
+            .callsign
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty()),
         before_id: p.before_id,
         limit: p.limit.unwrap_or(default_limit),
     }

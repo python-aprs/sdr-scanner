@@ -173,13 +173,19 @@ pub fn base_symbols(slots: [&[[u8; 264]]; 2], cc: u8, extra_idle: usize) -> Symb
 
 /// FM-modulate symbols with root raised cosine shaping, at `rate`.
 pub fn modulate(symbols: &Symbols, rate: f64, amp: f32) -> Vec<Complex32> {
+    modulate_4fsk(symbols, rate, amp, burst::OUTER_DEV)
+}
+
+/// [`modulate`] with the outer symbols at `outer_dev` Hz (4FSK at 4800
+/// symbols/s: DMR, System Fusion).
+pub fn modulate_4fsk(symbols: &Symbols, rate: f64, amp: f32, outer_dev: f64) -> Vec<Complex32> {
     let h = rx::rrc(SPS, 8, 0.2);
     let n = symbols.len() * SPS + h.len();
     let mut freq = vec![0f32; n];
     let mut on = vec![false; n];
     for (i, s) in symbols.iter().enumerate() {
         if let Some(v) = s {
-            let a = *v as f32 / 3.0 * burst::OUTER_DEV as f32 * SPS as f32;
+            let a = *v as f32 / 3.0 * outer_dev as f32 * SPS as f32;
             for (k, t) in h.iter().enumerate() {
                 freq[i * SPS + k] += a * t;
             }

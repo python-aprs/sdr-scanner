@@ -79,6 +79,38 @@ pub static SCHEMA: Schema = Schema {
             description: "mode-specific tags in their own tables",
             up: Up::Sql(V8),
         },
+        Migration {
+            description: "System Fusion calls",
+            up: Up::Sql(
+                "CREATE TABLE ysf_calls (
+                    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+                    data_type       TEXT,
+                    src             TEXT,
+                    dst             TEXT,
+                    downlink        TEXT,
+                    uplink          TEXT,
+                    dg_id           INTEGER,
+                    amb_bytes       INTEGER
+                 );
+                 CREATE INDEX ysf_calls_src ON ysf_calls(src);",
+            ),
+        },
+        Migration {
+            description: "D-STAR calls",
+            up: Up::Sql(
+                "CREATE TABLE dstar_calls (
+                    transmission_id INTEGER PRIMARY KEY REFERENCES transmissions(id) ON DELETE CASCADE,
+                    my              TEXT,
+                    suffix          TEXT,
+                    your            TEXT,
+                    rpt1            TEXT,
+                    rpt2            TEXT,
+                    message         TEXT,
+                    amb_bytes       INTEGER
+                 );
+                 CREATE INDEX dstar_calls_my ON dstar_calls(my);",
+            ),
+        },
     ],
 };
 
@@ -164,18 +196,26 @@ CREATE INDEX dmr_calls_src ON dmr_calls(src_id);
 const ROWS: &str = concat!(
     "SELECT t.*, tn.tone, d.digits AS dtmf,
         c.timeslot, c.color_code, c.call_type, c.src_id, c.dst_id, c.alias, c.encrypted,
-        c.amb_bytes ",
+        COALESCE(c.amb_bytes, y.amb_bytes, ds.amb_bytes) AS amb_bytes,
+        y.transmission_id AS ysf_id, y.data_type AS ysf_data_type, y.src AS ysf_src,
+        y.dst AS ysf_dst, y.downlink AS ysf_downlink, y.uplink AS ysf_uplink,
+        y.dg_id AS ysf_dg_id,
+        ds.transmission_id AS dstar_id, ds.my AS dstar_my, ds.suffix AS dstar_suffix,
+        ds.your AS dstar_your, ds.rpt1 AS dstar_rpt1, ds.rpt2 AS dstar_rpt2,
+        ds.message AS dstar_message ",
     tagged!()
 );
 
-/// `transmissions t` with its tag tables `tn` (tones), `d` (DTMF) and `c`
-/// (DMR calls) joined on.
+/// `transmissions t` with its tag tables `tn` (tones), `d` (DTMF), `c`
+/// (DMR calls), `y` (System Fusion calls) and `ds` (D-STAR calls) joined on.
 macro_rules! tagged {
     () => {
         "FROM transmissions t
          LEFT JOIN tones tn ON tn.transmission_id = t.id
          LEFT JOIN dtmf d ON d.transmission_id = t.id
-         LEFT JOIN dmr_calls c ON c.transmission_id = t.id"
+         LEFT JOIN dmr_calls c ON c.transmission_id = t.id
+         LEFT JOIN ysf_calls y ON y.transmission_id = t.id
+         LEFT JOIN dstar_calls ds ON ds.transmission_id = t.id"
     };
 }
 use tagged;
@@ -242,11 +282,80 @@ pub struct Row {
     pub encrypted: Option<bool>,
     /// Size of the raw voice frames kept beside the audio (`.amb`).
     pub amb_bytes: Option<i64>,
+    /// A System Fusion call's details.
+    pub ysf: Option<YsfCall>,
+    /// A D-STAR call's details.
+    pub dstar: Option<DstarCall>,
+}
+
+/// What a D-STAR call said about itself.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct DstarCall {
+    /// The caller and the four characters after (often the radio model).
+    pub my: Option<String>,
+    pub suffix: Option<String>,
+    /// Who the call is for (`CQCQCQ`, a callsign, or a link command).
+    pub your: Option<String>,
+    /// The repeater talked into, and where it routes (gateway or module).
+    pub rpt1: Option<String>,
+    pub rpt2: Option<String>,
+    /// The 20-character message from the slow data.
+    pub message: Option<String>,
+}
+
+/// What a System Fusion call said about itself.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct YsfCall {
+    /// `dn`, `vw`, `vd1` or `data`.
+    pub data_type: Option<String>,
+    /// Calling and called callsigns (the called one is usually `ALL`).
+    pub src: Option<String>,
+    pub dst: Option<String>,
+    /// The repeater heard and the one talked into, as the radio set them.
+    pub downlink: Option<String>,
+    pub uplink: Option<String>,
+    pub dg_id: Option<i64>,
 }
 
 /// What a digital call said about itself, for [`Index::set_digital`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Digital {
+    Dmr(DmrCall),
+    Ysf(YsfCall),
+    Dstar(DstarCall),
+}
+
+impl Digital {
+    pub fn from_call(i: &scanner_core::demod::CallInfo) -> Self {
+        use scanner_core::demod::CallInfo;
+        match i {
+            CallInfo::Dmr(i) => Digital::Dmr(DmrCall::from_call(i)),
+            CallInfo::Ysf(i) => Digital::Ysf(YsfCall {
+                data_type: i.mode().map(Into::into),
+                src: i.src.clone(),
+                dst: i.dst.clone(),
+                downlink: i.downlink.clone(),
+                uplink: i.uplink.clone(),
+                dg_id: i.dg_id.map(Into::into),
+            }),
+            CallInfo::Dstar(i) => {
+                let h = i.header.clone().unwrap_or_default();
+                Digital::Dstar(DstarCall {
+                    my: h.my,
+                    suffix: h.suffix,
+                    your: h.your,
+                    rpt1: h.rpt1,
+                    rpt2: h.rpt2,
+                    message: i.message.clone(),
+                })
+            }
+        }
+    }
+}
+
+/// What a DMR call said about itself.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Digital {
+pub struct DmrCall {
     pub timeslot: Option<u8>,
     pub color_code: Option<u8>,
     pub call_type: Option<&'static str>,
@@ -256,9 +365,9 @@ pub struct Digital {
     pub encrypted: bool,
 }
 
-impl Digital {
+impl DmrCall {
     pub fn from_call(i: &scanner_core::dmr::CallInfo) -> Self {
-        Digital {
+        DmrCall {
             timeslot: i.timeslot,
             color_code: i.color_code,
             call_type: i.call_type(),
@@ -289,6 +398,8 @@ pub struct Query {
     pub dst_id: Option<i64>,
     /// Digital calls from this radio id.
     pub src_id: Option<i64>,
+    /// System Fusion or D-STAR calls from this callsign (any case).
+    pub callsign: Option<String>,
     /// Paging: only rows with a smaller id.
     pub before_id: Option<i64>,
     pub limit: usize,
@@ -306,9 +417,10 @@ const SEARCH_WHERE: &str = "t.status = 'complete'
     AND (?9 IS NULL OR instr(d.digits, ?9) > 0)
     AND (?10 IS NULL OR t.starred = ?10)
     AND (?11 IS NULL OR c.dst_id = ?11)
-    AND (?12 IS NULL OR c.src_id = ?12)";
+    AND (?12 IS NULL OR c.src_id = ?12)
+    AND (?13 IS NULL OR y.src = ?13 COLLATE NOCASE OR ds.my = ?13 COLLATE NOCASE)";
 
-fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 12] {
+fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 13] {
     [
         &q.freq_min,
         &q.freq_max,
@@ -322,6 +434,7 @@ fn search_params<'a>(q: &'a Query, limit: &'a i64) -> [&'a dyn rusqlite::ToSql; 
         &q.starred,
         &q.dst_id,
         &q.src_id,
+        &q.callsign,
     ]
 }
 
@@ -536,6 +649,37 @@ impl Index {
     /// Record what a digital call said about itself, and the size of its
     /// raw voice frames file.
     pub fn set_digital(&self, id: i64, d: &Digital, amb_bytes: u64) -> Result<(), IndexError> {
+        let amb = (amb_bytes > 0).then_some(amb_bytes as i64);
+        let d = match d {
+            Digital::Dmr(d) => d,
+            Digital::Dstar(x) => {
+                self.db.execute(
+                    "INSERT OR REPLACE INTO dstar_calls (transmission_id, my, suffix, your,
+                         rpt1, rpt2, message, amb_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![id, x.my, x.suffix, x.your, x.rpt1, x.rpt2, x.message, amb],
+                )?;
+                return Ok(());
+            }
+            Digital::Ysf(y) => {
+                self.db.execute(
+                    "INSERT OR REPLACE INTO ysf_calls (transmission_id, data_type, src, dst,
+                         downlink, uplink, dg_id, amb_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id,
+                        y.data_type,
+                        y.src,
+                        y.dst,
+                        y.downlink,
+                        y.uplink,
+                        y.dg_id,
+                        amb
+                    ],
+                )?;
+                return Ok(());
+            }
+        };
         self.db.execute(
             "INSERT OR REPLACE INTO dmr_calls (transmission_id, timeslot, color_code, call_type,
                  src_id, dst_id, alias, encrypted, amb_bytes)
@@ -648,8 +792,10 @@ impl Index {
     pub fn usage_bytes(&self) -> Result<u64, IndexError> {
         let n: i64 = self.db.query_row(
             "SELECT COALESCE(SUM(COALESCE(t.wav_bytes, 0) + COALESCE(t.opus_bytes, 0)
-                 + COALESCE(c.amb_bytes, 0)), 0)
+                 + COALESCE(c.amb_bytes, y.amb_bytes, ds.amb_bytes, 0)), 0)
              FROM transmissions t LEFT JOIN dmr_calls c ON c.transmission_id = t.id
+                 LEFT JOIN ysf_calls y ON y.transmission_id = t.id
+                 LEFT JOIN dstar_calls ds ON ds.transmission_id = t.id
              WHERE t.status = 'complete'",
             [],
             |r| r.get(0),
@@ -730,6 +876,28 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         alias: r.get("alias")?,
         encrypted: r.get("encrypted")?,
         amb_bytes: r.get("amb_bytes")?,
+        ysf: match r.get::<_, Option<i64>>("ysf_id")? {
+            None => None,
+            Some(_) => Some(YsfCall {
+                data_type: r.get("ysf_data_type")?,
+                src: r.get("ysf_src")?,
+                dst: r.get("ysf_dst")?,
+                downlink: r.get("ysf_downlink")?,
+                uplink: r.get("ysf_uplink")?,
+                dg_id: r.get("ysf_dg_id")?,
+            }),
+        },
+        dstar: match r.get::<_, Option<i64>>("dstar_id")? {
+            None => None,
+            Some(_) => Some(DstarCall {
+                my: r.get("dstar_my")?,
+                suffix: r.get("dstar_suffix")?,
+                your: r.get("dstar_your")?,
+                rpt1: r.get("dstar_rpt1")?,
+                rpt2: r.get("dstar_rpt2")?,
+                message: r.get("dstar_message")?,
+            }),
+        },
     })
 }
 
@@ -1021,20 +1189,20 @@ mod tests {
         ix.set_tone(id, "100.0").unwrap();
         ix.set_tone(id, "D023N").unwrap();
         ix.set_dtmf(id, Some("5")).unwrap();
-        let d = Digital {
+        let d = DmrCall {
             color_code: Some(1),
             call_type: Some("group"),
             src_id: Some(1),
             dst_id: Some(99),
             ..Default::default()
         };
-        ix.set_digital(id, &d, 10).unwrap();
+        ix.set_digital(id, &Digital::Dmr(d.clone()), 10).unwrap();
         ix.set_digital(
             id,
-            &Digital {
+            &Digital::Dmr(DmrCall {
                 dst_id: Some(9),
                 ..d
-            },
+            }),
             20,
         )
         .unwrap();
@@ -1045,13 +1213,77 @@ mod tests {
         assert_eq!(ix.get(id).unwrap().unwrap().dtmf, None);
 
         ix.delete(id).unwrap();
-        for t in ["tones", "dtmf", "dmr_calls"] {
+        for t in ["tones", "dtmf", "dmr_calls", "ysf_calls", "dstar_calls"] {
             let n: i64 = ix
                 .db
                 .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
                 .unwrap();
             assert_eq!(n, 0, "{t} kept a deleted transmission's tag");
         }
+    }
+
+    #[test]
+    fn fusion_and_dstar_calls_have_their_own_tables() {
+        let ix = Index::in_memory().unwrap();
+        let add = |wav: &str| {
+            let id = ix
+                .insert(&NewRow {
+                    freq_hz: 442.175e6,
+                    channel: None,
+                    origin: "listed",
+                    mode: "ysf",
+                    start_ns: 0,
+                    audio_rate: 8000,
+                    wav_path: wav,
+                })
+                .unwrap();
+            ix.complete(id, 1, 1.0, 1.0, 30.0, 20.0, wav, 100).unwrap();
+            id
+        };
+        let (a, b) = (add("a.wav"), add("b.wav"));
+        let call = YsfCall {
+            data_type: Some("dn".into()),
+            src: Some("KF7HVM".into()),
+            dst: Some("ALL".into()),
+            downlink: None,
+            uplink: Some("W7ABC".into()),
+            dg_id: Some(21),
+        };
+        ix.set_digital(a, &Digital::Ysf(call.clone()), 40).unwrap();
+        let r = ix.get(a).unwrap().unwrap();
+        assert_eq!(r.ysf.as_ref(), Some(&call));
+        assert_eq!((r.amb_bytes, r.src_id), (Some(40), None));
+        assert_eq!(ix.get(b).unwrap().unwrap().ysf, None);
+        let found = ix
+            .search(&Query {
+                callsign: Some("kf7hvm".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(ix.usage_bytes().unwrap(), 100 + 100 + 40);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["ysf"]["src"], "KF7HVM");
+        let ds = DstarCall {
+            my: Some("N0CALL".into()),
+            suffix: Some("ID51".into()),
+            your: Some("CQCQCQ".into()),
+            rpt1: Some("WB7DZG B".into()),
+            rpt2: Some("WB7DZG G".into()),
+            message: Some("hello".into()),
+        };
+        ix.set_digital(b, &Digital::Dstar(ds.clone()), 16).unwrap();
+        let rb = ix.get(b).unwrap().unwrap();
+        assert_eq!((rb.dstar.as_ref(), rb.ysf.as_ref()), (Some(&ds), None));
+        let found = ix
+            .search(&Query {
+                callsign: Some("n0call".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), vec![b]);
     }
 
     #[test]

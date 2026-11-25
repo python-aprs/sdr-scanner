@@ -207,7 +207,6 @@ offset   = "-600 kHz"
 modes    = ["DSTAR"]
 mode     = "dstar"
 bandwidth = "11 kHz"
-record   = false  # digital-only until its decoder exists
 
 [[profiles.rainier-2m.repeaters]]
 name     = "W7RXJ McMinnville, OR"
