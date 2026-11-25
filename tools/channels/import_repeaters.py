@@ -38,6 +38,20 @@ DEFAULT_ORRC_AREAS = r"portland|lower columbia|nw oregon|sw washington|north wil
 
 
 @dataclass
+class Site:
+    """One of the repeaters sharing an output frequency."""
+
+    call: str
+    location: str
+    tone: float | None = None
+    dcs: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.call} {self.location}".strip()
+
+
+@dataclass
 class Repeater:
     output_mhz: float
     input_mhz: float
@@ -49,6 +63,8 @@ class Repeater:
     modes: list[str] = field(default_factory=list)  # e.g. ["FM"], ["FM", "DMR"], ["NFM"]
     distance_km: float | None = None
     notes: list[str] = field(default_factory=list)
+    # For an output shared by several repeaters: one per call.
+    sites: list[Site] = field(default_factory=list)
 
     @property
     def offset_khz(self) -> float:
@@ -228,6 +244,7 @@ def select(
     radius_km: float,
     orrc_regions: set[str],
     orrc_areas: str,
+    tones: list[str] | None = None,
 ) -> tuple[list[Repeater], list[str]]:
     lo, hi = band
     log = []
@@ -261,13 +278,16 @@ def select(
             log.append(f"skip {r.output_mhz:.4f} {r.call} {r.location} (ORRC): area {area!r}")
             continue
         chosen.append(r)
+    apply_tones(chosen, tones or [], log)
     return merge(chosen, log), log
 
 
 def merge(reps: list[Repeater], log: list[str]) -> list[Repeater]:
     """One entry per output frequency. Same-frequency entries (a linked
     system with several sites, or the same machine in both lists, or reuse in
-    different areas) are combined into one slot, keeping every call/location."""
+    different areas) are combined into one slot, keeping every call/location.
+    Each distinct call becomes one of the entry's `sites` with its own tone,
+    so the scanner can tell from the tone it hears which repeater it was."""
     by_freq: dict[int, list[Repeater]] = {}
     for r in reps:
         by_freq.setdefault(round(r.output_mhz * 1e4), []).append(r)
@@ -278,39 +298,70 @@ def merge(reps: list[Repeater], log: list[str]) -> list[Repeater]:
         group.sort(key=lambda r: (r.source != "WWARA", r.distance_km if r.distance_km is not None else 1e9))
         first = group[0]
         if len(group) > 1:
-            seen = []
+            # One site per call: the same machine in both lists, or one
+            # call's linked sites, is one site (its locations joined), taking
+            # the tone from whichever record has it.
+            sites: dict[str, Site] = {}
             for r in group:
-                label = f"{r.call} {r.location}".strip()
-                if label not in seen:
-                    seen.append(label)
+                k = r.call or r.location
+                s = sites.get(k)
+                if s is None:
+                    sites[k] = Site(r.call, r.location, r.tone, r.dcs)
+                else:
+                    if r.location and r.location not in s.location.split(" / "):
+                        s.location = f"{s.location} / {r.location}" if s.location else r.location
+                    s.tone = s.tone or r.tone
+                    s.dcs = s.dcs or r.dcs
             offsets = {r.offset_khz for r in group}
-            tones = {r.tone for r in group if r.tone}
             modes = []
             for r in group:
                 for m in r.modes:
                     if m not in modes:
                         modes.append(m)
+            site_list = list(sites.values())
             first = Repeater(
                 output_mhz=first.output_mhz,
                 input_mhz=first.input_mhz,
                 call=" / ".join(dict.fromkeys(r.call for r in group if r.call)),
                 location=" / ".join(dict.fromkeys(r.location for r in group if r.location)),
                 source="+".join(dict.fromkeys(r.source for r in group)),
-                tone=next(iter(tones)) if len(tones) == 1 else None,
-                dcs=first.dcs,
+                tone=site_list[0].tone if len(site_list) == 1 else None,
+                dcs=site_list[0].dcs if len(site_list) == 1 else None,
                 modes=modes,
                 distance_km=first.distance_km,
                 notes=[n for r in group for n in r.notes],
+                sites=site_list if len(site_list) > 1 else [],
             )
-            if len(seen) > 1:
-                first.notes.append("shared output: " + "; ".join(seen))
+            if len(site_list) > 1:
+                first.notes.append("shared output: " + "; ".join(s.label for s in site_list))
+                if not all(s.tone or s.dcs for s in site_list):
+                    first.notes.append("a site has no tone listed: add it with --tone so recordings can be told apart")
             if len(offsets) > 1:
                 first.notes.append(f"offsets differ {sorted(offsets)} kHz; using {first.offset_khz}")
                 log.append(f"{first.output_mhz:.4f}: offsets differ {sorted(offsets)}")
-            if len(tones) > 1:
-                first.notes.append(f"tones differ {sorted(tones)}")
         merged.append(first)
     return merged
+
+
+def apply_tones(reps: list[Repeater], overrides: list[str], log: list[str]) -> None:
+    """Apply `--tone CALL@MHZ=TONE` overrides (TONE is a CTCSS frequency or a
+    DCS code like D023) for tones the coordinator lists leave out or get wrong."""
+    for o in overrides:
+        m = re.fullmatch(r"\s*([^@=\s]+)\s*@\s*([\d.]+)\s*=\s*(D?)(\d+(?:\.\d+)?)\s*", o, re.IGNORECASE)
+        if not m:
+            raise ValueError(f"--tone {o!r}: expected CALL@MHZ=TONE, e.g. W7LT@147.18=103.5 or K7EEE@147.10=D023")
+        call, mhz, is_dcs, value = m.group(1).upper(), float(m.group(2)), m.group(3), m.group(4)
+        hit = False
+        for r in reps:
+            if r.call.upper() == call and abs(r.output_mhz - mhz) < 0.0005:
+                if is_dcs:
+                    r.tone, r.dcs = None, value.zfill(3)
+                else:
+                    r.tone, r.dcs = float(value), None
+                r.notes.append(f"{r.call} tone {is_dcs.upper()}{value} from --tone")
+                hit = True
+        if not hit:
+            log.append(f"--tone {o}: no {call} on {mhz:.4f} MHz")
 
 
 # ----------------------------------------------------------------------------- output
@@ -344,6 +395,20 @@ def to_toml(reps: list[Repeater], profile: str, digital_record: bool = False) ->
         out.append(f'offset   = "{r.offset_khz:g} kHz"')
         if r.tone:
             out.append(f"tone     = {r.tone:g}")
+        elif r.dcs:
+            out.append(f'dcs      = "{r.dcs}"')
+        if r.sites:
+            out.append("sites    = [")
+            for s in r.sites:
+                fields = [f"call = {_q(s.call)}"] if s.call else []
+                if s.location:
+                    fields.append(f"location = {_q(s.location)}")
+                if s.tone:
+                    fields.append(f"tone = {s.tone:g}")
+                elif s.dcs:
+                    fields.append(f'dcs = "{s.dcs}"')
+                out.append("    { " + ", ".join(fields) + " },")
+            out.append("]")
         if r.modes:
             out.append("modes    = [" + ", ".join(_q(m) for m in r.modes) + "]")
         mode = r.primary_mode
@@ -371,6 +436,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--orrc-regions", default="2,3", help="ORRC Region numbers to keep (comma list, empty = all)")
     ap.add_argument("--orrc-areas", default=DEFAULT_ORRC_AREAS, help="regex on ORRC ARRL_Region ('' = all)")
     ap.add_argument("--record-digital", action="store_true", help="record digital-only repeaters too")
+    ap.add_argument(
+        "--tone",
+        action="append",
+        default=[],
+        metavar="CALL@MHZ=TONE",
+        help="set a repeater's tone where the lists lack it, e.g. W7LT@147.18=103.5 or K7EEE@147.10=D023 (repeatable)",
+    )
     ap.add_argument("-o", "--out", help="write TOML here instead of stdout")
     ap.add_argument("-v", "--verbose", action="store_true", help="print skipped entries to stderr")
     args = ap.parse_args(argv)
@@ -384,7 +456,9 @@ def main(argv: list[str] | None = None) -> int:
     wwara = parse_wwara(read(args.wwara)) if args.wwara else []
     orrc = parse_orrc(read(args.orrc)) if args.orrc else []
     regions = {x.strip() for x in args.orrc_regions.split(",") if x.strip()}
-    reps, log = select(wwara, orrc, BANDS[args.band], args.lat, args.lon, args.radius_km, regions, args.orrc_areas)
+    reps, log = select(
+        wwara, orrc, BANDS[args.band], args.lat, args.lon, args.radius_km, regions, args.orrc_areas, args.tone
+    )
 
     header = [
         f"# Generated by tools/channels/import_repeaters.py: {len(reps)} repeaters, band {args.band}",

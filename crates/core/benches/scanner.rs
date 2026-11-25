@@ -148,6 +148,7 @@ fn plan() -> Vec<Slot> {
                     SlotOrigin::Grid
                 },
                 pair: None,
+                sites: Vec::new(),
             }
         })
         .collect()

@@ -62,6 +62,26 @@ impl Tone {
             }
         }
     }
+
+    /// The reverse of [`Tone::label`] (as the recordings index stores it).
+    pub fn parse(label: &str) -> Option<Tone> {
+        let l = label.trim();
+        if let Some(rest) = l.strip_prefix('D') {
+            let (digits, inverted) = match rest.as_bytes().last()? {
+                b'N' => (&rest[..rest.len() - 1], false),
+                b'I' => (&rest[..rest.len() - 1], true),
+                _ => (rest, false),
+            };
+            let code = u16::from_str_radix(digits, 8)
+                .ok()
+                .filter(|&c| c < 0o1000)?;
+            return Some(Tone::Dcs { code, inverted });
+        }
+        l.parse::<f32>()
+            .ok()
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .map(Tone::Ctcss)
+    }
 }
 
 const POLY: u32 = 0xC75;
@@ -361,6 +381,27 @@ pub(crate) mod tests {
             assert_eq!(dcs_partner(b), Some(a), "{b:o}");
         }
         assert_eq!(Tone::Ctcss(100.0).label(), "100.0");
+    }
+
+    #[test]
+    fn labels_parse_back() {
+        for t in [
+            Tone::Ctcss(103.5),
+            Tone::Ctcss(67.0),
+            Tone::Dcs {
+                code: 0o023,
+                inverted: false,
+            },
+            Tone::Dcs {
+                code: 0o754,
+                inverted: true,
+            },
+        ] {
+            assert_eq!(Tone::parse(&t.label()), Some(t));
+        }
+        for bad in ["", "D", "D9", "D1234", "abc", "-1"] {
+            assert_eq!(Tone::parse(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

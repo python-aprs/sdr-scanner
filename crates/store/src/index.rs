@@ -555,6 +555,16 @@ impl Index {
         Ok(())
     }
 
+    /// Rename a transmission's channel: on a frequency several repeaters
+    /// share, the one its tone picked out.
+    pub fn set_channel(&self, id: i64, channel: Option<&str>) -> Result<(), IndexError> {
+        self.db.execute(
+            "UPDATE transmissions SET channel = ?2 WHERE id = ?1",
+            params![id, channel],
+        )?;
+        Ok(())
+    }
+
     /// Record the DTMF digits heard in a transmission (`None` clears them).
     pub fn set_dtmf(&self, id: i64, digits: Option<&str>) -> Result<(), IndexError> {
         match digits {

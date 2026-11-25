@@ -9,6 +9,7 @@
 //! [`Slot`]s the detector watches: explicitly listed channels first, then
 //! repeater outputs and inputs, then a fallback grid for anything unlisted.
 
+use crate::tone::Tone;
 use crate::units::Hz;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -106,8 +107,18 @@ pub struct RepeaterEntry {
     pub name: String,
     pub output: Hz,
     pub offset: Hz,
-    /// CTCSS tone in Hz, informational for now.
+    /// CTCSS tone in Hz, informational (a recording keeps the tone it
+    /// carried); see `sites` for outputs shared by several repeaters.
     pub tone: Option<f64>,
+    /// DCS code (octal, `"023"`), informational like `tone`.
+    pub dcs: Option<String>,
+    /// For an output shared by several repeaters (frequency reuse, or a
+    /// linked system whose sites use different tones): each repeater with
+    /// its tone. A recording on the slot whose tone matches one site's is
+    /// named after that site; with no tone, or one no site lists, it keeps
+    /// the entry's `name`.
+    #[serde(default)]
+    pub sites: Vec<RepeaterSite>,
     #[serde(default = "default_true")]
     pub monitor_input: bool,
     pub bandwidth: Option<Hz>,
@@ -124,6 +135,61 @@ pub struct RepeaterEntry {
     pub source: Option<String>,
     #[serde(default)]
     pub modes: Vec<String>,
+}
+
+/// One of the repeaters sharing an output (see [`RepeaterEntry::sites`]).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepeaterSite {
+    /// Defaults to `call location`.
+    pub name: Option<String>,
+    pub call: Option<String>,
+    pub location: Option<String>,
+    /// CTCSS tone in Hz.
+    pub tone: Option<f64>,
+    /// DCS code (octal, `"023"`); either polarity matches.
+    pub dcs: Option<String>,
+}
+
+impl RepeaterSite {
+    /// The name recordings matched to this site get.
+    pub fn label(&self) -> Option<String> {
+        if let Some(n) = &self.name {
+            return Some(n.clone());
+        }
+        let parts: Vec<&str> = [&self.call, &self.location]
+            .into_iter()
+            .flatten()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+
+    /// The tone this site uses, if it lists one.
+    fn tone(&self) -> Result<Option<Tone>, String> {
+        match (self.tone, &self.dcs) {
+            (Some(_), Some(_)) => Err("set `tone` or `dcs`, not both".into()),
+            (Some(f), None) if (60.0..=260.0).contains(&f) => Ok(Some(Tone::Ctcss(f as f32))),
+            (Some(f), None) => Err(format!("tone {f} Hz is outside 60–260 Hz")),
+            (None, Some(d)) => parse_dcs(d).map(Some),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// A DCS code as config files write it: octal, with an optional leading
+/// `D` and trailing `N`/`I` (ignored: either polarity matches).
+fn parse_dcs(text: &str) -> Result<Tone, String> {
+    let t = text.trim().trim_start_matches(['D', 'd']);
+    let t = t.trim_end_matches(['N', 'n', 'I', 'i']);
+    match u16::from_str_radix(t, 8) {
+        Ok(code) if code < 0o1000 && !t.is_empty() => Ok(Tone::Dcs {
+            code,
+            inverted: false,
+        }),
+        _ => Err(format!("DCS code {text:?} is not three octal digits")),
+    }
 }
 
 /// A frequency or range whose slots stay on the spectrum but are not recorded.
@@ -289,6 +355,26 @@ impl Profile {
                 _ => {}
             }
         }
+        for rep in &r.repeaters {
+            let bad = |msg: String| invalid(format!("repeater {:?}: {msg}", rep.name));
+            if let Some(d) = &rep.dcs {
+                parse_dcs(d).map_err(bad)?;
+            }
+            if rep.sites.len() == 1 {
+                return Err(bad(
+                    "`sites` lists one site; put its tone on the entry".into()
+                ));
+            }
+            if !rep.sites.is_empty() && (rep.tone.is_some() || rep.dcs.is_some()) {
+                return Err(bad("with `sites`, give each site its tone instead".into()));
+            }
+            for site in &rep.sites {
+                if site.label().is_none() {
+                    return Err(bad("a site needs a `name`, `call` or `location`".into()));
+                }
+                site.tone().map_err(bad)?;
+            }
+        }
         Ok(Profile {
             name: name.to_string(),
             span,
@@ -346,6 +432,7 @@ impl Profile {
                     name: c.name.clone(),
                     origin: SlotOrigin::Listed,
                     pair: None,
+                    sites: Vec::new(),
                 },
                 &mut warnings,
             );
@@ -361,6 +448,14 @@ impl Profile {
                 name: Some(r.name.clone()),
                 origin: SlotOrigin::RepeaterOutput,
                 pair: r.monitor_input.then_some(r.output.0 + r.offset.0),
+                sites: r
+                    .sites
+                    .iter()
+                    .map(|s| SlotSite {
+                        name: s.label().expect("validated"),
+                        tone: s.tone().expect("validated"),
+                    })
+                    .collect(),
             };
             if r.monitor_input {
                 let input = Slot {
@@ -398,6 +493,7 @@ impl Profile {
                         name: None,
                         origin: SlotOrigin::Grid,
                         pair: None,
+                        sites: Vec::new(),
                     });
                 }
             }
@@ -455,9 +551,52 @@ pub struct Slot {
     /// For a repeater with its input monitored too: the other half's
     /// frequency (the input for an output slot, and the reverse).
     pub pair: Option<f64>,
+    /// For a repeater output shared by several repeaters (and its input):
+    /// each one with its tone, to tell recordings apart by the tone heard.
+    /// Empty otherwise.
+    pub sites: Vec<SlotSite>,
+}
+
+/// One of the repeaters sharing a slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotSite {
+    pub name: String,
+    pub tone: Option<Tone>,
+}
+
+/// Whether a heard tone is the one a site lists: CTCSS within 1 Hz (the
+/// closest standard tones are 2.5 Hz apart), DCS by code in either polarity.
+fn tone_matches(heard: &Tone, listed: &Tone) -> bool {
+    match (heard, listed) {
+        (Tone::Ctcss(a), Tone::Ctcss(b)) => (a - b).abs() < 1.0,
+        (Tone::Dcs { code: a, .. }, Tone::Dcs { code: b, .. }) => a == b,
+        _ => false,
+    }
 }
 
 impl Slot {
+    /// The channel name for a transmission on this slot that carried
+    /// `tone`. On a slot shared by several repeaters, the sites whose tone
+    /// matches (usually one; several when linked sites share a tone);
+    /// with no tone heard, or one no site lists, the slot's own name,
+    /// which names them all.
+    pub fn name_for(&self, tone: Option<&Tone>) -> Option<String> {
+        let matched: Vec<&str> = match tone {
+            Some(t) => self
+                .sites
+                .iter()
+                .filter(|s| s.tone.as_ref().is_some_and(|l| tone_matches(t, l)))
+                .map(|s| s.name.as_str())
+                .collect(),
+            None => Vec::new(),
+        };
+        if matched.is_empty() || matched.len() == self.sites.len() {
+            self.name.clone()
+        } else {
+            Some(matched.join(" / "))
+        }
+    }
+
     pub fn label(&self) -> String {
         let kind = match self.origin {
             SlotOrigin::Listed => "channel",
@@ -715,6 +854,107 @@ offset = "600 kHz"
         assert_eq!(c.tone, Some(107.2));
         // Wider than the RSP1A's usable 0.9 x 8 MS/s would not fit.
         assert!(p.span.width() <= 0.9 * 8e6);
+    }
+
+    const SHARED: &str = r#"
+[profiles.p]
+span = { start = "144 MHz", stop = "148 MHz" }
+spacing = "25 kHz"
+bandwidth = "16 kHz"
+deviation = "5 kHz"
+[[profiles.p.repeaters]]
+name = "NM7R / W7LT Meglar Mtn, WA / Portland, OR"
+output = "147.1800 MHz"
+offset = "600 kHz"
+sites = [
+    { call = "NM7R", location = "Meglar Mtn, WA", tone = 82.5 },
+    { call = "W7LT", location = "Portland, OR", tone = 103.5 },
+    { name = "Linked A", tone = 100 },
+    { name = "Linked B", tone = 100.0 },
+    { name = "Digital", dcs = "023" },
+    { name = "Unknown" },
+]
+"#;
+
+    #[test]
+    fn shared_output_is_named_by_the_tone_heard() {
+        let p = ConfigFile::parse(SHARED)
+            .unwrap()
+            .profile("p")
+            .unwrap()
+            .channel_plan();
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        let all = Some("NM7R / W7LT Meglar Mtn, WA / Portland, OR".to_string());
+        // The input slot (users keying up with the tone) resolves the same way.
+        for f in [147.18e6, 147.78e6] {
+            let s = slot_at(&p, f);
+            assert_eq!(s.sites.len(), 6);
+            let name = |t: Option<Tone>| s.name_for(t.as_ref());
+            assert_eq!(
+                name(Some(Tone::Ctcss(103.5))).as_deref(),
+                Some("W7LT Portland, OR")
+            );
+            assert_eq!(
+                name(Some(Tone::Ctcss(82.5))).as_deref(),
+                Some("NM7R Meglar Mtn, WA")
+            );
+            // Linked sites sharing a tone stay together.
+            assert_eq!(
+                name(Some(Tone::Ctcss(100.0))).as_deref(),
+                Some("Linked A / Linked B")
+            );
+            // Either DCS polarity.
+            let d = |inverted| {
+                Some(Tone::Dcs {
+                    code: 0o023,
+                    inverted,
+                })
+            };
+            assert_eq!(name(d(true)).as_deref(), Some("Digital"));
+            assert_eq!(name(d(false)).as_deref(), Some("Digital"));
+            // No tone, or one nobody lists: still every candidate.
+            assert_eq!(name(None), all);
+            assert_eq!(name(Some(Tone::Ctcss(123.0))), all);
+            assert_eq!(
+                name(Some(Tone::Dcs {
+                    code: 0o754,
+                    inverted: false
+                })),
+                all
+            );
+        }
+        // A slot with no sites is just its name.
+        let plain = Slot {
+            sites: Vec::new(),
+            ..slot_at(&p, 147.18e6).clone()
+        };
+        assert_eq!(plain.name_for(Some(&Tone::Ctcss(103.5))), all);
+    }
+
+    #[test]
+    fn bad_sites_are_rejected() {
+        let swap = |from: &str, to: &str| {
+            let text = SHARED.replace(from, to);
+            match ConfigFile::parse(&text).unwrap().profile("p") {
+                Err(ConfigError::Invalid { msg, .. }) => msg,
+                other => panic!("{to}: {other:?}"),
+            }
+        };
+        let site = r#"{ name = "Unknown" }"#;
+        assert!(swap(site, r#"{ tone = 100 }"#).contains("needs a `name`"));
+        assert!(swap(site, r#"{ name = "X", dcs = "089" }"#).contains("octal"));
+        assert!(swap(site, r#"{ name = "X", tone = 100, dcs = "023" }"#).contains("not both"));
+        assert!(swap(site, r#"{ name = "X", tone = 1000 }"#).contains("60–260"));
+        assert!(
+            swap("offset = \"600 kHz\"", "offset = \"600 kHz\"\ntone = 82.5").contains("each site")
+        );
+        let one = "sites = [\n    { name = \"Only\", tone = 100 },\n]\n";
+        let start = SHARED.find("sites = [").unwrap();
+        let text = format!("{}{one}", &SHARED[..start]);
+        assert!(matches!(
+            ConfigFile::parse(&text).unwrap().profile("p"),
+            Err(ConfigError::Invalid { msg, .. }) if msg.contains("one site")
+        ));
     }
 
     #[test]

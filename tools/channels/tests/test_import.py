@@ -92,3 +92,23 @@ def test_toml_output_is_loadable_shape():
     doc = tomllib.loads(text)
     entries = doc["profiles"]["site"]["repeaters"]
     assert {e["output"] for e in entries} >= {"147.1000 MHz", "146.4500 MHz"}
+
+
+def test_shared_output_lists_each_site_with_its_tone():
+    f = by_freq(run()[0])
+    sites = f[147.1].sites
+    assert [(s.call, s.tone, s.dcs) for s in sites] == [("W1AAA", 114.8, None), ("K7EEE", None, "023")]
+    assert f[147.1].tone is None
+    toml = ir.to_toml([f[147.1]], "p")
+    assert '{ call = "W1AAA", location = "Longview, WA", tone = 114.8 },' in toml
+    assert 'dcs = "023"' in toml
+
+
+def test_tone_override_fills_a_missing_tone():
+    log = []
+    reps = ir.parse_wwara(WWARA)
+    ir.apply_tones(reps, ["w1ccc@147.30=100", "W1BBB@146.45=D754", "W9ZZZ@147.3=100"], log)
+    f = by_freq(reps)
+    assert f[147.3].tone == 100.0
+    assert (f[146.45].tone, f[146.45].dcs) == (None, "754")
+    assert any("W9ZZZ" in line for line in log)
