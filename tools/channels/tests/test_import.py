@@ -112,3 +112,55 @@ def test_tone_override_fills_a_missing_tone():
     assert f[147.3].tone == 100.0
     assert (f[146.45].tone, f[146.45].dcs) == (None, "754")
     assert any("W9ZZZ" in line for line in log)
+
+
+RB = """{"count": 4, "results": [
+ {"Frequency": "146.62000", "Input Freq": "146.02000", "PL": "100.0", "TSQ": "", "Callsign": "K7BBB",
+  "Nearest City": "Gaston", "State": "Oregon", "Lat": "45.43", "Long": "-123.13", "Operational Status": "On-air",
+  "FM Analog": "Yes", "FM Bandwidth": "25 kHz", "DMR": "No", "D-Star": "Yes", "System Fusion": "No",
+  "APCO P-25": "No", "NXDN": "No"},
+ {"Frequency": "147.36000", "Input Freq": "147.96000", "PL": "D754", "Callsign": "w1zzz",
+  "Nearest City": "Kelso", "State": "Washington", "Lat": "46.15", "Long": "-122.90", "Operational Status": "On-air",
+  "FM Analog": "Yes", "FM Bandwidth": "12.5 kHz"},
+ {"Frequency": "147.38000", "Input Freq": "147.98000", "PL": "123.0", "Callsign": "W1OFF",
+  "Nearest City": "Kelso", "State": "Washington", "Lat": "46.15", "Long": "-122.90", "Operational Status": "Off-air",
+  "FM Analog": "Yes"},
+ {"Frequency": "147.10000", "Input Freq": "147.70000", "PL": "CSQ", "Callsign": "W1AAA",
+  "Nearest City": "Longview", "State": "Washington", "Lat": "46.15", "Long": "-122.95", "Operational Status": "On-air",
+  "FM Analog": "Yes"}
+]}"""
+
+
+def test_repeaterbook_parsing():
+    rb = {r.call: r for r in ir.parse_repeaterbook(RB)}
+    assert "W1OFF" not in rb  # off-air
+    assert (rb["K7BBB"].tone, rb["K7BBB"].location, rb["K7BBB"].modes) == (100.0, "Gaston, OR", ["FM", "DSTAR"])
+    assert (rb["W1ZZZ"].tone, rb["W1ZZZ"].dcs, rb["W1ZZZ"].narrow) == (None, "754", True)
+    assert rb["W1AAA"].tone is None  # CSQ
+
+
+def test_repeaterbook_fills_missing_tones_only():
+    reps, _ = ir.select(
+        ir.parse_wwara(WWARA), ir.parse_orrc(ORRC), ir.BANDS["2m"], **SITE, repeaterbook=ir.parse_repeaterbook(RB)
+    )
+    f = by_freq(reps)
+    assert f[146.62].tone == 100.0  # ORRC lists none
+    assert any("from RepeaterBook" in n for n in f[146.62].notes)
+    assert 147.36 not in f  # RepeaterBook-only, not added by default
+    # A listed tone is never replaced (W1AAA keeps 114.8 although RepeaterBook says CSQ).
+    assert f[147.1].sites[0].tone == 114.8
+
+
+def test_repeaterbook_all_adds_uncoordinated():
+    reps, _ = ir.select(
+        ir.parse_wwara(WWARA),
+        [],
+        ir.BANDS["2m"],
+        **SITE,
+        repeaterbook=ir.parse_repeaterbook(RB),
+        repeaterbook_all=True,
+    )
+    f = by_freq(reps)
+    assert f[147.36].dcs == "754" and f[147.36].source == "RepeaterBook"
+    assert 147.38 not in f
+    assert f[147.1].source == "WWARA"  # same call and output: not added twice

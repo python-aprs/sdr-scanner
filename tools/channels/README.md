@@ -14,7 +14,23 @@ Inputs:
   Region number and the ARRL_Region text, and the tone/mode are parsed from
   the ARRL_Code column.
 
-Regenerate the Rainier entries (2 m and 70 cm):
+- **RepeaterBook** (optional): the JSON its export API returns, saved by
+  `fetch_repeaterbook.py`. By default it only fills in tones the
+  coordinator lists leave out (same call on the same output);
+  `--repeaterbook-all` also adds on-air repeaters only RepeaterBook lists,
+  filtered by distance like WWARA. A tone a coordinator lists is never
+  replaced, and `--tone` beats both.
+
+Fetch RepeaterBook (cached 12 h, requests 30 s apart; `--token` or `RB_TOKEN`
+if the API asks for one):
+
+```sh
+python3 tools/channels/fetch_repeaterbook.py --state Washington --state Oregon -o repeaterbook/
+```
+
+Regenerate the Rainier entries (2 m and 70 cm), adding
+`--repeaterbook repeaterbook/Washington.json --repeaterbook repeaterbook/Oregon.json`
+when fetched:
 
 ```sh
 python3 tools/channels/import_repeaters.py --wwara WWARA-rptrlist.csv --orrc ORRC_Coordinations.xls \

@@ -24,6 +24,7 @@ import argparse
 import csv
 import html
 import io
+import json
 import math
 import re
 import sys
@@ -232,6 +233,93 @@ def parse_orrc(text: str) -> list[tuple[Repeater, dict]]:
     return out
 
 
+# ----------------------------------------------------------------------------- RepeaterBook
+
+
+def _rb_tone(value: str) -> tuple[float | None, str | None]:
+    """RepeaterBook's `PL`/`TSQ`: a CTCSS frequency, `D023` for DCS, or
+    empty / `CSQ` for none."""
+    v = (value or "").strip().upper()
+    m = re.fullmatch(r"D(\d{3})[NI]?", v)
+    if m:
+        return None, m.group(1)
+    f = _float(v)
+    return (f, None) if f and 60.0 <= f <= 260.0 else (None, None)
+
+
+def parse_repeaterbook(text: str) -> list[Repeater]:
+    """Records from RepeaterBook's export API (`{"results": [...]}`, or a
+    bare list). Off-air records are skipped."""
+    data = json.loads(text)
+    records = data.get("results", []) if isinstance(data, dict) else data
+    out = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        status = str(rec.get("Operational Status", "")).strip().lower()
+        if status and status != "on-air":
+            continue
+        f_out = _float(str(rec.get("Frequency", "")))
+        f_in = _float(str(rec.get("Input Freq", ""))) or f_out
+        if f_out is None:
+            continue
+        tone, dcs = _rb_tone(str(rec.get("PL", "")))
+
+        def yes(k: str, rec: dict = rec) -> bool:
+            return str(rec.get(k, "")).strip().lower() == "yes"
+
+        modes = []
+        if yes("FM Analog"):
+            modes.append("NFM" if "12.5" in str(rec.get("FM Bandwidth", "")) else "FM")
+        if yes("DMR"):
+            modes.append("DMR")
+        if yes("System Fusion"):
+            modes.append("YSF")
+        if yes("D-Star"):
+            modes.append("DSTAR")
+        if yes("APCO P-25"):
+            modes.append("P25")
+        if yes("NXDN"):
+            modes.append("NXDN")
+        city = str(rec.get("Nearest City", "")).strip()
+        state = STATE_ABBR.get(str(rec.get("State", "")).strip(), str(rec.get("State", "")).strip())
+        r = Repeater(
+            output_mhz=f_out,
+            input_mhz=f_in,
+            call=str(rec.get("Callsign", "")).strip().upper(),
+            location=f"{city}, {state}".strip(", "),
+            source="RepeaterBook",
+            tone=tone,
+            dcs=dcs,
+            modes=modes,
+        )
+        lat, lon = _float(str(rec.get("Lat", ""))), _float(str(rec.get("Long", "")))
+        r._latlon = (lat, lon) if lat is not None and lon is not None else None  # type: ignore[attr-defined]
+        out.append(r)
+    return out
+
+
+STATE_ABBR = {"Washington": "WA", "Oregon": "OR", "Idaho": "ID", "California": "CA"}
+
+
+def fill_tones(chosen: list[Repeater], rb: list[Repeater], log: list[str]) -> None:
+    """Give coordinated repeaters that list no tone the tone RepeaterBook
+    has for the same call on the same output."""
+    by_key: dict[tuple[str, int], Repeater] = {}
+    for r in rb:
+        if r.tone or r.dcs:
+            by_key.setdefault((r.call.upper(), round(r.output_mhz * 1e4)), r)
+    for r in chosen:
+        if r.tone or r.dcs:
+            continue
+        hit = by_key.get((r.call.upper(), round(r.output_mhz * 1e4)))
+        if hit:
+            r.tone, r.dcs = hit.tone, hit.dcs
+            label = f"{hit.tone:g}" if hit.tone else f"D{hit.dcs}"
+            r.notes.append(f"{r.call} tone {label} from RepeaterBook")
+            log.append(f"{r.output_mhz:.4f} {r.call}: tone {label} from RepeaterBook")
+
+
 # ----------------------------------------------------------------------------- selection
 
 
@@ -245,6 +333,8 @@ def select(
     orrc_regions: set[str],
     orrc_areas: str,
     tones: list[str] | None = None,
+    repeaterbook: list[Repeater] | None = None,
+    repeaterbook_all: bool = False,
 ) -> tuple[list[Repeater], list[str]]:
     lo, hi = band
     log = []
@@ -278,6 +368,25 @@ def select(
             log.append(f"skip {r.output_mhz:.4f} {r.call} {r.location} (ORRC): area {area!r}")
             continue
         chosen.append(r)
+    rb = repeaterbook or []
+    fill_tones(chosen, rb, log)
+    if repeaterbook_all:
+        known = {(r.call.upper(), round(r.output_mhz * 1e4)) for r in chosen}
+        for r in rb:
+            if not lo <= r.output_mhz <= hi or abs(r.offset_khz) < 1:
+                continue
+            if (r.call.upper(), round(r.output_mhz * 1e4)) in known:
+                continue
+            ll = getattr(r, "_latlon", None)
+            if lat is not None and lon is not None:
+                if ll is None:
+                    continue
+                r.distance_km = haversine_km(lat, lon, *ll)
+                if r.distance_km > radius_km:
+                    continue
+            r.notes.append(f"{r.call} only in RepeaterBook (not coordinated)")
+            known.add((r.call.upper(), round(r.output_mhz * 1e4)))
+            chosen.append(r)
     apply_tones(chosen, tones or [], log)
     return merge(chosen, log), log
 
@@ -428,6 +537,18 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--wwara", help="WWARA repeater list CSV")
     ap.add_argument("--orrc", help="ORRC Coordinations.xls (HTML table)")
+    ap.add_argument(
+        "--repeaterbook",
+        action="append",
+        default=[],
+        metavar="JSON",
+        help="RepeaterBook export (fetch_repeaterbook.py) to fill in missing tones from; repeatable",
+    )
+    ap.add_argument(
+        "--repeaterbook-all",
+        action="store_true",
+        help="also add repeaters only RepeaterBook lists (in range, on-air), not just their tones",
+    )
     ap.add_argument("--band", default="2m", choices=sorted(BANDS))
     ap.add_argument("--profile", default="2m", help="profile name to write entries under")
     ap.add_argument("--lat", type=float, help="site latitude (filters WWARA by distance)")
@@ -446,8 +567,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-o", "--out", help="write TOML here instead of stdout")
     ap.add_argument("-v", "--verbose", action="store_true", help="print skipped entries to stderr")
     args = ap.parse_args(argv)
-    if not args.wwara and not args.orrc:
-        ap.error("give --wwara and/or --orrc")
+    if not args.wwara and not args.orrc and not (args.repeaterbook and args.repeaterbook_all):
+        ap.error("give --wwara and/or --orrc (or --repeaterbook with --repeaterbook-all)")
 
     def read(path: str) -> str:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -456,13 +577,33 @@ def main(argv: list[str] | None = None) -> int:
     wwara = parse_wwara(read(args.wwara)) if args.wwara else []
     orrc = parse_orrc(read(args.orrc)) if args.orrc else []
     regions = {x.strip() for x in args.orrc_regions.split(",") if x.strip()}
+    rb = [r for path in args.repeaterbook for r in parse_repeaterbook(read(path))]
     reps, log = select(
-        wwara, orrc, BANDS[args.band], args.lat, args.lon, args.radius_km, regions, args.orrc_areas, args.tone
+        wwara,
+        orrc,
+        BANDS[args.band],
+        args.lat,
+        args.lon,
+        args.radius_km,
+        regions,
+        args.orrc_areas,
+        args.tone,
+        rb,
+        args.repeaterbook_all,
     )
 
     header = [
         f"# Generated by tools/channels/import_repeaters.py: {len(reps)} repeaters, band {args.band}",
-        f"# Sources: {', '.join(x for x in (args.wwara and 'WWARA', args.orrc and 'ORRC') if x)}",
+        "# Sources: "
+        + ", ".join(
+            x
+            for x in (
+                args.wwara and "WWARA",
+                args.orrc and "ORRC",
+                args.repeaterbook and ("RepeaterBook" if args.repeaterbook_all else "RepeaterBook (tones)"),
+            )
+            if x
+        ),
     ]
     if args.lat is not None:
         header.append(f"# WWARA within {args.radius_km:g} km of {args.lat}, {args.lon}")

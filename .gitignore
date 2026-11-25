@@ -8,3 +8,4 @@ __pycache__/
 /captures/
 *.sigmf-data
 !tools/synth/tests/fixtures/*.sigmf-data
+repeaterbook/
