@@ -6,9 +6,15 @@
 //! What depends on the mode sits behind [`Demod`]: NBFM voice turns the IQ
 //! into audio, AFSK1200 into AX.25 frames, DMR into calls. Further modes
 //! (SSB, CW) are further implementations, built by [`build`].
+//!
+//! NBFM slots run [`AutoDetect`] unless `auto_detect` is off: FM voice plus
+//! every digital and packet decoder, so a digital repeater or a packet
+//! burst on a channel nobody listed is decoded rather than recorded as
+//! noise.
 
 mod afsk;
 mod audio;
+mod auto;
 mod dmr;
 mod dstar;
 mod nbfm;
@@ -16,6 +22,7 @@ mod ysf;
 
 pub use afsk::AfskPacket;
 pub use audio::{Levels, SquelchGate};
+pub use auto::AutoDetect;
 pub use dmr::DmrVoice;
 pub use dstar::DstarVoice;
 pub use nbfm::NbfmVoice;
@@ -44,6 +51,14 @@ pub enum CallInfo {
 }
 
 impl CallInfo {
+    pub fn mode(&self) -> Mode {
+        match self {
+            CallInfo::Dmr(_) => Mode::Dmr,
+            CallInfo::Ysf(_) => Mode::Ysf,
+            CallInfo::Dstar(_) => Mode::Dstar,
+        }
+    }
+
     /// The codec of the call's voice frames.
     pub fn codec(&self) -> crate::dmr::vocoder::Codec {
         match self {
@@ -121,6 +136,12 @@ pub trait Demod: Send {
     fn take_calls(&mut self) -> Vec<Call> {
         Vec::new()
     }
+
+    /// The digital or packet mode this transmission has shown itself to be
+    /// (syncs, a checked header or a frame that passed its FCS), if any.
+    fn detected(&self) -> Option<Mode> {
+        None
+    }
 }
 
 /// Whether [`build`] has a demodulator for this mode.
@@ -135,6 +156,7 @@ pub fn supports(mode: Mode) -> bool {
 /// if the mode isn't written yet.
 pub fn build(slot: &Slot, rate: f64, cfg: &ScannerConfig) -> Option<Box<dyn Demod>> {
     match slot.mode {
+        Mode::Nbfm if cfg.auto_detect => Some(Box::new(AutoDetect::new(slot, rate, cfg))),
         Mode::Nbfm => Some(Box::new(NbfmVoice::new(slot, rate, cfg))),
         Mode::Afsk1200 => Some(Box::new(AfskPacket::new(slot, rate))),
         Mode::Dmr => Some(Box::new(DmrVoice::new(rate))),

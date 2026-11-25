@@ -2,7 +2,7 @@
 
 use super::Demod;
 use crate::afsk::{AfskDecoder, Decoded};
-use crate::config::Slot;
+use crate::config::{Mode, Slot};
 use crate::dsp::FmDiscriminator;
 use num_complex::Complex32;
 
@@ -12,6 +12,8 @@ pub struct AfskPacket {
     disc: FmDiscriminator,
     decoder: AfskDecoder,
     demod: Vec<f32>,
+    /// Frames decoded (each passed its FCS).
+    frames: u32,
 }
 
 impl AfskPacket {
@@ -20,6 +22,7 @@ impl AfskPacket {
             disc: FmDiscriminator::new(rate, slot.deviation),
             decoder: AfskDecoder::new(rate),
             demod: Vec::new(),
+            frames: 0,
         }
     }
 }
@@ -37,7 +40,13 @@ impl Demod for AfskPacket {
         false
     }
 
+    fn detected(&self) -> Option<Mode> {
+        (self.frames > 0).then_some(Mode::Afsk1200)
+    }
+
     fn take_frames(&mut self) -> Vec<Decoded> {
-        self.decoder.take()
+        let f = self.decoder.take();
+        self.frames += f.len() as u32;
+        f
     }
 }

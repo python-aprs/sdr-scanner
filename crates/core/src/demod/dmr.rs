@@ -2,6 +2,7 @@
 //! timeslot (see [`crate::dmr`]).
 
 use super::{Call, CallInfo, Demod};
+use crate::config::Mode;
 use crate::dmr::calls::{CallEvent, Calls};
 use crate::dmr::rx::{self, Receiver, RxBurst};
 use crate::dmr::vocoder::{self, FRAME_SAMPLES, Leveled, Vocoder};
@@ -17,6 +18,8 @@ pub struct DmrVoice {
     events: Vec<CallEvent>,
     out: Vec<Call>,
     vocoders: [Option<Box<dyn Vocoder>>; 2],
+    /// Bursts received with a sync pattern.
+    syncs: u32,
 }
 
 impl DmrVoice {
@@ -29,6 +32,7 @@ impl DmrVoice {
             events: Vec::new(),
             out: Vec::new(),
             vocoders: [None, None],
+            syncs: 0,
         }
     }
 
@@ -78,6 +82,7 @@ impl Demod for DmrVoice {
     fn process(&mut self, iq: &[Complex32], _open: bool, _audio: &mut Vec<f32>) {
         self.rx.push(iq, &mut self.bursts);
         for b in self.bursts.drain(..) {
+            self.syncs += b.sync.is_some() as u32;
             self.calls.push(&b, &mut self.events);
         }
         self.convert();
@@ -90,6 +95,11 @@ impl Demod for DmrVoice {
 
     fn records_audio(&self) -> bool {
         false
+    }
+
+    /// Two syncs: one can be chance, the second lands a frame later.
+    fn detected(&self) -> Option<Mode> {
+        (self.syncs >= 2).then_some(Mode::Dmr)
     }
 
     fn take_calls(&mut self) -> Vec<Call> {
