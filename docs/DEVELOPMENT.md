@@ -356,14 +356,21 @@ reduction 20–59 dB), `--rate` (2–10.66 MS/s), `--center-mhz` (default: middl
 of the profile's span plus 12.5 kHz), `--if-bw-khz` (8000), `--agc <dBFS>`
 (off by default, because AGC steps make the noise floor jump), `--ppm`,
 `--bias-t`, `--fm-notch`, `--dab-notch`. Overload warnings, samples the API
-reports lost (zero-filled, so timestamps hold) and unplugging show up in the
+reports lost and unplugging show up in the
 status line; unplugging ends the run after the open recordings are written.
 
 How it fits: `crates/sources/sdrplay/shim.c` is the only code that sees the
 vendor header; it gives Rust a small interface (`scanner_sdrplay.h`).
 `scanner_sources::sdrplay::StreamState` (plain Rust, unit tested without the
 API) interleaves each callback's I and Q arrays into full ring blocks and
-turns jumps in the API's sample counter into zero-filled gaps.
+counts jumps in the API's sample counter. It does not zero-fill them: on an
+RSP1A the counter reported about 9 minutes of gaps per 49 minutes while the
+radio delivered 7.91 of 8 MS/s, and filling them ran timestamps minutes into
+the future. `SCANNER_SDRPLAY_FILL_GAPS=1` turns filling back on. Live
+timestamps still come from the sample count, but `serve` steps the clock
+whenever a sample would be stamped after the moment it was read, or longer
+before it than the ring can hold (`SampleClock::discipline`); the status line
+reports those steps.
 `crates/sources/sdrplay/fake/run-e2e.sh` builds the feature against a
 stand-in header and runs `serve` against a fake API library that streams a
 keyed carrier, so the whole path can be exercised without the SDK or a radio.

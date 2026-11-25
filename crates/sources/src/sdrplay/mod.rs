@@ -10,8 +10,12 @@
 //! - [`SdrplayConfig`]: radio settings and their checks.
 //! - [`StreamState`]: what the stream callback does. It interleaves the API's
 //!   separate I and Q arrays into full ring blocks (callbacks deliver about a
-//!   thousand samples each, far smaller than a ring block), and turns gaps in
-//!   the API's sample counter into zero-filled spans so timestamps never slip.
+//!   thousand samples each, far smaller than a ring block), and counts gaps
+//!   in the API's sample counter. The counter is not trusted to zero-fill
+//!   them: on Masen's RSP1A it reported ~9 minutes of gaps in 49 minutes
+//!   while the radio delivered 7.91 of 8 MS/s, and the zeros pushed every
+//!   timestamp ahead of real time. Timestamps are kept honest by the host
+//!   clock instead (`SampleClock::discipline`).
 //! - [`DeviceEvents`]: counters the callbacks update and anyone can read
 //!   (overloads, gain changes, unplugging).
 
@@ -142,7 +146,8 @@ pub struct DeviceEvents {
     pub failed: AtomicBool,
     /// Stream resets reported by the API (after a settings change).
     pub resets: AtomicU64,
-    /// Samples the API's counter says were lost, zero-filled downstream.
+    /// Samples the API's counter says were lost (zero-filled only with
+    /// SCANNER_SDRPLAY_FILL_GAPS=1).
     pub gap_samples: AtomicU64,
     /// Counter jumps too large or backwards to be a gap; tracking restarted.
     pub counter_jumps: AtomicU64,
@@ -188,7 +193,7 @@ impl DeviceEvents {
         let gaps = self.gap_samples.load(Ordering::Relaxed);
         if gaps > 0 {
             parts.push(format!(
-                "{gaps} samples lost in the API ({} gaps in {} callbacks)",
+                "{gaps} samples lost per the API's counter ({} gaps in {} callbacks)",
                 self.gap_events.load(Ordering::Relaxed),
                 self.callbacks.load(Ordering::Relaxed)
             ));
@@ -260,8 +265,9 @@ pub struct StreamState {
     debug_left: u32,
     debug_gaps_left: u32,
     last: (u32, u32),
-    /// SCANNER_SDRPLAY_IGNORE_GAPS=1 counts counter gaps but does not
-    /// zero-fill them (to tell real loss from a miscounted counter).
+    /// Zero-fill counter gaps in the stream. Off by default (the counter
+    /// over-reports, see the module docs); SCANNER_SDRPLAY_FILL_GAPS=1
+    /// turns it on.
     fill_gaps: bool,
 }
 
@@ -290,7 +296,7 @@ impl StreamState {
             debug_left: debug_count(),
             debug_gaps_left: debug_count(),
             last: (0, 0),
-            fill_gaps: std::env::var("SCANNER_SDRPLAY_IGNORE_GAPS").map_or(true, |v| v != "1"),
+            fill_gaps: std::env::var("SCANNER_SDRPLAY_FILL_GAPS").is_ok_and(|v| v == "1"),
         }
     }
 
@@ -349,6 +355,12 @@ impl StreamState {
                 self.flush();
             }
         }
+    }
+
+    /// Zero-fill counter gaps in the stream (see `fill_gaps`).
+    pub fn with_fill_gaps(mut self, on: bool) -> Self {
+        self.fill_gaps = on;
+        self
     }
 
     /// Push buffered samples to the ring now (a partial block).
@@ -473,10 +485,28 @@ mod tests {
     }
 
     #[test]
-    fn counter_gaps_become_zero_filled_spans() {
+    fn counter_gaps_are_counted_but_not_filled_by_default() {
         let (p, mut c) = ring(16, 1000, info());
         let events = Arc::new(DeviceEvents::default());
-        let mut st = StreamState::new(p, 1000, 8e6, events.clone());
+        let mut st = StreamState::new(p, 1000, 8e6, events.clone()).with_fill_gaps(false);
+        let ones = vec![16384i16; 100];
+        st.on_samples(&ones, &ones, 0, false);
+        // The counter claims 50 samples were lost; the stream is not padded.
+        st.on_samples(&ones, &ones, 150, false);
+        st.close();
+        let got = drain(&mut c);
+        assert_eq!(got.len(), 200);
+        assert!(got.iter().all(|v| v.re == 0.5));
+        assert_eq!(c.stats().samples_dropped, 0);
+        assert_eq!(events.gap_samples.load(Ordering::Relaxed), 50);
+        assert!(events.summary().unwrap().contains("50 samples lost per"));
+    }
+
+    #[test]
+    fn counter_gaps_become_zero_filled_spans_when_asked() {
+        let (p, mut c) = ring(16, 1000, info());
+        let events = Arc::new(DeviceEvents::default());
+        let mut st = StreamState::new(p, 1000, 8e6, events.clone()).with_fill_gaps(true);
         let ones = vec![16384i16; 100];
         st.on_samples(&ones, &ones, 0, false);
         st.on_samples(&ones, &ones, 100, false);
@@ -490,7 +520,7 @@ mod tests {
         assert!(got[250..].iter().all(|v| v.re == 0.5));
         assert_eq!(c.stats().samples_dropped, 50);
         assert_eq!(events.gap_samples.load(Ordering::Relaxed), 50);
-        assert!(events.summary().unwrap().contains("50 samples lost"));
+        assert!(events.summary().unwrap().contains("50 samples lost per"));
     }
 
     #[test]

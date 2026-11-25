@@ -183,6 +183,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
     let mut out: Vec<Output> = Vec::new();
     loop {
         let read = session.source.read(&mut buf);
+        let read_at = SystemTime::now();
         // A radio that stalls or whose stream ends (USB failure, unplugged)
         // is reopened rather than ending the program. A replay ends for
         // good when its file does.
@@ -235,6 +236,11 @@ pub fn serve(o: ServeOptions) -> Result<()> {
             }
         }
         let t = Instant::now();
+        // Timestamps come from the sample count; keep that count within
+        // reach of the wall clock in case the radio's sample accounting
+        // slips (the SDRplay API's counter has reported minutes of gaps
+        // that never happened).
+        scanner.discipline_clock(k, read_at, max_lag(&session));
         scanner.set_live(web.live_wanted());
         scanner.push(&buf[..k], &mut out);
         tel.busy += t.elapsed();
@@ -279,6 +285,13 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         eprintln!("radio: {note}");
     }
     Ok(radio_result?)
+}
+
+/// The oldest a sample can be when the DSP thread reads it: a full ring of
+/// buffering plus slack for the driver and USB.
+fn max_lag(session: &Session) -> Duration {
+    let ring = session.source.stats_ring().capacity as f64 * BLOCK as f64;
+    Duration::from_secs_f64(ring / session.info.sample_rate + 2.0)
 }
 
 /// A scanner for a radio session (a new one after each reopen).

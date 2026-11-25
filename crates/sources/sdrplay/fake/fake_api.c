@@ -2,7 +2,9 @@
 /* Fake SDRplay API (built against the stand-in header next to it) for an end-to-end test: streams a 147.52 MHz carrier
  * keyed on/off, 1008-sample callbacks, with one injected counter gap.
  * FAKE_STALL_AFTER=<s>: the first stream stops delivering samples after that many seconds (like a USB failure), and the
- * first SelectDevice after that fails once, so a reopen has to retry. */
+ * first SelectDevice after that fails once, so a reopen has to retry.
+ * FAKE_PHANTOM_GAPS=1: every 1000 callbacks the sample counter jumps 1000 packets with no samples lost (the RSP1A's
+ * counter over-reports gaps like this), which would run sample-count timestamps twice as fast if trusted. */
 #include <stdlib.h>
 #include <sdrplay_api.h>
 #include <math.h>
@@ -32,7 +34,7 @@ static void *run(void *x){
   double fs=devp.fsFreq.fsHz, off=147.52e6-rxa.tunerParams.rfFreq.rfHz, ph=0; unsigned int first=0; short xi[1008],xq[1008];
   struct timespec t0; clock_gettime(CLOCK_MONOTONIC,&t0); unsigned long long sent=0; int ncb=0;
   fprintf(stderr,"fake: mode=%d fs=%.0f rf=%.0f lna=%d gr=%d bw=%d\n",devp.mode,fs,rxa.tunerParams.rfFreq.rfHz,rxa.tunerParams.gain.LNAstate,rxa.tunerParams.gain.gRdB,rxa.tunerParams.bwType);
-  unsigned int seed=1; int session=inits; double stall=stall_after();
+  unsigned int seed=1; int session=inits; double stall=stall_after(); int phantom=getenv("FAKE_PHANTOM_GAPS")!=0;
   while(running){
     if(session==1 && stall>0 && sent/fs>stall){ struct timespec s={0,10000000}; nanosleep(&s,0); continue; }
     double t=sent/fs; int on = fmod(t,4.0)>1.0 && fmod(t,4.0)<3.0;
@@ -40,6 +42,7 @@ static void *run(void *x){
       ph+=2*M_PI*(off+(on?3000*sin(2*M_PI*1000*(sent+k)/fs):0))/fs; if(ph>M_PI)ph-=2*M_PI;
       xi[k]=(short)(nI+(on?4000*cos(ph):0)); xq[k]=(short)(nQ+(on?4000*sin(ph):0)); }
     if(++ncb==5000){ first+=1008*3; sent+=1008*3; } /* lose 3 packets */
+    if(phantom && ncb%1000==0) first+=1008*1000; /* counter jumps, nothing lost */
     sdrplay_api_StreamCbParamsT p={first,0,0,0,1008};
     cbs.StreamACbFn(xi,xq,&p,1008,ncb==1,cbctx); first+=1008; sent+=1008;
     if(ncb==3000){ sdrplay_api_EventParamsT e; e.powerOverloadParams.powerOverloadChangeType=sdrplay_api_Overload_Detected; cbs.EventCbFn(sdrplay_api_PowerOverloadChange,sdrplay_api_Tuner_A,&e,cbctx);}

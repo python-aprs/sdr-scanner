@@ -41,6 +41,22 @@ n2=$(find "$work/out2" -name '147.5200_*.wav' | wc -l)
 echo "recorded $n2 transmissions on 147.52 MHz around a reopen"
 [ "$n2" -ge 4 ]
 
+# The API's counter reports gaps that never happened (as on Masen's RSP1A).
+# Timestamps must stay with the wall clock: no recording may be stamped
+# after the run ended.
+FAKE_PHANTOM_GAPS=1 "$root/target/release/scanner" serve --source sdrplay \
+    --config "$root/config/rainier.toml" --out "$work/out4" --http off \
+    --status-every 5 2>"$work/log4" &
+pid=$!
+sleep 13
+end=$(date -u +%Y%m%dT%H%M%S)
+kill -INT $pid
+wait $pid
+cat "$work/log4"
+last=$(find "$work/out4" -name '147.5200_*.wav' | sed 's/.*_\([0-9T]*\)\..*/\1/' | sort | tail -1)
+echo "latest recording stamped $last, run ended $end"
+[ -n "$last" ] && [ "$last" \< "$end" -o "$last" = "$end" ]
+
 # Another program holds the API lock: serve says what it is waiting on after
 # 10 s, and Ctrl-C gets it out without a second Ctrl-C.
 FAKE_HANG_LOCK=1 "$root/target/release/scanner" serve --source sdrplay \

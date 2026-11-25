@@ -187,6 +187,11 @@ pub struct ScannerStats {
     /// Digital voice calls recorded (also counted in `recorded`).
     pub calls: u64,
     pub max_concurrent: usize,
+    /// Times the sample clock was stepped to stay within reach of the
+    /// host clock (see [`Scanner::discipline_clock`]), and the net step in
+    /// nanoseconds (negative: timestamps were running ahead).
+    pub clock_steps: u64,
+    pub clock_step_ns: i64,
 }
 
 pub struct Scanner {
@@ -302,6 +307,26 @@ impl Scanner {
 
     pub fn clock(&self) -> &SampleClock {
         &self.clock
+    }
+
+    /// Tie the sample clock to the host clock before pushing `pending`
+    /// samples that were just read at `now` (see [`SampleClock::discipline`]).
+    /// For live sources only: a file is timed by its own sample count.
+    pub fn discipline_clock(
+        &mut self,
+        pending: usize,
+        now: SystemTime,
+        max_lag: std::time::Duration,
+    ) -> i128 {
+        let n = self.stats.samples + pending as u64;
+        let step = self
+            .clock
+            .discipline(n, now, max_lag, std::time::Duration::from_millis(50));
+        if step != 0 {
+            self.stats.clock_steps += 1;
+            self.stats.clock_step_ns += step as i64;
+        }
+        step
     }
 
     /// Feed IQ samples.

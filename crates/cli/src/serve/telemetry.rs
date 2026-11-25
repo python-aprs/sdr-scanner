@@ -118,6 +118,14 @@ impl Telemetry {
                 )
             })
             .unwrap_or_default();
+        let st = scanner.stats();
+        let clock_note = match st.clock_steps {
+            0 => String::new(),
+            n => format!(
+                ", clock stepped {n} times to match the wall ({:+.1} s net)",
+                st.clock_step_ns as f64 / 1e9
+            ),
+        };
         let d = scanner.detector();
         let guards = match (d.burst_blocks(), d.step_blocks()) {
             (0, 0) => String::new(),
@@ -136,7 +144,7 @@ impl Telemetry {
             ),
         };
         format!(
-            "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}{}{}",
+            "status: {:.0} s, DSP {:.0}% of a core, ring {}/{} blocks, dropped {} samples, recorded {}, active [{}]{}{}{}{}{}",
             wall,
             self.busy.as_secs_f64() / wall * 100.0,
             rs.blocks_written - rs.blocks_read,
@@ -147,6 +155,7 @@ impl Telemetry {
             guards,
             raised,
             radio_note,
+            clock_note,
             self.reopened_note(),
         )
     }
