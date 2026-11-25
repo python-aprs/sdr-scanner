@@ -83,11 +83,14 @@ impl BurstGuard {
 
     /// When many idle slots read over their close threshold (`close[i]`) at
     /// once, keep only the opens within the margin of the strongest signal.
+    /// Only slots at least as strong as their neighbours (`peak[i]`) count,
+    /// so one signal across several narrow grid windows counts once.
     pub fn apply(
         &mut self,
         states: &[SlotState],
         stats: &[SlotStats],
         close: &[f32],
+        peak: &[bool],
         opens: &mut [bool],
     ) {
         if self.slots == 0 {
@@ -102,7 +105,7 @@ impl BurstGuard {
         // five of them over the open threshold at once, too few to arm
         // the guard, so they opened one by one.
         let hot = (0..states.len())
-            .filter(|&i| idle(i) && stats[i].snr_db >= close[i])
+            .filter(|&i| peak[i] && idle(i) && stats[i].snr_db >= close[i])
             .count();
         if hot < self.slots {
             return;

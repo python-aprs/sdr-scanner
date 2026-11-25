@@ -10,6 +10,7 @@
 [profiles.rainier-2m]
 span       = { start = "144.000 MHz", stop = "148.000 MHz" }
 spacing    = "25 kHz"      # fallback grid for unlisted signals
+simplex_spacing = "10 kHz" # also every 10 kHz-round frequency (146.52, 147.58, ...)
 bandwidth  = "16 kHz"
 deviation  = "5 kHz"
 audio_rate = 8000

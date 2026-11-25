@@ -221,6 +221,9 @@ pub struct RawProfile {
     pub mode: Option<Mode>,
     /// Add fallback grid slots between listed channels (default true).
     pub grid: Option<bool>,
+    /// Also put grid slots on every multiple of this step (e.g. 10 kHz for
+    /// 2 m simplex, which sits on 10 and 20 kHz steps off the 25 kHz grid).
+    pub simplex_spacing: Option<Hz>,
     #[serde(default)]
     pub channels: Vec<ChannelEntry>,
     #[serde(default)]
@@ -297,7 +300,16 @@ impl ConfigFile {
                 ($($f:ident),*) => { $( if r.$f.is_some() { merged.$f = r.$f.clone(); } )* };
             }
             take!(
-                span, spacing, offset, bandwidth, deviation, audio_rate, deemphasis, mode, grid
+                span,
+                spacing,
+                offset,
+                bandwidth,
+                deviation,
+                audio_rate,
+                deemphasis,
+                mode,
+                grid,
+                simplex_spacing
             );
             merged.channels.extend(r.channels.iter().cloned());
             merged.repeaters.extend(r.repeaters.iter().cloned());
@@ -320,6 +332,7 @@ pub struct Profile {
     pub deemphasis: bool,
     pub mode: Mode,
     pub grid: bool,
+    pub simplex_spacing: Option<Hz>,
     pub channels: Vec<ChannelEntry>,
     pub repeaters: Vec<RepeaterEntry>,
     pub lockouts: Vec<LockoutEntry>,
@@ -355,6 +368,9 @@ impl Profile {
                 _ => {}
             }
         }
+        if r.simplex_spacing.is_some_and(|s| s.0 <= 0.0) {
+            return Err(invalid("simplex_spacing must be positive".into()));
+        }
         for rep in &r.repeaters {
             let bad = |msg: String| invalid(format!("repeater {:?}: {msg}", rep.name));
             if let Some(d) = &rep.dcs {
@@ -386,10 +402,26 @@ impl Profile {
             deemphasis: r.deemphasis.unwrap_or(true),
             mode: r.mode.unwrap_or_default(),
             grid,
+            simplex_spacing: r.simplex_spacing,
             channels: r.channels,
             repeaters: r.repeaters,
             lockouts: r.lockouts,
         })
+    }
+
+    fn grid_slot(&self, freq: f64) -> Slot {
+        Slot {
+            freq,
+            bandwidth: self.bandwidth.0,
+            deviation: self.deviation.0,
+            mode: self.mode,
+            priority: false,
+            record: true,
+            name: None,
+            origin: SlotOrigin::Grid,
+            pair: None,
+            sites: Vec::new(),
+        }
     }
 
     /// Build the list of slots the detector watches, sorted by frequency.
@@ -473,30 +505,47 @@ impl Profile {
 
         let mut slots = explicit.clone();
         if self.grid {
-            let spacing = self.spacing.expect("validated").0;
-            let off = self.offset.0;
-            let first = ((self.span.start.0 - off) / spacing).ceil() as i64;
-            let last = ((self.span.stop.0 - off) / spacing).floor() as i64;
-            for k in first..=last {
-                let f = k as f64 * spacing + off;
+            // The grid raster, plus the simplex raster if there is one.
+            let raster = |step: f64, off: f64| {
+                let first = ((self.span.start.0 - off) / step).ceil() as i64;
+                let last = ((self.span.stop.0 - off) / step).floor() as i64;
+                (first..=last).map(move |k| k as f64 * step + off)
+            };
+            let mut freqs: Vec<f64> = raster(self.spacing.expect("validated").0, self.offset.0)
+                .chain(
+                    self.simplex_spacing
+                        .into_iter()
+                        .flat_map(|s| raster(s.0, 0.0)),
+                )
+                .collect();
+            freqs.sort_by(f64::total_cmp);
+            freqs.dedup_by(|a, b| same_freq(*a, *b));
+            for f in freqs {
+                // Only a grid position inside an explicit slot's channel is
+                // left out; one just past its edge (10 kHz from a repeater on
+                // 2 m) stays, so an off-raster signal between two explicit
+                // slots is still caught.
                 let taken = explicit
                     .iter()
-                    .any(|e| (e.freq - f).abs() < (spacing.max(e.bandwidth)) / 2.0);
+                    .any(|e| (e.freq - f).abs() < e.bandwidth / 2.0);
                 if !taken {
-                    slots.push(Slot {
-                        freq: f,
-                        bandwidth: self.bandwidth.0,
-                        deviation: self.deviation.0,
-                        mode: self.mode,
-                        priority: false,
-                        record: true,
-                        name: None,
-                        origin: SlotOrigin::Grid,
-                        pair: None,
-                        sites: Vec::new(),
-                    });
+                    slots.push(self.grid_slot(f));
                 }
             }
+            // Two explicit slots with no grid slot between them and a gap
+            // between their channels (repeaters 20 kHz apart on a 25 kHz
+            // grid, the grid positions near them all taken): watch the gap
+            // from its middle, or a signal there opens neither.
+            slots.sort_by(|a, b| a.freq.total_cmp(&b.freq));
+            let mut gaps = Vec::new();
+            for w in slots.windows(2) {
+                let (a, b) = (&w[0], &w[1]);
+                let (edge_a, edge_b) = (a.freq + a.bandwidth / 2.0, b.freq - b.bandwidth / 2.0);
+                if a.origin != SlotOrigin::Grid && b.origin != SlotOrigin::Grid && edge_b > edge_a {
+                    gaps.push((a.freq + b.freq) / 2.0);
+                }
+            }
+            slots.extend(gaps.into_iter().map(|f| self.grid_slot(f)));
         }
 
         for l in &self.lockouts {
@@ -737,14 +786,46 @@ deviation = "2.5 kHz"
             .count();
         let explicit = p.slots.len() - grid;
         assert_eq!(explicit, 4);
-        // 144.39 (off-grid) is 15 kHz from 144.375 and 10 kHz from 144.400.
-        // A grid slot closer than half a spacing (12.5 kHz) to a listed slot is
-        // dropped, so 144.400 goes and 144.375 stays.
+        // Only grid positions inside an explicit slot's channel are dropped:
+        // 146.525 is 5 kHz from 146.52 (11 kHz wide). 144.400 is 10 kHz from
+        // 144.39, past its 8 kHz half-channel, so it stays to catch signals
+        // between 144.39's channel and 144.425.
+        assert!(p.slots.iter().all(|s| (s.freq - 146.525e6).abs() > 1.0));
         assert!(p.slots.iter().any(|s| (s.freq - 144.375e6).abs() < 1.0));
-        assert!(p.slots.iter().all(|s| (s.freq - 144.400e6).abs() > 1.0));
-        assert_eq!(grid, 161 - 3 - 1);
+        assert!(p.slots.iter().any(|s| (s.freq - 144.400e6).abs() < 1.0));
+        assert_eq!(grid, 161 - 1);
         // sorted
         assert!(p.slots.windows(2).all(|w| w[0].freq < w[1].freq));
+    }
+
+    #[test]
+    fn simplex_spacing_adds_the_10_khz_raster() {
+        let text = format!(
+            "{EXAMPLE}\n[profiles.simplex]\ninherit = \"2m-25k\"\nsimplex_spacing = \"10 kHz\"\n"
+        );
+        let p = ConfigFile::parse(&text)
+            .unwrap()
+            .profile("simplex")
+            .unwrap()
+            .channel_plan();
+        let grid: Vec<f64> = p
+            .slots
+            .iter()
+            .filter(|s| s.origin == SlotOrigin::Grid)
+            .map(|s| s.freq)
+            .collect();
+        let has = |f: f64| grid.iter().any(|&g| same_freq(g, f));
+        // Common simplex frequencies off the 25 kHz grid, and the grid itself.
+        for f in [146.56e6, 146.58e6, 147.58e6, 147.42e6, 147.575e6, 147.6e6] {
+            assert!(has(f), "{f}");
+        }
+        // Not on top of an explicit slot, and no position twice.
+        assert!(!has(146.52e6) && !has(146.84e6) && !has(144.39e6));
+        assert!(grid.windows(2).all(|w| w[1] - w[0] > 1.0));
+        // 25 kHz (161) plus 10 kHz (401) less the 81 shared 50 kHz points,
+        // less the explicit slots on the 10 kHz raster (146.52, 146.84,
+        // 146.24, 144.39) and 146.525, inside 146.52's channel.
+        assert_eq!(grid.len(), 161 + 401 - 81 - 5);
     }
 
     #[test]

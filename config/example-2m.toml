@@ -9,6 +9,7 @@
 [profiles.2m-25k]
 span       = { start = "144.000 MHz", stop = "148.000 MHz" }
 spacing    = "25 kHz"      # fallback grid for unlisted signals
+simplex_spacing = "10 kHz" # also every 10 kHz-round frequency (146.52, 147.58, ...)
 offset     = "0 kHz"
 bandwidth  = "16 kHz"      # channel filter passband
 deviation  = "5 kHz"
