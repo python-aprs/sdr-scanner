@@ -58,6 +58,35 @@ impl SampleClock {
         let since_zero = self.unix_nanos_at(n) - self.t0_ns;
         self.t0_ns = target - since_zero;
     }
+
+    /// Keep the sample clock honest against the host clock. Sample `n` has
+    /// just been read at wall time `now`, so it was captured no later than
+    /// `now` and no earlier than `now - max_lag` (the most the ring and the
+    /// driver can hold back). A mapping outside that window means the
+    /// sample count has slipped from real time (a radio that miscounts
+    /// lost samples, or one that really drops them unnoticed), so the
+    /// clock is moved to the nearest edge. `ahead_slack` lets small
+    /// scheduling jitter pass without a step. Returns the step taken in
+    /// nanoseconds (negative pulls timestamps back), or 0.
+    pub fn discipline(
+        &mut self,
+        n: u64,
+        now: SystemTime,
+        max_lag: Duration,
+        ahead_slack: Duration,
+    ) -> i128 {
+        let now_ns = SampleClock::new(now, self.sample_rate).t0_ns;
+        let at = self.unix_nanos_at(n);
+        let step = if at > now_ns + ahead_slack.as_nanos() as i128 {
+            now_ns - at
+        } else if at < now_ns - max_lag.as_nanos() as i128 {
+            now_ns - max_lag.as_nanos() as i128 - at
+        } else {
+            0
+        };
+        self.t0_ns += step;
+        step
+    }
 }
 
 /// Nanoseconds since the Unix epoch (0 for times before it).
@@ -167,6 +196,26 @@ mod tests {
         c.reanchor(1000, at(102)); // radio clock says 101, host says 102
         assert_eq!(c.unix_nanos_at(1000), 102_000_000_000);
         assert_eq!(c.unix_nanos_at(0), 101_000_000_000);
+    }
+
+    #[test]
+    fn discipline_pulls_a_fast_count_back_to_the_host_clock() {
+        let ms = Duration::from_millis;
+        // 1000 S/s, started at t=100 s.
+        let mut c = SampleClock::new(at(100), 1000.0);
+        // In time (sample 2000 read at 102.1 s, 100 ms of buffering): no step.
+        assert_eq!(c.discipline(2000, at(102) + ms(100), ms(1000), ms(50)), 0);
+        // Slightly ahead, within the slack: no step.
+        assert_eq!(c.discipline(2030, at(102), ms(1000), ms(50)), 0);
+        // The count ran 9 s ahead of the wall (phantom gaps zero-filled).
+        let step = c.discipline(11_000, at(102), ms(1000), ms(50));
+        assert_eq!(step, -9_000_000_000);
+        assert_eq!(c.time_at(11_000), at(102));
+        // Too far behind (samples lost without being counted): pulled up to
+        // the oldest the buffering allows.
+        let step = c.discipline(12_000, at(110), ms(1000), ms(50));
+        assert_eq!(step, 6_000_000_000);
+        assert_eq!(c.time_at(12_000), at(109));
     }
 
     #[test]
