@@ -285,8 +285,15 @@ How the pipeline fits together (PLAN.md 3.2–3.4):
    MS/s, 76 Hz bins, 25 % overlap, ~9.8 ms of new samples per block).
 2. `detector::Detector`: slot SNR = integrated power in the slot window over
    the per-segment noise floor; `idle → attack → active → hang` per slot.
-   Fallback grid windows are one grid spacing wide so they tile the band;
-   explicit slots only open for a signal centred on them.
+   Fallback grid windows tile the band (each reaches halfway to the next
+   grid slot, or to the edge of an explicit slot's channel); explicit slots
+   only open for a signal centred on them. Grid slots are the `spacing`
+   raster plus, with `simplex_spacing`, every multiple of that step (10 kHz
+   on 2 m, for simplex on 146.56, 147.58 and the like). A grid position is
+   dropped only when it falls inside an explicit slot's channel, and a gap
+   between two explicit channels with no grid slot gets one at its middle.
+   A grid slot competes with any slot within a channel of it, so a signal
+   wider than the narrow windows opens only the one it is centred on.
 3. On open, `scanner::Scanner` builds a chain for the slot (grid slots retune
    to the measured centre, rounded to 2.5 kHz) and replays the pre-roll blocks
    it kept. Each chain: `channelizer::Extractor` (bin slice × filter, small

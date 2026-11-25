@@ -171,6 +171,8 @@ pub struct Detector {
     blocks_seen: u64,
     /// Scratch: per slot, whether it may start or continue an attack.
     opens: Vec<bool>,
+    /// Scratch: per slot, whether no neighbour reads stronger this block.
+    peak: Vec<bool>,
     /// Scratch: per slot, the close threshold this block (raised over
     /// interference).
     close_db: Vec<f32>,
@@ -207,13 +209,8 @@ impl Detector {
                 skipped.push(format!("{:.4} MHz outside the capture", s.freq / 1e6));
                 continue;
             }
-            let width = if s.origin == SlotOrigin::Grid {
-                s.bandwidth.max(params.grid_window_hz)
-            } else {
-                s.bandwidth
-            };
-            let lo = ((off - width / 2.0) / bin_hz).round() as i64 + (n / 2) as i64;
-            let hi = ((off + width / 2.0) / bin_hz).round() as i64 + (n / 2) as i64;
+            let lo = ((off - s.bandwidth / 2.0) / bin_hz).round() as i64 + (n / 2) as i64;
+            let hi = ((off + s.bandwidth / 2.0) / bin_hz).round() as i64 + (n / 2) as i64;
             slots.push(WatchedSlot {
                 slot: s.clone(),
                 offset_hz: off,
@@ -223,34 +220,60 @@ impl Detector {
                 segment: 0,
             });
         }
-        // Grid windows (one spacing wide) tile the band between themselves.
-        // Next to an explicit slot, whose window is only its bandwidth, a gap
-        // can open; grow the grid window to meet the explicit window's edge
-        // (by at most one grid window) so no signal falls between them.
+        // Fallback grid windows tile the band: each reaches halfway to the
+        // next grid slot, or to the edge of an explicit slot's window (which
+        // is only its bandwidth), so no signal falls between windows. A side
+        // is at most one grid window long, where the grid was thinned out
+        // around explicit slots.
         slots.sort_by(|a, b| a.offset_hz.total_cmp(&b.offset_hz));
-        let cap = (params.grid_window_hz / bin_hz).round() as usize;
-        if cap > 0 {
-            let snapshot: Vec<(usize, usize, bool)> = slots
+        if params.grid_window_hz > 0.0 {
+            let to_bin = |hz: f64| ((hz / bin_hz).round() as i64 + (n / 2) as i64).max(0) as usize;
+            let reach = params.grid_window_hz;
+            let snapshot: Vec<(f64, usize, usize, bool)> = slots
                 .iter()
-                .map(|s| (s.lo, s.hi, s.slot.origin == SlotOrigin::Grid))
+                .map(|s| (s.offset_hz, s.lo, s.hi, s.slot.origin == SlotOrigin::Grid))
                 .collect();
             for i in 0..slots.len() {
-                let (lo, hi, grid) = snapshot[i];
+                let (off, _, _, grid) = snapshot[i];
                 if !grid {
                     continue;
                 }
-                if i > 0 && !snapshot[i - 1].2 && snapshot[i - 1].1 < lo {
-                    slots[i].lo = snapshot[i - 1].1.max(lo.saturating_sub(cap));
+                let centre = to_bin(off);
+                let half = reach.max(slots[i].slot.bandwidth) / 2.0;
+                let mut lo = to_bin(off - half);
+                if let Some(&(p_off, _, p_hi, p_grid)) = i.checked_sub(1).map(|j| &snapshot[j]) {
+                    let edge = if p_grid {
+                        to_bin((p_off + off) / 2.0)
+                    } else {
+                        p_hi
+                    };
+                    lo = edge.max(to_bin(off - reach)).min(centre);
                 }
-                if i + 1 < slots.len() && !snapshot[i + 1].2 && snapshot[i + 1].0 > hi {
-                    slots[i].hi = snapshot[i + 1].0.min(hi + cap);
+                let mut hi = to_bin(off + half);
+                if let Some(&(n_off, n_lo, _, n_grid)) = snapshot.get(i + 1) {
+                    let edge = if n_grid {
+                        to_bin((n_off + off) / 2.0)
+                    } else {
+                        n_lo
+                    };
+                    hi = edge.min(to_bin(off + reach)).max(centre + 1);
                 }
+                slots[i].lo = lo;
+                slots[i].hi = hi.max(lo + 1);
             }
         }
-        // Overlapping windows compete: only the strongest may open.
+        // Overlapping windows compete: only the strongest may open. So do a
+        // grid slot and any slot within a channel of it: tiled grid windows
+        // can be narrower than a signal, and a strong one would otherwise
+        // open the windows on its skirts too.
         for i in 0..slots.len() {
             for j in 0..slots.len() {
-                if i != j && slots[i].lo < slots[j].hi && slots[j].lo < slots[i].hi {
+                let (a, b) = (&slots[i], &slots[j]);
+                let overlap = a.lo < b.hi && b.lo < a.hi;
+                let grid = a.slot.origin == SlotOrigin::Grid || b.slot.origin == SlotOrigin::Grid;
+                let near =
+                    (a.offset_hz - b.offset_hz).abs() < a.slot.bandwidth.max(b.slot.bandwidth);
+                if i != j && (overlap || (grid && near)) {
                     slots[i].neighbors.push(j);
                 }
             }
@@ -298,6 +321,7 @@ impl Detector {
             smooth_alpha: (block / SQUELCH_SMOOTHING.max(block)).min(1.0) as f32,
             blocks_seen: 0,
             opens: vec![false; count],
+            peak: vec![true; count],
             close_db: vec![0.0; count],
             attack_centre: vec![(0.0, 0); count],
             back_at: vec![None; count],
@@ -473,8 +497,17 @@ impl Detector {
         for i in 0..self.slots.len() {
             self.close_db[i] = self.params.close_db + self.background_db(i);
         }
-        self.burst
-            .apply(&self.states, &self.stats, &self.close_db, &mut self.opens);
+        for (i, s) in self.slots.iter().enumerate() {
+            let snr = self.stats[i].snr_db;
+            self.peak[i] = s.neighbors.iter().all(|&j| self.stats[j].snr_db <= snr);
+        }
+        self.burst.apply(
+            &self.states,
+            &self.stats,
+            &self.close_db,
+            &self.peak,
+            &mut self.opens,
+        );
         self.step_states(b, interfered, events);
     }
 

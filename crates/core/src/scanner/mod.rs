@@ -1246,6 +1246,100 @@ mod tests {
         out.iter().filter(|o| matches!(o, Output::Open(_))).count()
     }
 
+    /// Frequencies recorded from `sigs` (offset Hz, tone, on, off) over a
+    /// 2 m style plan around 147 MHz: repeater outputs every 20 kHz from
+    /// 147.000 to 147.100, a 25 kHz grid, and optionally the 10 kHz
+    /// simplex raster.
+    fn recorded_on_2m_plan(sigs: &[(f64, f64, f64, f64)], amp: f32, simplex: bool) -> Vec<f64> {
+        let mut toml = String::from(
+            "[profiles.p]\nspan = { start = \"146.200 MHz\", stop = \"147.800 MHz\" }\n\
+             spacing = \"25 kHz\"\nbandwidth = \"16 kHz\"\ndeviation = \"5 kHz\"\n",
+        );
+        if simplex {
+            toml += "simplex_spacing = \"10 kHz\"\n";
+        }
+        for k in 0..6 {
+            toml += &format!(
+                "[[profiles.p.repeaters]]\nname = \"R{k}\"\noutput = \"{} kHz\"\noffset = \"600 kHz\"\n",
+                147_000 + 20 * k
+            );
+        }
+        let profile = crate::config::ConfigFile::parse(&toml)
+            .unwrap()
+            .profile("p")
+            .unwrap();
+        let plan = profile.channel_plan().slots;
+        let x = scene_amp(2.0, sigs, 3000.0, amp);
+        let cfg = ScannerConfig {
+            detector: DetectorParams {
+                grid_window_hz: 25e3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut s = Scanner::with_params(cfg, params(), 147e6, SystemTime::UNIX_EPOCH, &plan);
+        let mut out = Vec::new();
+        for c in x.chunks(50_000) {
+            s.push(c, &mut out);
+        }
+        s.finish(&mut out);
+        let mut tuned: Vec<f64> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Open(t) => Some((t.slot.freq / 10.0).round() * 10.0),
+                _ => None,
+            })
+            .collect();
+        tuned.sort_by(f64::total_cmp);
+        tuned
+    }
+
+    #[test]
+    fn signals_between_repeaters_are_recorded() {
+        // 147.010 and 147.050 sit 10 kHz from a repeater on each side. Their
+        // 25 kHz grid positions are inside the repeaters' channels, so only
+        // a grid slot just past the repeater's edge catches them; before,
+        // neither repeater (not centred) nor any grid window took them.
+        for simplex in [false, true] {
+            for amp in [0.0005, 0.3] {
+                let sigs = [(10e3, 40.0, 0.5, 1.5), (50e3, 55.0, 0.5, 1.5)];
+                assert_eq!(
+                    recorded_on_2m_plan(&sigs, amp, simplex),
+                    vec![147.010e6, 147.050e6],
+                    "simplex {simplex} amp {amp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simplex_raster_records_each_signal_once_on_its_frequency() {
+        // 147.580 and 146.560 (simplex, off the 25 kHz grid), 147.575 (on
+        // it) and one repeater; strong or weak, each is recorded once.
+        for amp in [0.0005, 0.3] {
+            let sigs = [
+                (580e3, 40.0, 0.5, 1.5),
+                (-440e3, 55.0, 0.5, 1.5),
+                (575e3 - 300e3, 70.0, 0.5, 1.5),
+                (40e3, 90.0, 0.5, 1.5),
+            ];
+            assert_eq!(
+                recorded_on_2m_plan(&sigs, amp, true),
+                vec![146.560e6, 147.040e6, 147.275e6, 147.580e6],
+                "amp {amp}"
+            );
+        }
+    }
+
+    #[test]
+    fn simplex_neighbours_20_khz_apart_both_record() {
+        let sigs = [(560e3, 40.0, 0.5, 1.5), (580e3, 55.0, 0.5, 1.5)];
+        assert_eq!(
+            recorded_on_2m_plan(&sigs, 0.01, true),
+            vec![147.560e6, 147.580e6]
+        );
+    }
+
     #[test]
     fn lockout_ranges_catch_retuned_grid_signals() {
         // An off-grid signal at 112.5 kHz heard by the 100 kHz grid slot,

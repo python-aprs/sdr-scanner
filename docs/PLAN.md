@@ -370,6 +370,7 @@ band profiles, and each source runs one profile:
 [profiles.2m-25k]
 span          = { start = "144.000 MHz", stop = "148.000 MHz" }
 spacing       = "25 kHz"       # raster step
+simplex_spacing = "10 kHz"     # also every 10 kHz-round frequency (simplex)
 offset        = "0 kHz"        # raster anchor offset
 bandwidth     = "16 kHz"       # channel filter passband
 deviation     = "5 kHz"        # sets audio gain and noise-squelch scaling
