@@ -651,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     ]
     if args.lat is not None:
-        header.append(f"# Within {args.radius_km:g} km of {args.lat}, {args.lon} (WWARA, RepeaterBook)")
+        header.append(f"# Within {args.radius_km:g} km of {args.lat}, {args.lon}")
     if args.orrc:
         header.append(f"# ORRC regions {sorted(regions) or 'all'}, areas /{args.orrc_areas}/")
     text = "\n".join(header) + "\n\n" + to_toml(reps, args.profile, args.record_digital)
