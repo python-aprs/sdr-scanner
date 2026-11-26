@@ -15,7 +15,7 @@ Inputs:
   the ARRL_Code column.
 
 - **RepeaterBook** (optional): the JSON its export API returns, saved by
-  `fetch_repeaterbook.py`, or the website's JSON export (proximity search, Export, JSON; it has no on-air status, so off-air repeaters are not filtered). By default it only fills in tones the
+  `fetch_repeaterbook.py`, or the website's JSON export (proximity search, Export, JSON; it carries no status field, so limit the search to on-air repeaters). By default it only fills in tones the
   coordinator lists leave out (same call on the same output);
   `--repeaterbook-all` also adds on-air repeaters only RepeaterBook lists,
   filtered by distance like WWARA. A tone a coordinator lists is never
