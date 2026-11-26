@@ -34,9 +34,9 @@ when fetched:
 
 ```sh
 python3 tools/channels/import_repeaters.py --wwara WWARA-rptrlist.csv --orrc ORRC_Coordinations.xls \
-    --lat 46.089 --lon -122.936 --radius-km 100 --band 2m --profile rainier-2m --tone W7LT@147.18=103.5 --tone NM7R@147.18=82.5/103.5 -v > /tmp/2m.toml
+    --lat 46.089 --lon -122.936 --radius-km 100 --band 2m --profile rainier-2m --exclude NM7R@147.18 --tone W7LT@147.18=103.5 -v > /tmp/2m.toml
 python3 tools/channels/import_repeaters.py --wwara WWARA-rptrlist.csv --orrc ORRC_Coordinations.xls \
-    --lat 46.089 --lon -122.936 --radius-km 100 --band 70cm --profile rainier-70cm --tone W7LT@147.18=103.5 --tone NM7R@147.18=82.5/103.5 -v > /tmp/70cm.toml
+    --lat 46.089 --lon -122.936 --radius-km 100 --band 70cm --profile rainier-70cm --exclude NM7R@147.18 --tone W7LT@147.18=103.5 -v > /tmp/70cm.toml
 ```
 
 then replace the generated sections at the bottom of `config/rainier.toml` and
@@ -50,21 +50,23 @@ Rules:
   are merged into one slot that keeps every call and location. Each distinct
   call becomes one of the entry's `sites`, with its own tone, and the
   scanner names each recording on that slot after the site whose tone it
-  carried (`103.5` on 147.18 is W7LT, `82.5` is NM7R). With no tone, or a
+  carried (on 145.45, `118.8` is W7BU and `110.9` is KB7CNN). With no tone, or a
   tone no site lists, the recording keeps the combined name.
 - A site's `tone` is its access tone, which stations send on the input. A
   repeater that transmits a different tone on its output gets `tone_out`
   (from WWARA's CTCSS_OUT or RepeaterBook's TSQ). Output recordings are
   matched on what the repeater transmits, input recordings on the access
   tone. If two sites transmit the same tone, output recordings keep both
-  names. On 147.18, NM7R takes 82.5 but transmits 103.5, like W7LT, so only
-  the input tells them apart.
+  names, and only the input can tell them apart.
 - Where the lists leave a tone out or get it wrong, give it with
-  `--tone CALL@MHZ=TONE[/OUT]` (CTCSS Hz, or `D023` for DCS). The Rainier
-  files use `--tone W7LT@147.18=103.5 --tone NM7R@147.18=82.5/103.5`. ORRC
-  has no W7LT tone, and WWARA gives NM7R's output as 82.5, but recordings on
-  147.18 carry 103.5. A shared output with a site that still has
-  no tone is flagged in a comment.
+  `--tone CALL@MHZ=TONE[/OUT]` (CTCSS Hz, or `D023` for DCS, e.g.
+  `NM7R@147.18=82.5/103.5`). A shared output with a site that still has no
+  tone is flagged in a comment.
+- `--exclude CALL@MHZ` drops a repeater from every list, for a wrong listing
+  or a site sharing an output that doesn't reach this one. The Rainier files
+  use `--exclude NM7R@147.18 --tone W7LT@147.18=103.5`. NM7R Megler Mtn
+  doesn't make it here, and it transmits the same 103.5 as W7LT Mt Scott, so
+  147.18 is W7LT alone. ORRC lists no tone for W7LT.
 - After changing a site's tone, `scanner config retag config/rainier.toml
   <recordings folder>` renames recordings already made (`-n` to preview).
 - Repeaters with FM are `mode = "nbfm"` (narrow FM gets 11 kHz / 2.5 kHz);

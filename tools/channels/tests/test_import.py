@@ -229,3 +229,11 @@ def test_tone_override_with_output_tone():
         assert "CALL@MHZ" in str(e)
     else:
         raise AssertionError("bad output tone accepted")
+
+
+def test_exclude_drops_one_site_of_a_shared_output():
+    reps, log = ir.select(ir.parse_wwara(WWARA), ir.parse_orrc(ORRC), ir.BANDS["2m"], **SITE, excludes=["k7eee@147.10"])
+    r = by_freq(reps)[147.1]
+    assert (r.call, r.source, r.sites) == ("W1AAA", "WWARA", [])
+    _, log = ir.select(ir.parse_wwara(WWARA), [], ir.BANDS["2m"], **SITE, excludes=["W9ZZZ@147.10"])
+    assert any("W9ZZZ" in line for line in log)

@@ -420,21 +420,15 @@ output   = "147.1400 MHz"
 offset   = "600 kHz"
 modes    = ["FM"]
 
-# 77 km
-# NM7R tone 82.5/103.5 from --tone
 # W7LT tone 103.5 from --tone
-# shared output: NM7R Meglar Mtn, WA; W7LT Portland, OR
 [[profiles.rainier-2m.repeaters]]
-name     = "NM7R / W7LT Meglar Mtn, WA / Portland, OR"
-call     = "NM7R / W7LT"
-location = "Meglar Mtn, WA / Portland, OR"
-source   = "WWARA+ORRC"
+name     = "W7LT Portland, OR"
+call     = "W7LT"
+location = "Portland, OR"
+source   = "ORRC"
 output   = "147.1800 MHz"
 offset   = "600 kHz"
-sites    = [
-    { call = "NM7R", location = "Meglar Mtn, WA", tone = 82.5, tone_out = 103.5 },
-    { call = "W7LT", location = "Portland, OR", tone = 103.5 },
-]
+tone     = 103.5
 modes    = ["FM"]
 
 # 93 km

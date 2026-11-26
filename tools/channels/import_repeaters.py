@@ -396,6 +396,7 @@ def select(
     repeaterbook: list[Repeater] | None = None,
     repeaterbook_all: bool = False,
     note_uncoordinated: bool = True,
+    excludes: list[str] | None = None,
 ) -> tuple[list[Repeater], list[str]]:
     lo, hi = band
     log = []
@@ -449,6 +450,7 @@ def select(
                 r.notes.append(f"{r.call} only in RepeaterBook (not coordinated)")
             known.add((r.call.upper(), round(r.output_mhz * 1e4)))
             chosen.append(r)
+    chosen = apply_excludes(chosen, excludes or [], log)
     apply_tones(chosen, tones or [], log)
     return merge(chosen, log), log
 
@@ -521,6 +523,25 @@ def _parse_tone(text: str) -> tuple[float | None, str | None]:
     if not m:
         raise ValueError(text)
     return (None, m.group(2).zfill(3)) if m.group(1) else (float(m.group(2)), None)
+
+
+def apply_excludes(reps: list[Repeater], excludes: list[str], log: list[str]) -> list[Repeater]:
+    """Drop `--exclude CALL@MHZ` records: listings that are wrong, or a
+    repeater sharing an output that can't be heard from the site."""
+    keep = reps
+    for e in excludes:
+        m = re.fullmatch(r"\s*([^@\s]+)\s*@\s*([\d.]+)\s*", e)
+        if not m:
+            raise ValueError(f"--exclude {e!r}: expected CALL@MHZ, e.g. NM7R@147.18")
+        call, mhz = m.group(1).upper(), float(m.group(2))
+
+        def hit(r: Repeater, call: str = call, mhz: float = mhz) -> bool:
+            return r.call.upper() == call and abs(r.output_mhz - mhz) < 0.0005
+
+        if not any(hit(r) for r in keep):
+            log.append(f"--exclude {e}: no {call} on {mhz:.4f} MHz")
+        keep = [r for r in keep if not hit(r)]
+    return keep
 
 
 def apply_tones(reps: list[Repeater], overrides: list[str], log: list[str]) -> None:
@@ -639,6 +660,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--orrc-areas", default=DEFAULT_ORRC_AREAS, help="regex on ORRC ARRL_Region ('' = all)")
     ap.add_argument("--record-digital", action="store_true", help="record digital-only repeaters too")
     ap.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="CALL@MHZ",
+        help="leave out a repeater (every list's record of it), e.g. NM7R@147.18 (repeatable)",
+    )
+    ap.add_argument(
         "--tone",
         action="append",
         default=[],
@@ -676,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
         rb,
         rb_all,
         note_uncoordinated=not rb_only,
+        excludes=args.exclude,
     )
 
     header = [
