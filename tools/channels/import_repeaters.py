@@ -335,6 +335,7 @@ def select(
     tones: list[str] | None = None,
     repeaterbook: list[Repeater] | None = None,
     repeaterbook_all: bool = False,
+    note_uncoordinated: bool = True,
 ) -> tuple[list[Repeater], list[str]]:
     lo, hi = band
     log = []
@@ -384,7 +385,8 @@ def select(
                 r.distance_km = haversine_km(lat, lon, *ll)
                 if r.distance_km > radius_km:
                     continue
-            r.notes.append(f"{r.call} only in RepeaterBook (not coordinated)")
+            if note_uncoordinated:
+                r.notes.append(f"{r.call} only in RepeaterBook (not coordinated)")
             known.add((r.call.upper(), round(r.output_mhz * 1e4)))
             chosen.append(r)
     apply_tones(chosen, tones or [], log)
@@ -567,8 +569,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-o", "--out", help="write TOML here instead of stdout")
     ap.add_argument("-v", "--verbose", action="store_true", help="print skipped entries to stderr")
     args = ap.parse_args(argv)
-    if not args.wwara and not args.orrc and not (args.repeaterbook and args.repeaterbook_all):
-        ap.error("give --wwara and/or --orrc (or --repeaterbook with --repeaterbook-all)")
+    if not args.wwara and not args.orrc and not args.repeaterbook:
+        ap.error("give --wwara, --orrc and/or --repeaterbook")
+    # With no coordinator list, RepeaterBook is the list.
+    rb_only = not args.wwara and not args.orrc
+    rb_all = args.repeaterbook_all or rb_only
 
     def read(path: str) -> str:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -589,7 +594,8 @@ def main(argv: list[str] | None = None) -> int:
         args.orrc_areas,
         args.tone,
         rb,
-        args.repeaterbook_all,
+        rb_all,
+        note_uncoordinated=not rb_only,
     )
 
     header = [
@@ -600,13 +606,13 @@ def main(argv: list[str] | None = None) -> int:
             for x in (
                 args.wwara and "WWARA",
                 args.orrc and "ORRC",
-                args.repeaterbook and ("RepeaterBook" if args.repeaterbook_all else "RepeaterBook (tones)"),
+                args.repeaterbook and ("RepeaterBook" if rb_all else "RepeaterBook (tones)"),
             )
             if x
         ),
     ]
     if args.lat is not None:
-        header.append(f"# WWARA within {args.radius_km:g} km of {args.lat}, {args.lon}")
+        header.append(f"# Within {args.radius_km:g} km of {args.lat}, {args.lon} (WWARA, RepeaterBook)")
     if args.orrc:
         header.append(f"# ORRC regions {sorted(regions) or 'all'}, areas /{args.orrc_areas}/")
     text = "\n".join(header) + "\n\n" + to_toml(reps, args.profile, args.record_digital)
@@ -617,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(text)
     print(
         f"{len(reps)} repeaters ({sum(r.primary_mode != 'nbfm' for r in reps)} digital-only), "
-        f"from {len(wwara)} WWARA and {len(orrc)} ORRC records",
+        f"from {len(wwara)} WWARA, {len(orrc)} ORRC and {len(rb)} RepeaterBook records",
         file=sys.stderr,
     )
     if args.verbose:

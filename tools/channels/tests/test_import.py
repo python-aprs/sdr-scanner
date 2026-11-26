@@ -164,3 +164,15 @@ def test_repeaterbook_all_adds_uncoordinated():
     assert f[147.36].dcs == "754" and f[147.36].source == "RepeaterBook"
     assert 147.38 not in f
     assert f[147.1].source == "WWARA"  # same call and output: not added twice
+
+
+def test_repeaterbook_alone_is_the_whole_list(tmp_path, capsys):
+    rb = tmp_path / "rb.json"
+    rb.write_text(RB)
+    out = tmp_path / "out.toml"
+    assert ir.main(["--repeaterbook", str(rb), "--lat", "46.089", "--lon", "-122.936", "-o", str(out)]) == 0
+    text = out.read_text()
+    assert 'name     = "W1ZZZ Kelso, WA"' in text and 'name     = "K7BBB Gaston, OR"' in text
+    assert "not coordinated" not in text
+    assert "W1OFF" not in text
+    assert "3 RepeaterBook records" in capsys.readouterr().err
