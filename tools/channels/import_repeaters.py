@@ -247,11 +247,50 @@ def _rb_tone(value: str) -> tuple[float | None, str | None]:
     return (f, None) if f and 60.0 <= f <= 260.0 else (None, None)
 
 
+def _rb_web_record(rec: dict) -> dict:
+    """A record from the website's JSON export (proximity search, "Export":
+    `{"records": [...]}` with snake_case fields) in the API's field names.
+    It has no FM flag or status: a repeater is taken as analog unless it
+    lists digital modes without `mixed_mode`."""
+
+    def yes(k: str) -> bool:
+        return str(rec.get(k, "")).strip().lower() == "yes"
+
+    digital = {
+        "DMR": yes("dmr"),
+        "System Fusion": yes("ysf"),
+        "D-Star": yes("dstar_node"),
+        "APCO P-25": yes("p25"),
+        "NXDN": yes("nxdn"),
+    }
+    out_f = _float(str(rec.get("freq_mhz", "")))
+    in_f = _float(str(rec.get("input_freq", "")))
+    if in_f is None and out_f is not None:
+        off = _float(str(rec.get("offset_mhz", "")))
+        in_f = round(out_f + off, 4) if off is not None and abs(off) < 10 else None
+    return {
+        "Frequency": out_f,
+        "Input Freq": in_f,
+        "PL": rec.get("pl_tone") or rec.get("tone") or "",
+        "Callsign": rec.get("callsign", ""),
+        "Nearest City": rec.get("city", ""),
+        "State": rec.get("state", ""),
+        "Lat": rec.get("lat", ""),
+        "Long": rec.get("lon", ""),
+        "FM Analog": "Yes" if yes("mixed_mode") or not any(digital.values()) else "No",
+        **{k: "Yes" if v else "No" for k, v in digital.items()},
+    }
+
+
 def parse_repeaterbook(text: str) -> list[Repeater]:
-    """Records from RepeaterBook's export API (`{"results": [...]}`, or a
-    bare list). Off-air records are skipped."""
+    """Records from RepeaterBook: its export API (`{"results": [...]}`, or a
+    bare list), or the website's JSON export (`{"records": [...]}`).
+    Off-air records are skipped where the export says which they are."""
     data = json.loads(text)
-    records = data.get("results", []) if isinstance(data, dict) else data
+    if isinstance(data, dict) and "records" in data:
+        records = [_rb_web_record(r) for r in data["records"] or [] if isinstance(r, dict)]
+    else:
+        records = data.get("results", []) if isinstance(data, dict) else data
     out = []
     for rec in records or []:
         if not isinstance(rec, dict):

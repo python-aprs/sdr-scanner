@@ -176,3 +176,29 @@ def test_repeaterbook_alone_is_the_whole_list(tmp_path, capsys):
     assert "not coordinated" not in text
     assert "W1OFF" not in text
     assert "3 RepeaterBook records" in capsys.readouterr().err
+
+
+# The website's JSON export (proximity search, Export > JSON).
+RB_WEB = """{"schema_version": 1, "export_format": "json", "count": 3, "records": [
+ {"callsign": "N7DEM", "freq_mhz": "147.260000", "input_freq": "147.860000", "offset_mhz": "0.60000000000002",
+  "tone": "114.8", "city": "Longview", "county": "Cowlitz", "state": "WA", "country": "US", "landmark": "",
+  "lat": "46.16120148", "lon": "-122.88700104", "mixed_mode": "Yes", "dmr": "", "dmr_cc": "0", "dstar_node": "",
+  "nxdn": "", "p25": "", "ysf": "", "m17": "", "wide_area": "Yes", "pl_tone": "114.8", "tsq_tone": "114.8"},
+ {"callsign": "W1DIG", "freq_mhz": "145.330000", "input_freq": "", "offset_mhz": "-0.59999999999999",
+  "tone": "CSQ", "city": "Kelso", "state": "WA", "lat": "46.15", "lon": "-122.90", "mixed_mode": "",
+  "dmr": "Yes", "dmr_cc": "1", "pl_tone": "CSQ"},
+ {"callsign": "W1ANA", "freq_mhz": "146.760000", "input_freq": "146.160000", "tone": "D023",
+  "city": "Rainier", "state": "OR", "lat": "46.09", "lon": "-122.94", "mixed_mode": "", "pl_tone": "D023"}
+]}"""
+
+
+def test_repeaterbook_website_export():
+    rb = {r.call: r for r in ir.parse_repeaterbook(RB_WEB)}
+    n = rb["N7DEM"]
+    assert (n.output_mhz, n.input_mhz, n.tone, n.location, n.modes) == (147.26, 147.86, 114.8, "Longview, WA", ["FM"])
+    d = rb["W1DIG"]
+    assert d.modes == ["DMR"] and d.primary_mode == "dmr" and d.tone is None
+    assert d.offset_khz == -600  # input from the offset
+    a = rb["W1ANA"]
+    assert a.modes == ["FM"] and a.dcs == "023"
+    assert a._latlon == (46.09, -122.94)
