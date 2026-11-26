@@ -202,3 +202,30 @@ def test_repeaterbook_website_export():
     a = rb["W1ANA"]
     assert a.modes == ["FM"] and a.dcs == "023"
     assert a._latlon == (46.09, -122.94)
+
+
+def test_output_tone_where_it_differs():
+    # 147.18: NM7R takes 82.5 but transmits 103.5; W7LT uses 103.5 both ways.
+    web = """{"records": [
+     {"callsign": "NM7R", "freq_mhz": "147.18", "input_freq": "147.78", "city": "Chinook", "state": "WA",
+      "lat": "46.29", "lon": "-123.90", "mixed_mode": "Yes", "pl_tone": "82.5", "tsq_tone": "103.5"},
+     {"callsign": "W7LT", "freq_mhz": "147.18", "input_freq": "147.78", "city": "Clackamas", "state": "OR",
+      "lat": "45.45", "lon": "-122.55", "mixed_mode": "Yes", "pl_tone": "103.5", "tsq_tone": "103.5"}]}"""
+    reps, _ = ir.select([], [], ir.BANDS["2m"], **SITE, repeaterbook=ir.parse_repeaterbook(web), repeaterbook_all=True)
+    toml = ir.to_toml(reps, "p")
+    assert '{ call = "NM7R", location = "Chinook, WA", tone = 82.5, tone_out = 103.5 },' in toml
+    assert '{ call = "W7LT", location = "Clackamas, OR", tone = 103.5 },' in toml
+
+
+def test_tone_override_with_output_tone():
+    reps = ir.parse_wwara(WWARA)
+    ir.apply_tones(reps, ["W1AAA@147.10=82.5/103.5", "W1CCC@147.3=D023/D754"], [])
+    f = by_freq(reps)
+    assert (f[147.1].tone, f[147.1].tone_out) == (82.5, 103.5)
+    assert (f[147.3].dcs, f[147.3].dcs_out, f[147.3].tone) == ("023", "754", None)
+    try:
+        ir.apply_tones(reps, ["W1AAA@147.10=82.5/xyz"], [])
+    except ValueError as e:
+        assert "CALL@MHZ" in str(e)
+    else:
+        raise AssertionError("bad output tone accepted")

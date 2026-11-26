@@ -56,7 +56,9 @@ its inverted partner are the same waveform (023 N is 047 I); the
 normal-polarity name wins.
 
 The tone also picks the repeater on an output several repeaters share. A
-`[[repeaters]]` entry can list `sites = [{ call, location, tone | dcs }, ...]`;
+`[[repeaters]]` entry can list `sites = [{ call, location, tone | dcs }, ...]`
+(plus `tone_out`/`dcs_out` where a site transmits a different tone than it
+takes: output recordings match on that, input recordings on the access tone);
 the slot (output and input) keeps the entry's combined `name`, and a
 recording on it whose tone matches one site's (CTCSS within 1 Hz, DCS by
 code in either polarity) has its `channel` set to that site's name, or to

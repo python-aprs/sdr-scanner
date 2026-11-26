@@ -46,6 +46,9 @@ class Site:
     location: str
     tone: float | None = None
     dcs: str | None = None
+    # What the repeater transmits on its output, where it differs.
+    tone_out: float | None = None
+    dcs_out: str | None = None
 
     @property
     def label(self) -> str:
@@ -61,6 +64,10 @@ class Repeater:
     source: str
     tone: float | None = None
     dcs: str | None = None
+    # The output's tone where the lists give one (WWARA CTCSS_OUT,
+    # RepeaterBook TSQ) and it differs from the access tone.
+    tone_out: float | None = None
+    dcs_out: str | None = None
     modes: list[str] = field(default_factory=list)  # e.g. ["FM"], ["FM", "DMR"], ["NFM"]
     distance_km: float | None = None
     notes: list[str] = field(default_factory=list)
@@ -142,6 +149,7 @@ def parse_wwara(text: str) -> list[Repeater]:
             location=f"{row.get('CITY', '').strip()}, {row.get('STATE', '').strip()}".strip(", "),
             source="WWARA",
             tone=_float(row.get("CTCSS_IN", "")),
+            tone_out=_float(row.get("CTCSS_OUT", "")),
             dcs=(row.get("DCS_CDCSS") or "").strip() or None,
             modes=modes,
         )
@@ -272,6 +280,7 @@ def _rb_web_record(rec: dict) -> dict:
         "Frequency": out_f,
         "Input Freq": in_f,
         "PL": rec.get("pl_tone") or rec.get("tone") or "",
+        "TSQ": rec.get("tsq_tone") or "",
         "Callsign": rec.get("callsign", ""),
         "Nearest City": rec.get("city", ""),
         "State": rec.get("state", ""),
@@ -303,6 +312,7 @@ def parse_repeaterbook(text: str) -> list[Repeater]:
         if f_out is None:
             continue
         tone, dcs = _rb_tone(str(rec.get("PL", "")))
+        tone_out, dcs_out = _rb_tone(str(rec.get("TSQ", "")))
 
         def yes(k: str, rec: dict = rec) -> bool:
             return str(rec.get(k, "")).strip().lower() == "yes"
@@ -330,6 +340,8 @@ def parse_repeaterbook(text: str) -> list[Repeater]:
             source="RepeaterBook",
             tone=tone,
             dcs=dcs,
+            tone_out=tone_out,
+            dcs_out=dcs_out,
             modes=modes,
         )
         lat, lon = _float(str(rec.get("Lat", ""))), _float(str(rec.get("Long", "")))
@@ -354,9 +366,18 @@ def fill_tones(chosen: list[Repeater], rb: list[Repeater], log: list[str]) -> No
         hit = by_key.get((r.call.upper(), round(r.output_mhz * 1e4)))
         if hit:
             r.tone, r.dcs = hit.tone, hit.dcs
-            label = f"{hit.tone:g}" if hit.tone else f"D{hit.dcs}"
+            if not (r.tone_out or r.dcs_out):
+                r.tone_out, r.dcs_out = hit.tone_out, hit.dcs_out
+            label = _tone_label(hit.tone, hit.dcs)
+            out = _tone_label(hit.tone_out, hit.dcs_out)
+            if out and out != label:
+                label += f", output {out}"
             r.notes.append(f"{r.call} tone {label} from RepeaterBook")
             log.append(f"{r.output_mhz:.4f} {r.call}: tone {label} from RepeaterBook")
+
+
+def _tone_label(tone: float | None, dcs: str | None) -> str:
+    return f"{tone:g}" if tone else f"D{dcs}" if dcs else ""
 
 
 # ----------------------------------------------------------------------------- selection
@@ -456,11 +477,13 @@ def merge(reps: list[Repeater], log: list[str]) -> list[Repeater]:
                 k = r.call or r.location
                 s = sites.get(k)
                 if s is None:
-                    sites[k] = Site(r.call, r.location, r.tone, r.dcs)
+                    sites[k] = Site(r.call, r.location, r.tone, r.dcs, r.tone_out, r.dcs_out)
                 else:
                     if r.location and r.location not in s.location.split(" / "):
                         s.location = f"{s.location} / {r.location}" if s.location else r.location
                     s.tone = s.tone or r.tone
+                    s.tone_out = s.tone_out or r.tone_out
+                    s.dcs_out = s.dcs_out or r.dcs_out
                     s.dcs = s.dcs or r.dcs
             offsets = {r.offset_khz for r in group}
             modes = []
@@ -493,22 +516,33 @@ def merge(reps: list[Repeater], log: list[str]) -> list[Repeater]:
     return merged
 
 
+def _parse_tone(text: str) -> tuple[float | None, str | None]:
+    m = re.fullmatch(r"\s*(D?)(\d+(?:\.\d+)?)\s*", text, re.IGNORECASE)
+    if not m:
+        raise ValueError(text)
+    return (None, m.group(2).zfill(3)) if m.group(1) else (float(m.group(2)), None)
+
+
 def apply_tones(reps: list[Repeater], overrides: list[str], log: list[str]) -> None:
-    """Apply `--tone CALL@MHZ=TONE` overrides (TONE is a CTCSS frequency or a
-    DCS code like D023) for tones the coordinator lists leave out or get wrong."""
+    """Apply `--tone CALL@MHZ=TONE[/OUT]` overrides (a CTCSS frequency or a
+    DCS code like D023; OUT is what the repeater transmits, when it differs
+    from the access tone) for tones the lists leave out or get wrong."""
+    usage = "expected CALL@MHZ=TONE[/OUT], e.g. W7LT@147.18=103.5, NM7R@147.18=82.5/103.5 or K7EEE@147.10=D023"
     for o in overrides:
-        m = re.fullmatch(r"\s*([^@=\s]+)\s*@\s*([\d.]+)\s*=\s*(D?)(\d+(?:\.\d+)?)\s*", o, re.IGNORECASE)
+        m = re.fullmatch(r"\s*([^@=\s]+)\s*@\s*([\d.]+)\s*=\s*([^/]+?)\s*(?:/\s*(.+?))?\s*", o)
         if not m:
-            raise ValueError(f"--tone {o!r}: expected CALL@MHZ=TONE, e.g. W7LT@147.18=103.5 or K7EEE@147.10=D023")
-        call, mhz, is_dcs, value = m.group(1).upper(), float(m.group(2)), m.group(3), m.group(4)
+            raise ValueError(f"--tone {o!r}: {usage}")
+        call, mhz = m.group(1).upper(), float(m.group(2))
+        try:
+            tone, dcs = _parse_tone(m.group(3))
+            tone_out, dcs_out = _parse_tone(m.group(4)) if m.group(4) else (None, None)
+        except ValueError:
+            raise ValueError(f"--tone {o!r}: {usage}") from None
         hit = False
         for r in reps:
             if r.call.upper() == call and abs(r.output_mhz - mhz) < 0.0005:
-                if is_dcs:
-                    r.tone, r.dcs = None, value.zfill(3)
-                else:
-                    r.tone, r.dcs = float(value), None
-                r.notes.append(f"{r.call} tone {is_dcs.upper()}{value} from --tone")
+                r.tone, r.dcs, r.tone_out, r.dcs_out = tone, dcs, tone_out, dcs_out
+                r.notes.append(f"{r.call} tone {m.group(3)}{'/' + m.group(4) if m.group(4) else ''} from --tone")
                 hit = True
         if not hit:
             log.append(f"--tone {o}: no {call} on {mhz:.4f} MHz")
@@ -557,6 +591,12 @@ def to_toml(reps: list[Repeater], profile: str, digital_record: bool = False) ->
                     fields.append(f"tone = {s.tone:g}")
                 elif s.dcs:
                     fields.append(f'dcs = "{s.dcs}"')
+                # The output's tone, only where it differs from the access tone.
+                if (s.tone_out or s.dcs_out) and (s.tone_out, s.dcs_out) != (s.tone, s.dcs):
+                    if s.tone_out:
+                        fields.append(f"tone_out = {s.tone_out:g}")
+                    else:
+                        fields.append(f'dcs_out = "{s.dcs_out}"')
                 out.append("    { " + ", ".join(fields) + " },")
             out.append("]")
         if r.modes:
@@ -602,8 +642,9 @@ def main(argv: list[str] | None = None) -> int:
         "--tone",
         action="append",
         default=[],
-        metavar="CALL@MHZ=TONE",
-        help="set a repeater's tone where the lists lack it, e.g. W7LT@147.18=103.5 or K7EEE@147.10=D023 (repeatable)",
+        metavar="CALL@MHZ=TONE[/OUT]",
+        help="set a repeater's tone where the lists lack it or get it wrong: W7LT@147.18=103.5, K7EEE@147.10=D023, "
+        "or access/output like NM7R@147.18=82.5/103.5 (repeatable)",
     )
     ap.add_argument("-o", "--out", help="write TOML here instead of stdout")
     ap.add_argument("-v", "--verbose", action="store_true", help="print skipped entries to stderr")

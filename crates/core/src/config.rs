@@ -145,10 +145,16 @@ pub struct RepeaterSite {
     pub name: Option<String>,
     pub call: Option<String>,
     pub location: Option<String>,
-    /// CTCSS tone in Hz.
+    /// CTCSS tone in Hz: the access tone stations send on the input, and
+    /// the output's too unless `tone_out`/`dcs_out` says otherwise.
     pub tone: Option<f64>,
     /// DCS code (octal, `"023"`); either polarity matches.
     pub dcs: Option<String>,
+    /// The CTCSS tone the repeater itself transmits on its output, where
+    /// it differs from the access tone.
+    pub tone_out: Option<f64>,
+    /// The DCS code it transmits, where it differs from the access code.
+    pub dcs_out: Option<String>,
 }
 
 impl RepeaterSite {
@@ -166,15 +172,27 @@ impl RepeaterSite {
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
-    /// The tone this site uses, if it lists one.
+    /// The tone stations send to this site (its input), if it lists one.
     fn tone(&self) -> Result<Option<Tone>, String> {
-        match (self.tone, &self.dcs) {
-            (Some(_), Some(_)) => Err("set `tone` or `dcs`, not both".into()),
-            (Some(f), None) if (60.0..=260.0).contains(&f) => Ok(Some(Tone::Ctcss(f as f32))),
-            (Some(f), None) => Err(format!("tone {f} Hz is outside 60–260 Hz")),
-            (None, Some(d)) => parse_dcs(d).map(Some),
-            (None, None) => Ok(None),
+        tone_of(self.tone, &self.dcs)
+    }
+
+    /// The tone this site transmits on its output.
+    fn tone_out(&self) -> Result<Option<Tone>, String> {
+        match (self.tone_out, &self.dcs_out) {
+            (None, None) => self.tone(),
+            (f, d) => tone_of(f, d).map_err(|e| format!("output {e}")),
         }
+    }
+}
+
+fn tone_of(tone: Option<f64>, dcs: &Option<String>) -> Result<Option<Tone>, String> {
+    match (tone, dcs) {
+        (Some(_), Some(_)) => Err("set `tone` or `dcs`, not both".into()),
+        (Some(f), None) if (60.0..=260.0).contains(&f) => Ok(Some(Tone::Ctcss(f as f32))),
+        (Some(f), None) => Err(format!("tone {f} Hz is outside 60–260 Hz")),
+        (None, Some(d)) => parse_dcs(d).map(Some),
+        (None, None) => Ok(None),
     }
 }
 
@@ -389,6 +407,7 @@ impl Profile {
                     return Err(bad("a site needs a `name`, `call` or `location`".into()));
                 }
                 site.tone().map_err(bad)?;
+                site.tone_out().map_err(bad)?;
             }
         }
         Ok(Profile {
@@ -485,15 +504,24 @@ impl Profile {
                     .iter()
                     .map(|s| SlotSite {
                         name: s.label().expect("validated"),
-                        tone: s.tone().expect("validated"),
+                        tone: s.tone_out().expect("validated"),
                     })
                     .collect(),
             };
             if r.monitor_input {
+                // The input carries what stations send: the access tones.
                 let input = Slot {
                     freq: r.output.0 + r.offset.0,
                     origin: SlotOrigin::RepeaterInput,
                     pair: Some(r.output.0),
+                    sites: r
+                        .sites
+                        .iter()
+                        .map(|s| SlotSite {
+                            name: s.label().expect("validated"),
+                            tone: s.tone().expect("validated"),
+                        })
+                        .collect(),
                     ..base.clone()
                 };
                 push(base, &mut warnings);
@@ -950,6 +978,7 @@ offset = "600 kHz"
 sites = [
     { call = "NM7R", location = "Meglar Mtn, WA", tone = 82.5 },
     { call = "W7LT", location = "Portland, OR", tone = 103.5 },
+    { name = "Out differs", tone = 88.5, tone_out = 156.7 },
     { name = "Linked A", tone = 100 },
     { name = "Linked B", tone = 100.0 },
     { name = "Digital", dcs = "023" },
@@ -969,7 +998,7 @@ sites = [
         // The input slot (users keying up with the tone) resolves the same way.
         for f in [147.18e6, 147.78e6] {
             let s = slot_at(&p, f);
-            assert_eq!(s.sites.len(), 6);
+            assert_eq!(s.sites.len(), 7);
             let name = |t: Option<Tone>| s.name_for(t.as_ref());
             assert_eq!(
                 name(Some(Tone::Ctcss(103.5))).as_deref(),
@@ -1004,6 +1033,15 @@ sites = [
                 all
             );
         }
+        // A site's own output tone is what the output carries; the input
+        // carries the access tone.
+        let out = slot_at(&p, 147.18e6);
+        let inp = slot_at(&p, 147.78e6);
+        let named = |s: &Slot, f: f32| s.name_for(Some(&Tone::Ctcss(f)));
+        assert_eq!(named(out, 156.7).as_deref(), Some("Out differs"));
+        assert_eq!(named(out, 88.5), all);
+        assert_eq!(named(inp, 88.5).as_deref(), Some("Out differs"));
+        assert_eq!(named(inp, 156.7), all);
         // A slot with no sites is just its name.
         let plain = Slot {
             sites: Vec::new(),
@@ -1026,6 +1064,7 @@ sites = [
         assert!(swap(site, r#"{ name = "X", dcs = "089" }"#).contains("octal"));
         assert!(swap(site, r#"{ name = "X", tone = 100, dcs = "023" }"#).contains("not both"));
         assert!(swap(site, r#"{ name = "X", tone = 1000 }"#).contains("60–260"));
+        assert!(swap(site, r#"{ name = "X", tone_out = 1000 }"#).contains("output tone"));
         assert!(
             swap("offset = \"600 kHz\"", "offset = \"600 kHz\"\ntone = 82.5").contains("each site")
         );
