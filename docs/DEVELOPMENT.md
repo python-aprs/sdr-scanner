@@ -70,6 +70,13 @@ the Channels page shows each with its tone. `scanner config retag <config>
 index to the config's current names, by the same rule, after a name, a site
 or a tone changes.
 
+A config file can pull in others with a top-level `include = ["file.toml"]`
+(relative to the including file, resolved by `ConfigFile::load`). Their
+profiles' channels, repeaters and lockouts add to the same-named profile;
+a setting such as `span` may come from only one of the files. `rainier.toml`
+uses it for `rainier-custom.toml`, the hand-kept entries that survive a
+regeneration of the generated repeater lists.
+
 DTMF digits heard in a recording are stored too (`dtmf` in the index and
 API, groups split by a space: `*73 1234#`), from `dtmf::DtmfDecoder`. The
 recorder thread runs it on the audio it writes, so the DSP threads never

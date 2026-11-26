@@ -1,0 +1,21 @@
+# Hand-kept frequencies for the Rainier, OR site, merged into rainier.toml by
+# its `include` line. The generated repeater lists in rainier.toml get
+# replaced on each regeneration; this file doesn't, so put local additions
+# here: repeaters missing from RepeaterBook, simplex and other channels.
+#
+# Entries add to the same-named profile in rainier.toml. Settings such as
+# span or spacing stay in rainier.toml (setting one in both is an error).
+
+# Not in RepeaterBook (it only lists N7DEM on 147.26).
+[[profiles.rainier-2m.repeaters]]
+name     = "N7DEM Rainier, OR"
+call     = "N7DEM"
+location = "Rainier, OR"
+output   = "145.1300 MHz"
+offset   = "-600 kHz"
+modes    = ["FM", "YSF"]
+
+# Off the 10 and 25 kHz grids, so it needs its own slot.
+[[profiles.rainier-2m.channels]]
+freq = "146.4150 MHz"
+name = "146.415"

@@ -28,19 +28,25 @@ if the API asks for one):
 python3 tools/channels/fetch_repeaterbook.py --state Washington --state Oregon -o repeaterbook/
 ```
 
-Regenerate the Rainier entries (2 m and 70 cm), adding
-`--repeaterbook repeaterbook/Washington.json --repeaterbook repeaterbook/Oregon.json`
-when fetched:
+Regenerate the Rainier entries. 2 m comes from a RepeaterBook website export
+(proximity search around the site, on-air only, Export, JSON; not in git),
+70 cm from the coordinator lists:
 
 ```sh
+python3 tools/channels/import_repeaters.py --repeaterbook repeaterbook-100mi.json \
+    --lat 46.089 --lon -122.936 --radius-km 100 --band 2m --profile rainier-2m --exclude NM7R@147.18 -v > /tmp/2m.toml
 python3 tools/channels/import_repeaters.py --wwara WWARA-rptrlist.csv --orrc ORRC_Coordinations.xls \
-    --lat 46.089 --lon -122.936 --radius-km 100 --band 2m --profile rainier-2m --exclude NM7R@147.18 --tone W7LT@147.18=103.5 -v > /tmp/2m.toml
-python3 tools/channels/import_repeaters.py --wwara WWARA-rptrlist.csv --orrc ORRC_Coordinations.xls \
-    --lat 46.089 --lon -122.936 --radius-km 100 --band 70cm --profile rainier-70cm --exclude NM7R@147.18 --tone W7LT@147.18=103.5 -v > /tmp/70cm.toml
+    --lat 46.089 --lon -122.936 --radius-km 100 --band 70cm --profile rainier-70cm -v > /tmp/70cm.toml
 ```
 
 then replace the generated sections at the bottom of `config/rainier.toml` and
 run `scanner config check config/rainier.toml`.
+
+Frequencies the lists miss (N7DEM 145.13, 146.415) live in
+`config/rainier-custom.toml`, which `rainier.toml` pulls in with
+`include = ["rainier-custom.toml"]`. A regeneration doesn't touch it. Its
+channels, repeaters and lockouts add to the same-named profiles; settings
+such as `span` stay in the main file.
 
 Rules:
 
@@ -63,10 +69,11 @@ Rules:
   `NM7R@147.18=82.5/103.5`). A shared output with a site that still has no
   tone is flagged in a comment.
 - `--exclude CALL@MHZ` drops a repeater from every list, for a wrong listing
-  or a site sharing an output that doesn't reach this one. The Rainier files
-  use `--exclude NM7R@147.18 --tone W7LT@147.18=103.5`. NM7R Megler Mtn
-  doesn't make it here, and it transmits the same 103.5 as W7LT Mt Scott, so
-  147.18 is W7LT alone. ORRC lists no tone for W7LT.
+  or a site sharing an output that doesn't reach this one. The Rainier 2 m
+  list uses `--exclude NM7R@147.18`: NM7R Megler Mtn doesn't make it here,
+  and it transmits the same 103.5 as W7LT Mt Scott, so 147.18 is W7LT alone.
+  (From the coordinator lists, add `--tone W7LT@147.18=103.5`, since ORRC
+  lists no tone for W7LT.)
 - After regenerating, `scanner config retag config/rainier.toml <recordings
   folder>` renames recordings already made to the new names (`-n` to
   preview).

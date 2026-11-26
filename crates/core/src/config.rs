@@ -253,6 +253,12 @@ pub struct RawProfile {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    /// Other config files merged into this one by [`ConfigFile::load`],
+    /// relative to this file. A profile in an included file adds its
+    /// channels, repeaters and lockouts to the same-named profile here, and
+    /// may set a setting only where this file leaves it out.
+    #[serde(default)]
+    pub include: Vec<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, RawProfile>,
 }
@@ -277,6 +283,13 @@ pub enum ConfigError {
     },
     #[error("profile {profile:?}: {msg}")]
     Invalid { profile: String, msg: String },
+    #[error("{path}: {source}")]
+    In {
+        path: String,
+        source: Box<ConfigError>,
+    },
+    #[error("{0} includes itself")]
+    IncludeCycle(String),
 }
 
 impl ConfigFile {
@@ -284,12 +297,80 @@ impl ConfigFile {
         Ok(toml::from_str(text)?)
     }
 
+    /// Read `path` and merge in the files it includes. [`ConfigFile::parse`]
+    /// leaves `include` unresolved, since text has no directory.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_from(path, &mut Vec::new())
+    }
+
+    fn load_from(path: &Path, stack: &mut Vec<std::path::PathBuf>) -> Result<Self, ConfigError> {
+        let shown = path.display().to_string();
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.display().to_string(),
+            path: shown.clone(),
             source,
         })?;
-        Self::parse(&text)
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if stack.contains(&key) {
+            return Err(ConfigError::IncludeCycle(shown));
+        }
+        let wrap = |e: ConfigError| match e {
+            e
+            @ (ConfigError::In { .. } | ConfigError::Io { .. } | ConfigError::IncludeCycle(_)) => e,
+            e => ConfigError::In {
+                path: shown.clone(),
+                source: Box::new(e),
+            },
+        };
+        let mut cfg = Self::parse(&text).map_err(wrap)?;
+        stack.push(key);
+        let dir = path.parent().unwrap_or(Path::new(""));
+        for inc in std::mem::take(&mut cfg.include) {
+            let other = Self::load_from(&dir.join(&inc), stack)?;
+            cfg.merge(other).map_err(wrap)?;
+        }
+        stack.pop();
+        Ok(cfg)
+    }
+
+    /// Merge an included file's profiles into this file's.
+    fn merge(&mut self, other: ConfigFile) -> Result<(), ConfigError> {
+        for (name, add) in other.profiles {
+            let Some(base) = self.profiles.get_mut(&name) else {
+                self.profiles.insert(name, add);
+                continue;
+            };
+            let clash = |field: &'static str| ConfigError::Invalid {
+                profile: name.clone(),
+                msg: format!("`{field}` is set both here and in an included file"),
+            };
+            macro_rules! fill {
+                ($($f:ident),*) => {$(
+                    if add.$f.is_some() {
+                        if base.$f.is_some() {
+                            return Err(clash(stringify!($f)));
+                        }
+                        base.$f = add.$f;
+                    }
+                )*};
+            }
+            fill!(
+                inherit,
+                span,
+                spacing,
+                offset,
+                bandwidth,
+                deviation,
+                audio_rate,
+                deemphasis,
+                mode,
+                grid,
+                simplex_spacing
+            );
+            base.channels.extend(add.channels);
+            base.repeaters.extend(add.repeaters);
+            base.lockouts.extend(add.lockouts);
+        }
+        Ok(())
     }
 
     /// Resolve `name`, applying its `inherit` chain.
@@ -932,15 +1013,9 @@ offset = "600 kHz"
 
     #[test]
     fn shipped_configs_load_without_warnings() {
-        for (file, text) in [
-            (
-                "example-2m.toml",
-                include_str!("../../../config/example-2m.toml"),
-            ),
-            ("rainier.toml", include_str!("../../../config/rainier.toml")),
-            ("cowlitz.toml", include_str!("../../../config/cowlitz.toml")),
-        ] {
-            let cfg = ConfigFile::parse(text).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        for file in ["example-2m.toml", "rainier.toml", "cowlitz.toml"] {
+            let cfg = ConfigFile::load(&dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
             for name in cfg.profiles.keys() {
                 let p = cfg
                     .profile(name)
@@ -953,6 +1028,68 @@ offset = "600 kHz"
                 );
             }
         }
+    }
+
+    #[test]
+    fn includes_add_to_profiles() {
+        let dir = std::env::temp_dir().join(format!("scanner-include-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let main = dir.join("main.toml");
+        std::fs::write(
+            &main,
+            r#"include = ["sub/custom.toml"]
+[profiles.p]
+span = { start = "145.000 MHz", stop = "147.000 MHz" }
+spacing = "12.5 kHz"
+bandwidth = "16 kHz"
+deviation = "5 kHz"
+audio_rate = 8000
+[[profiles.p.channels]]
+freq = "146.520 MHz"
+name = "Calling"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sub/custom.toml"),
+            r#"[[profiles.p.channels]]
+freq = "146.415 MHz"
+name = "Custom"
+[profiles.q]
+inherit = "p"
+"#,
+        )
+        .unwrap();
+        let cfg = ConfigFile::load(&main).unwrap();
+        let names: Vec<_> = cfg.profiles["p"]
+            .channels
+            .iter()
+            .map(|c| c.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, ["Calling", "Custom"]);
+        cfg.profile("q").unwrap();
+
+        // A setting may come from one file only.
+        std::fs::write(
+            dir.join("sub/custom.toml"),
+            "[profiles.p]\nspacing = \"25 kHz\"\n",
+        )
+        .unwrap();
+        let err = ConfigFile::load(&main).unwrap_err().to_string();
+        assert!(
+            err.contains("main.toml") && err.contains("`spacing`"),
+            "{err}"
+        );
+
+        // A file that includes itself is refused.
+        std::fs::write(
+            dir.join("sub/custom.toml"),
+            "include = [\"../main.toml\"]\n",
+        )
+        .unwrap();
+        let err = ConfigFile::load(&main).unwrap_err().to_string();
+        assert!(err.contains("includes itself"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
