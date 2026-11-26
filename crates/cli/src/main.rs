@@ -4,8 +4,8 @@
 //! - `scanner info <recording>`: SigMF metadata and signal level
 //! - `scanner peaks <recording>`: averaged spectrum peaks, in RF frequency
 //! - `scanner config check <file> [--profile NAME]`: validate band profiles
-//! - `scanner config retag <file> <recordings>`: name recordings on shared
-//!   repeater outputs after the repeater their tone picks out
+//! - `scanner config retag <file> <recordings>`: rename recordings to the
+//!   config's channel names (on shared repeater outputs, by their tone)
 //!
 //! Phase 1:
 //! - `scanner run <recording> --config FILE`: scan a recording and write one
@@ -405,9 +405,10 @@ enum ConfigCmd {
         #[arg(long)]
         slots: bool,
     },
-    /// Rename recordings on outputs several repeaters share (`sites`) after
-    /// the repeater whose tone each one carried: for recordings made before
-    /// tone matching, or after a site's tone was added or changed.
+    /// Rename recordings to the config's current channel names: on outputs
+    /// several repeaters share (`sites`), after the repeater whose tone each
+    /// one carried. For recordings made before tone matching, or after a
+    /// name, a site or its tone changed.
     Retag {
         file: PathBuf,
         /// Recordings folder (the one with `index.sqlite`).
@@ -937,14 +938,12 @@ fn config_retag(file: &Path, dir: &Path, only: Option<String>, dry_run: bool) ->
     let mut shared = Vec::new();
     for name in names {
         let plan = cfg.profile(&name)?.channel_plan();
-        shared.extend(plan.slots.into_iter().filter(|s| !s.sites.is_empty()));
-    }
-    if shared.is_empty() {
-        eprintln!(
-            "{}: no repeater lists `sites`; nothing to do",
-            file.display()
+        // Grid slots retune and carry no name: leave their rows alone.
+        shared.extend(
+            plan.slots
+                .into_iter()
+                .filter(|s| s.origin != SlotOrigin::Grid),
         );
-        return Ok(());
     }
     let index = scanner_store::Index::open(&dir.join("index.sqlite"))
         .with_context(|| format!("{} is not a recordings folder", dir.display()))?;
@@ -978,7 +977,7 @@ fn config_retag(file: &Path, dir: &Path, only: Option<String>, dry_run: bool) ->
         }
     }
     eprintln!(
-        "{}: {seen} recordings on shared outputs, {renamed} {}",
+        "{}: {seen} recordings on listed channels and repeaters, {renamed} {}",
         dir.display(),
         if dry_run {
             "would be renamed"

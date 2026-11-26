@@ -67,8 +67,9 @@ Rules:
   use `--exclude NM7R@147.18 --tone W7LT@147.18=103.5`. NM7R Megler Mtn
   doesn't make it here, and it transmits the same 103.5 as W7LT Mt Scott, so
   147.18 is W7LT alone. ORRC lists no tone for W7LT.
-- After changing a site's tone, `scanner config retag config/rainier.toml
-  <recordings folder>` renames recordings already made (`-n` to preview).
+- After regenerating, `scanner config retag config/rainier.toml <recordings
+  folder>` renames recordings already made to the new names (`-n` to
+  preview).
 - Repeaters with FM are `mode = "nbfm"` (narrow FM gets 11 kHz / 2.5 kHz);
   digital-only ones get their digital mode, and `record = false` unless the
   scanner decodes it (DMR does; `--record-digital` records the rest too).

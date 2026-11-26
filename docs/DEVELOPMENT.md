@@ -66,8 +66,9 @@ the matching sites joined with ` / ` when linked sites share a tone. No
 tone, or one no site lists, leaves the combined name: the recording could
 be any of them. The channel list (`/api/v1/channels`) carries `sites` and
 the Channels page shows each with its tone. `scanner config retag <config>
-<recordings folder>` (`-n` to preview) re-applies the rule to recordings
-already in the index, after a tone is added or corrected.
+<recordings folder>` (`-n` to preview) renames recordings already in the
+index to the config's current names, by the same rule, after a name, a site
+or a tone changes.
 
 DTMF digits heard in a recording are stored too (`dtmf` in the index and
 API, groups split by a space: `*73 1234#`), from `dtmf::DtmfDecoder`. The
