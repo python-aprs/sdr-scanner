@@ -182,6 +182,9 @@ pub struct Detector {
     /// Per slot: the last block it came back from its hang time (an open
     /// slot rising again), for the pulsed comb guard.
     back_at: Vec<Option<u64>>,
+    /// Per slot in its hang time: blocks in a row it has read over the
+    /// close threshold (see `sustain_blocks`).
+    returning: Vec<u64>,
     attack_blocks: u64,
     hang_blocks: u64,
     preroll_blocks: u64,
@@ -325,6 +328,7 @@ impl Detector {
             close_db: vec![0.0; count],
             attack_centre: vec![(0.0, 0); count],
             back_at: vec![None; count],
+            returning: vec![0; count],
             skipped,
         }
     }
@@ -402,6 +406,19 @@ impl Detector {
     /// the signal was first seen (the pre-roll alone).
     pub fn signal_offset_blocks(&self) -> u64 {
         self.preroll_blocks
+    }
+
+    /// Blocks a signal must hold to open a slot or bring it back from its
+    /// hang time: the attack, plus the TDMA hold for a TDMA slot, whose SNR
+    /// is its peak over that hold, so one block of noise or interference
+    /// would otherwise last a whole attack.
+    fn sustain_blocks(&self, i: usize) -> u64 {
+        self.attack_blocks
+            + if self.slots[i].slot.mode.is_tdma() {
+                self.tdma_blocks as u64
+            } else {
+                0
+            }
     }
 
     pub fn hang_blocks(&self) -> u64 {
@@ -541,12 +558,16 @@ impl Detector {
             let start =
                 open && (self.slots[i].slot.origin == SlotOrigin::Grid || self.is_centred(i));
             let stay = self.squelch_db(i) >= self.close_db[i];
+            let sustain = self.sustain_blocks(i);
+            if !stay || !matches!(self.states[i], SlotState::Hang { .. }) {
+                self.returning[i] = 0;
+            }
             let st = &mut self.stats[i];
             let next = match self.states[i] {
                 SlotState::Idle if start => SlotState::Attack { since: b },
                 SlotState::Idle => SlotState::Idle,
                 SlotState::Attack { since } if open => {
-                    if b + 1 - since >= self.attack_blocks
+                    if b + 1 - since >= sustain
                         && (active < self.params.max_active || self.slots[i].slot.priority)
                     {
                         // If the open was held back (max_active), only the
@@ -571,7 +592,25 @@ impl Detector {
                 SlotState::Attack { .. } => SlotState::Idle,
                 SlotState::Active { start } if stay => SlotState::Active { start },
                 SlotState::Active { start } => SlotState::Hang { start, since: b },
+                SlotState::Hang { start, since }
+                    if stay && !interfered && self.returning[i] + 1 < sustain =>
+                {
+                    // Coming back counts only once it lasts as long as an
+                    // attack: a single block over the threshold is noise or
+                    // a pulse of interference, and letting it restart the
+                    // hang held slots open for minutes.
+                    self.returning[i] += 1;
+                    if b - since >= self.hang_blocks {
+                        events.push(st.close(i, start, since.saturating_sub(1)));
+                        active -= 1;
+                        self.returning[i] = 0;
+                        SlotState::Idle
+                    } else {
+                        SlotState::Hang { start, since }
+                    }
+                }
                 SlotState::Hang { start, .. } if stay && !interfered => {
+                    self.returning[i] = 0;
                     self.back_at[i] = Some(b);
                     SlotState::Active { start }
                 }
@@ -1290,6 +1329,60 @@ mod tests {
             })
             .collect();
         assert_eq!(opened, vec![-50e3]);
+    }
+
+    /// Pulses of interference one block long, every `every` s from `from`
+    /// to `to`, `snr_db` over the noise in a 16 kHz bandwidth at `off`.
+    fn pulses(x: &mut [Complex32], off: f64, snr_db: f64, from: f64, to: f64, every: f64) {
+        let p = params();
+        let fs = p.sample_rate;
+        let amp = (1e-4 * 16e3 / fs * 10f64.powf(snr_db / 10.0)).sqrt() as f32;
+        let mut t = from;
+        while t < to {
+            let at = (t * fs) as usize;
+            for k in 0..p.hop {
+                if let Some(v) = x.get_mut(at + k) {
+                    let ph = (2.0 * PI * off * (at + k) as f64 / fs).rem_euclid(2.0 * PI);
+                    *v += Complex32::from_polar(amp, ph as f32);
+                }
+            }
+            t += every;
+        }
+    }
+
+    #[test]
+    fn interference_pulses_do_not_hold_a_closed_transmission_open() {
+        // Seen live on an Airspy R2 (Nov 2026): lines of interference
+        // pulsing on for a block now and then, more often than the hang
+        // time, kept bringing finished transmissions back for minutes.
+        let mut x = scene(5.0, &[(100e3, 15.0, 0.3, 1.0)], 21);
+        pulses(&mut x, 100e3, 20.0, 1.2, 5.0, 0.5);
+        let plan = vec![slot(100e3, 16e3)];
+        let (_, events, _) = run(&x, &plan, DetectorParams::default());
+        let block = params().block_secs();
+        let closes: Vec<f64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Close { end_block, .. } => Some((end_block + 1) as f64 * block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes.len(), 1, "{events:?}");
+        assert!((closes[0] - 1.0).abs() < 0.1, "closed at {} s", closes[0]);
+    }
+
+    #[test]
+    fn interference_pulses_do_not_open_a_tdma_slot() {
+        // A TDMA slot reads its peak over the TDMA hold, so one block of
+        // interference lasted as long as an attack.
+        let mut x = scene(3.0, &[], 23);
+        pulses(&mut x, 100e3, 20.0, 0.5, 3.0, 0.4);
+        let dmr = Slot {
+            mode: Mode::Dmr,
+            ..slot(100e3, 11e3)
+        };
+        let (_, events, _) = run(&x, &[dmr], DetectorParams::default());
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
