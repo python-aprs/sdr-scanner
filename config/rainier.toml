@@ -41,6 +41,12 @@ name      = "DMR simplex"
 mode      = "dmr"            # talkgroup and radio ids; audio with the mbelib build
 bandwidth = "11 kHz"
 
+[[profiles.rainier-2m.channels]]
+freq      = "146.5000 MHz"
+name      = "WA7DMR Baw Faw Peak DMR (PNW Digital, CC1)"
+mode      = "dmr"
+bandwidth = "11 kHz"
+
 [[profiles.rainier-2m.lockouts]]
 start  = "144.000 MHz"
 stop   = "144.300 MHz"

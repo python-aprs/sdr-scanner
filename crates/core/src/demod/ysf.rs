@@ -2,6 +2,7 @@
 //! one call at a time out (see [`crate::ysf`]).
 
 use super::{Call, CallInfo, Demod};
+use crate::config::Mode;
 use crate::dmr::vocoder::{self, FRAME_SAMPLES, Leveled, Vocoder};
 use crate::ysf::calls::{CallEvent, Calls};
 use crate::ysf::rx::{self, Receiver, RxFrame};
@@ -17,6 +18,8 @@ pub struct YsfVoice {
     events: Vec<CallEvent>,
     out: Vec<Call>,
     vocoder: Option<Box<dyn Vocoder>>,
+    /// Frames received (the receiver only passes frames while locked).
+    received: u32,
 }
 
 impl YsfVoice {
@@ -29,6 +32,7 @@ impl YsfVoice {
             events: Vec::new(),
             out: Vec::new(),
             vocoder: None,
+            received: 0,
         }
     }
 
@@ -77,6 +81,7 @@ impl YsfVoice {
 impl Demod for YsfVoice {
     fn process(&mut self, iq: &[Complex32], _open: bool, _audio: &mut Vec<f32>) {
         self.rx.push(iq, &mut self.frames);
+        self.received += self.frames.len() as u32;
         for f in self.frames.drain(..) {
             self.calls.push(&f, &mut self.events);
         }
@@ -90,6 +95,10 @@ impl Demod for YsfVoice {
 
     fn records_audio(&self) -> bool {
         false
+    }
+
+    fn detected(&self) -> Option<Mode> {
+        (self.received >= 2).then_some(Mode::Ysf)
     }
 
     fn take_calls(&mut self) -> Vec<Call> {

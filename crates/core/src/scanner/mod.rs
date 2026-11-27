@@ -62,6 +62,10 @@ pub struct ScannerConfig {
     /// Fallback grid slots retune to the signal's measured centre, rounded
     /// to this step (Hz). 0 keeps the grid frequency.
     pub grid_tune_step: f64,
+    /// NBFM slots also run the DMR, System Fusion, D-STAR and AFSK1200
+    /// decoders and switch to whichever finds its mode (see
+    /// [`crate::demod::AutoDetect`]).
+    pub auto_detect: bool,
 }
 
 impl Default for ScannerConfig {
@@ -85,6 +89,7 @@ impl Default for ScannerConfig {
             min_channel_rate: 25_000.0,
             parallel: true,
             grid_tune_step: 2500.0,
+            auto_detect: true,
         }
     }
 }
@@ -180,6 +185,9 @@ pub struct ScannerStats {
     pub not_recorded: u64,
     /// Grid detections that retuned onto a signal already being recorded.
     pub duplicates: u64,
+    /// FM recordings thrown away because the transmission turned out to be
+    /// digital voice, digital data or packet (see `ScannerConfig::auto_detect`).
+    pub discarded_digital: u64,
     /// Steady carriers found and locked out (see `ScannerConfig::spur_secs`).
     pub spurs: u64,
     /// AX.25 frames decoded on `afsk1200` slots.
@@ -546,6 +554,17 @@ impl Scanner {
                 c,
                 out,
             );
+            if c.audio && !c.records_audio() {
+                // Turned out digital: its FM recording is only noise.
+                c.audio = false;
+                self.stats.discarded_digital += 1;
+                if let (Some(live), Some(_)) = (&mut self.live, c.live_sent.take()) {
+                    live.push(LiveAudio::End { id: c.id });
+                }
+                if c.confirmed {
+                    out.push(Output::Discard { id: c.id });
+                }
+            }
             if !c.records_audio() {
                 continue;
             }
@@ -651,9 +670,13 @@ impl Scanner {
                     let start = stream(c, at_sample);
                     let id = *next_id;
                     *next_id += 1;
+                    // Recorded under the call's mode, whatever the slot's
+                    // (an NBFM slot that found a digital call).
+                    let mut slot = c.tuned.clone();
+                    slot.mode = info.mode();
                     out.push(Output::Open(TxStart {
                         id,
-                        slot: c.tuned.clone(),
+                        slot,
                         start_sample: start,
                         start_time: clock.time_at(start),
                         audio_rate: AUDIO_RATE,
@@ -872,6 +895,20 @@ impl Scanner {
                     * self.cfg.audio_rate as f64)
                     .max(0.0) as usize;
                 c.flush();
+                // A transmission that went from FM to digital within the
+                // hang time: end its calls too.
+                Self::emit_packets(&self.clock, &mut self.stats, &p, &mut c, out);
+                let snr = self.detector.snr_db(c.slot);
+                Self::emit_calls(
+                    &self.clock,
+                    &mut self.stats,
+                    &p,
+                    &mut self.next_id,
+                    &mut self.live,
+                    snr,
+                    &mut c,
+                    out,
+                );
                 let total = c.emitted + c.pending.len();
                 if keep_audio < total {
                     let cut = keep_audio.saturating_sub(c.emitted);
@@ -1340,6 +1377,36 @@ mod tests {
         );
     }
 
+    /// Recordings opened and not thrown away later.
+    fn kept_opens(out: &[Output]) -> Vec<&TxStart> {
+        let gone: Vec<u64> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Discard { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Open(s) if !gone.contains(&s.id) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The plan for a digital signal at `freq`: one slot listed with its
+    /// mode, or the plain 25 kHz NBFM grid, which has to find the mode itself.
+    fn digital_plan(freq: f64, mode: Mode, listed: bool) -> Vec<Slot> {
+        if !listed {
+            return (-8..=8).map(|k| slot(k as f64 * 25e3)).collect();
+        }
+        let mut s = slot(freq);
+        s.mode = mode;
+        s.bandwidth = 11e3;
+        s.origin = SlotOrigin::Listed;
+        vec![s]
+    }
+
     #[test]
     fn lockout_ranges_catch_retuned_grid_signals() {
         // An off-grid signal at 112.5 kHz heard by the 100 kHz grid slot,
@@ -1577,31 +1644,35 @@ mod tests {
             ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
             x[on + i] += Complex32::from_polar(0.1, ph as f32);
         }
-        let mut s = slot(100e3);
-        s.mode = Mode::Afsk1200;
-        s.origin = SlotOrigin::Listed;
-        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
-        let packets: Vec<&Packet> = out
-            .iter()
-            .filter_map(|o| match o {
-                Output::Packet(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(packets.len(), 1, "{stats:?}");
-        assert_eq!(
-            packets[0].frame.tnc2(),
-            "KF7HVM-9>APRS,WIDE2-1:>scanner test"
-        );
-        let t = packets[0]
-            .time
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-        let end = 0.3 + audio.len() as f64 / 31250.0;
-        assert!((t - end).abs() < 0.05, "{t} vs {end}");
-        assert_eq!(s_opens(&out), 0, "no audio files");
-        assert_eq!(stats.packets, 1);
+        for listed in [true, false] {
+            let mut s = slot(100e3);
+            if listed {
+                s.mode = Mode::Afsk1200;
+                s.origin = SlotOrigin::Listed;
+            }
+            let (out, stats) = collect(&x, &[s], ScannerConfig::default());
+            let packets: Vec<&Packet> = out
+                .iter()
+                .filter_map(|o| match o {
+                    Output::Packet(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(packets.len(), 1, "{stats:?}");
+            assert_eq!(
+                packets[0].frame.tnc2(),
+                "KF7HVM-9>APRS,WIDE2-1:>scanner test"
+            );
+            let t = packets[0]
+                .time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            let end = 0.3 + audio.len() as f64 / 31250.0;
+            assert!((t - end).abs() < 0.05, "{t} vs {end}");
+            assert_eq!(kept_opens(&out).len(), 0, "no audio files");
+            assert_eq!(stats.packets, 1);
+        }
     }
 
     #[test]
@@ -1620,46 +1691,133 @@ mod tests {
             let ph = (2.0 * PI * 100e3 * t).rem_euclid(2.0 * PI);
             *v += b * Complex32::from_polar(1.0, ph as f32);
         }
-        let mut s = slot(100e3);
-        s.mode = Mode::Dmr;
-        s.bandwidth = 11e3;
-        s.origin = SlotOrigin::Listed;
-        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
-        assert_eq!(s_opens(&out), 1, "{stats:?}");
-        let Some(Output::Open(start)) = out.iter().find(|o| matches!(o, Output::Open(_))) else {
-            unreachable!()
-        };
-        assert_eq!(start.audio_rate, 8000);
-        let t0 = start
-            .start_time
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-        // Voice starts after the two header bursts (and their 60 ms frames).
-        assert!((t0 - 0.52).abs() < 0.05, "{t0}");
-        let frames: usize = out
-            .iter()
-            .map(|o| match o {
-                Output::Ambe { frames, .. } => frames.len(),
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(frames, 3 * 6 * 3);
-        assert_eq!(audio_of(&out, start.id).len(), frames * 160);
+        {
+            let listed = true;
+            let plan = digital_plan(100e3, Mode::Dmr, listed);
+            let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+            let opens = kept_opens(&out);
+            assert_eq!(opens.len(), 1, "listed {listed}: {stats:?}");
+            let start = opens[0];
+            assert_eq!(start.slot.mode, Mode::Dmr);
+            assert_eq!(start.audio_rate, 8000);
+            let t0 = start
+                .start_time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            // Voice starts after the two header bursts (and their 60 ms frames).
+            assert!((t0 - 0.52).abs() < 0.05, "{t0}");
+            let frames: usize = out
+                .iter()
+                .map(|o| match o {
+                    Output::Ambe { frames, .. } => frames.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(frames, 3 * 6 * 3);
+            assert_eq!(audio_of(&out, start.id).len(), frames * 160);
+            let ends = closes(&out);
+            assert_eq!(ends.len(), 1);
+            let Some(CallInfo::Dmr(info)) = ends[0].digital.as_ref() else {
+                panic!("call info {:?}", ends[0].digital)
+            };
+            let lc = info.lc.unwrap();
+            assert_eq!((lc.dst, lc.src), (99, 3_171_501));
+            assert_eq!(info.alias.as_deref(), Some("KF7HVM"));
+            assert!(
+                (ends[0].signal_secs - 1.08).abs() < 0.1,
+                "{}",
+                ends[0].signal_secs
+            );
+            assert_eq!((stats.calls, stats.recorded), (1, 1), "{stats:?}");
+        }
+    }
+
+    #[test]
+    fn unlisted_dmr_repeater_is_decoded_not_recorded_as_fm() {
+        use crate::dmr::burst::Source;
+        use crate::dmr::tx::{self, TxCall};
+        let fs = params().sample_rate;
+        // A repeater: a call on TS1 while TS2 idles, then (after the hang
+        // time) a data-only stretch of idle bursts, like the ARS and GPS
+        // bursts a networked repeater passes on.
+        let call = tx::call_bursts(&TxCall::group(3141, 3_150_430, 3), Source::Base);
+        let idle = vec![tx::idle_burst(1); call.len()];
+        let keyup = tx::modulate(&tx::base_symbols([&call, &idle], 1, 4), fs, 0.1);
+        let quiet = vec![tx::idle_burst(1); 40];
+        let data = tx::modulate(&tx::base_symbols([&quiet, &quiet], 1, 0), fs, 0.1);
+        let mut x = scene(6.0, &[]);
+        for (on, bb) in [(0.4, &keyup), (3.5, &data)] {
+            let on = (on * fs) as usize;
+            for (i, (v, b)) in x[on..].iter_mut().zip(bb.iter()).enumerate() {
+                let t = (on + i) as f64 / fs;
+                let ph = (2.0 * PI * 100e3 * t).rem_euclid(2.0 * PI);
+                *v += b * Complex32::from_polar(1.0, ph as f32);
+            }
+        }
+        let plan = digital_plan(100e3, Mode::Dmr, false);
+        let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+        let opens = kept_opens(&out);
+        assert_eq!(opens.len(), 1, "{stats:?}");
+        assert_eq!(opens[0].slot.mode, Mode::Dmr);
         let ends = closes(&out);
         assert_eq!(ends.len(), 1);
         let Some(CallInfo::Dmr(info)) = ends[0].digital.as_ref() else {
             panic!("call info {:?}", ends[0].digital)
         };
-        let lc = info.lc.unwrap();
-        assert_eq!((lc.dst, lc.src), (99, 3_171_501));
-        assert_eq!(info.alias.as_deref(), Some("KF7HVM"));
-        assert!(
-            (ends[0].signal_secs - 1.08).abs() < 0.1,
-            "{}",
-            ends[0].signal_secs
-        );
+        assert_eq!(info.timeslot, Some(1));
+        assert_eq!(info.lc.map(|l| (l.dst, l.src)), Some((3141, 3_150_430)));
+        // Both keyups were FM recordings until DMR showed; neither is kept.
+        assert_eq!(stats.discarded_digital, 2, "{stats:?}");
         assert_eq!((stats.calls, stats.recorded), (1, 1), "{stats:?}");
+
+        let (_, stats) = collect(
+            &x,
+            &plan,
+            ScannerConfig {
+                auto_detect: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!((stats.calls, stats.recorded), (0, 2), "{stats:?}");
+    }
+
+    #[test]
+    fn fusion_repeater_keeps_fm_and_decodes_c4fm() {
+        use crate::ysf::tx::{self, TxCall};
+        let fs = params().sample_rate;
+        // FM for 2 s, then C4FM 0.4 s later: within the hang time, so one
+        // transmission as the detector sees it.
+        let mut x = scene(5.0, &[(-150e3, 800.0, 0.3, 2.3)]);
+        let bb = tx::modulate(
+            &tx::symbols(&tx::call_frames(&TxCall::dn("KF7HVM", 10))),
+            fs,
+            0.1,
+        );
+        let on = (2.7 * fs) as usize;
+        for (i, (v, b)) in x[on..].iter_mut().zip(&bb).enumerate() {
+            let t = (on + i) as f64 / fs;
+            let ph = (2.0 * PI * -150e3 * t).rem_euclid(2.0 * PI);
+            *v += b * Complex32::from_polar(1.0, ph as f32);
+        }
+        let plan = digital_plan(-150e3, Mode::Ysf, false);
+        let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+        let opens = kept_opens(&out);
+        let modes: Vec<Mode> = opens.iter().map(|o| o.slot.mode).collect();
+        assert_eq!(modes, [Mode::Nbfm, Mode::Ysf], "{stats:?}");
+        let fm = audio_of(&out, opens[0].id);
+        let secs = fm.len() as f64 / 8000.0;
+        assert!(secs > 1.8, "{secs}");
+        // The FM recording is muted from the C4FM on.
+        let tail = &fm[((2.9 - 0.3) * 8000.0) as usize..];
+        let last = fm.iter().rposition(|v| v.abs() > 1e-3).unwrap() as f64 / 8000.0;
+        assert!(
+            tail.iter().all(|v| v.abs() < 1e-3),
+            "C4FM in the FM audio until {last} s of {secs}"
+        );
+        let ends = closes(&out);
+        assert_eq!(ends.len(), 2);
+        assert_eq!(stats.discarded_digital, 0, "{stats:?}");
     }
 
     #[test]
@@ -1676,33 +1834,34 @@ mod tests {
             let ph = (2.0 * PI * -150e3 * t).rem_euclid(2.0 * PI);
             *v += b * Complex32::from_polar(1.0, ph as f32);
         }
-        let mut s = slot(-150e3);
-        s.mode = Mode::Ysf;
-        s.bandwidth = 11e3;
-        s.origin = SlotOrigin::Listed;
-        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
-        assert_eq!(s_opens(&out), 1, "{stats:?}");
-        let frames: usize = out
-            .iter()
-            .map(|o| match o {
-                Output::Ambe { frames, .. } => frames.len(),
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(frames, 10 * 5);
-        let ends = closes(&out);
-        assert_eq!(ends.len(), 1);
-        let Some(CallInfo::Ysf(info)) = ends[0].digital.as_ref() else {
-            panic!("call info {:?}", ends[0].digital)
-        };
-        assert_eq!(info.src.as_deref(), Some("KF7HVM"));
-        assert_eq!(info.dg_id, Some(21));
-        // Header, ten voice frames and the terminator: 1.2 s.
-        assert!(
-            (ends[0].signal_secs - 1.2).abs() < 0.1,
-            "{}",
-            ends[0].signal_secs
-        );
+        for listed in [true, false] {
+            let plan = digital_plan(-150e3, Mode::Ysf, listed);
+            let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+            let opens = kept_opens(&out);
+            assert_eq!(opens.len(), 1, "listed {listed}: {stats:?}");
+            assert_eq!(opens[0].slot.mode, Mode::Ysf);
+            let frames: usize = out
+                .iter()
+                .map(|o| match o {
+                    Output::Ambe { frames, .. } => frames.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(frames, 10 * 5);
+            let ends = closes(&out);
+            assert_eq!(ends.len(), 1);
+            let Some(CallInfo::Ysf(info)) = ends[0].digital.as_ref() else {
+                panic!("call info {:?}", ends[0].digital)
+            };
+            assert_eq!(info.src.as_deref(), Some("KF7HVM"));
+            assert_eq!(info.dg_id, Some(21));
+            // Header, ten voice frames and the terminator: 1.2 s.
+            assert!(
+                (ends[0].signal_secs - 1.2).abs() < 0.1,
+                "{}",
+                ends[0].signal_secs
+            );
+        }
     }
 
     #[test]
@@ -1718,36 +1877,37 @@ mod tests {
             let ph = (2.0 * PI * 75e3 * t).rem_euclid(2.0 * PI);
             *v += b * Complex32::from_polar(1.0, ph as f32);
         }
-        let mut s = slot(75e3);
-        s.mode = Mode::Dstar;
-        s.bandwidth = 11e3;
-        s.origin = SlotOrigin::Listed;
-        let (out, stats) = collect(&x, &[s], ScannerConfig::default());
-        assert_eq!(s_opens(&out), 1, "{stats:?}");
-        let frames: usize = out
-            .iter()
-            .map(|o| match o {
-                Output::Ambe { frames, codec, .. } => {
-                    assert_eq!(*codec, crate::dmr::vocoder::Codec::Ambe);
-                    frames.len()
-                }
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(frames, 50);
-        let ends = closes(&out);
-        assert_eq!(ends.len(), 1);
-        let Some(CallInfo::Dstar(info)) = ends[0].digital.as_ref() else {
-            panic!("call info {:?}", ends[0].digital)
-        };
-        let h = info.header.as_ref().expect("header");
-        assert_eq!(h.my.as_deref(), Some("KF7HVM"));
-        // Header (137.5 ms) and fifty 20 ms frames.
-        assert!(
-            (ends[0].signal_secs - 1.14).abs() < 0.1,
-            "{}",
-            ends[0].signal_secs
-        );
+        for listed in [true, false] {
+            let plan = digital_plan(75e3, Mode::Dstar, listed);
+            let (out, stats) = collect(&x, &plan, ScannerConfig::default());
+            let opens = kept_opens(&out);
+            assert_eq!(opens.len(), 1, "listed {listed}: {stats:?}");
+            assert_eq!(opens[0].slot.mode, Mode::Dstar);
+            let frames: usize = out
+                .iter()
+                .map(|o| match o {
+                    Output::Ambe { frames, codec, .. } => {
+                        assert_eq!(*codec, crate::dmr::vocoder::Codec::Ambe);
+                        frames.len()
+                    }
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(frames, 50);
+            let ends = closes(&out);
+            assert_eq!(ends.len(), 1);
+            let Some(CallInfo::Dstar(info)) = ends[0].digital.as_ref() else {
+                panic!("call info {:?}", ends[0].digital)
+            };
+            let h = info.header.as_ref().expect("header");
+            assert_eq!(h.my.as_deref(), Some("KF7HVM"));
+            // Header (137.5 ms) and fifty 20 ms frames.
+            assert!(
+                (ends[0].signal_secs - 1.14).abs() < 0.1,
+                "{}",
+                ends[0].signal_secs
+            );
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! at a time out (see [`crate::dstar`]).
 
 use super::{Call, CallInfo, Demod};
+use crate::config::Mode;
 use crate::dmr::vocoder::{self, Codec, FRAME_SAMPLES, Leveled, Vocoder};
 use crate::dstar::calls::{CallEvent, Calls};
 use crate::dstar::rx::{self, Receiver, RxEvent};
@@ -17,6 +18,9 @@ pub struct DstarVoice {
     events: Vec<CallEvent>,
     out: Vec<Call>,
     vocoder: Option<Box<dyn Vocoder>>,
+    /// A header checked, or voice frames carrying the data sync.
+    headers: u32,
+    syncs: u32,
 }
 
 impl DstarVoice {
@@ -29,6 +33,8 @@ impl DstarVoice {
             events: Vec::new(),
             out: Vec::new(),
             vocoder: None,
+            headers: 0,
+            syncs: 0,
         }
     }
 
@@ -77,6 +83,11 @@ impl Demod for DstarVoice {
     fn process(&mut self, iq: &[Complex32], _open: bool, _audio: &mut Vec<f32>) {
         self.rx.push(iq, &mut self.rx_events);
         for e in self.rx_events.drain(..) {
+            match &e {
+                RxEvent::Header { .. } => self.headers += 1,
+                RxEvent::Frame { index, .. } if index % 21 == 0 => self.syncs += 1,
+                _ => {}
+            }
             self.calls.push(&e, &mut self.events);
         }
         self.convert();
@@ -89,6 +100,11 @@ impl Demod for DstarVoice {
 
     fn records_audio(&self) -> bool {
         false
+    }
+
+    /// A header (its CRC checked), or two data syncs for late entry.
+    fn detected(&self) -> Option<Mode> {
+        (self.headers > 0 || self.syncs >= 2).then_some(Mode::Dstar)
     }
 
     fn take_calls(&mut self) -> Vec<Call> {

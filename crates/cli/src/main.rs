@@ -303,6 +303,11 @@ struct Tuning {
     /// Run channels on one thread.
     #[arg(long)]
     serial: bool,
+    /// Only decode what each channel's `mode` says. By default NBFM
+    /// channels (listed or grid) also listen for DMR, System Fusion, D-STAR
+    /// and AFSK1200 packet, and switch to whichever they find.
+    #[arg(long)]
+    no_auto_detect: bool,
     /// Skip the Opus copy of each recording (the web UI then plays the WAV).
     #[arg(long)]
     no_opus: bool,
@@ -388,6 +393,7 @@ impl Tuning {
             noise_squelch_db: self.noise_squelch,
             spur_secs: self.spur_secs,
             parallel: !self.serial,
+            auto_detect: !self.no_auto_detect,
             ..Default::default()
         }
     }
@@ -1092,6 +1098,8 @@ fn run(a: RunArgs) -> Result<()> {
                 "recorded": stats.recorded,
                 "discarded_short": stats.discarded_short,
                 "discarded_silent": stats.discarded_silent,
+                "discarded_digital": stats.discarded_digital,
+                "calls": stats.calls,
                 "spurs": stats.spurs,
                 "packets": stats.packets,
                 "not_recorded": stats.not_recorded,
@@ -1120,11 +1128,14 @@ fn run(a: RunArgs) -> Result<()> {
             }
         }
         println!(
-            "{} transmissions ({} opened, {} too short, {} not recorded), {:.1} s of audio, {:.1} MB WAV, {:.1} MB Opus",
+            "{} transmissions ({} opened, {} too short, {} not recorded, {} turned out digital, {} digital calls, {} packets), {:.1} s of audio, {:.1} MB WAV, {:.1} MB Opus",
             rec.files,
             stats.opened,
             stats.discarded_short + stats.discarded_silent,
             stats.not_recorded,
+            stats.discarded_digital,
+            stats.calls,
+            stats.packets,
             rec.audio_secs,
             rec.bytes as f64 / 1e6,
             rec.opus_bytes as f64 / 1e6

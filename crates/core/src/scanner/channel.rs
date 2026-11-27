@@ -29,6 +29,9 @@ pub(super) struct Channel {
     /// Audio samples sent to live listeners so far (counted like `emitted`),
     /// or `None` until the channel is announced to them.
     pub live_sent: Option<usize>,
+    /// Still recording FM audio (false once its demodulator stopped: a
+    /// mode that never records audio, or FM that turned out digital).
+    pub audio: bool,
     /// Digital calls being recorded, by the demodulator's call key.
     pub calls: [Option<CallRec>; 2],
     iq: Vec<Complex32>,
@@ -56,6 +59,7 @@ impl Channel {
         demod: Box<dyn Demod>,
         audio_t0: i64,
     ) -> Self {
+        let audio = demod.records_audio();
         Channel {
             id,
             slot,
@@ -68,6 +72,7 @@ impl Channel {
             pending: Vec::new(),
             emitted: 0,
             live_sent: None,
+            audio,
             calls: [None, None],
             iq: Vec::new(),
         }
