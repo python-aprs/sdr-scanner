@@ -56,7 +56,9 @@ its inverted partner are the same waveform (023 N is 047 I); the
 normal-polarity name wins.
 
 The tone also picks the repeater on an output several repeaters share. A
-`[[repeaters]]` entry can list `sites = [{ call, location, tone | dcs }, ...]`;
+`[[repeaters]]` entry can list `sites = [{ call, location, tone | dcs }, ...]`
+(plus `tone_out`/`dcs_out` where a site transmits a different tone than it
+takes: output recordings match on that, input recordings on the access tone);
 the slot (output and input) keeps the entry's combined `name`, and a
 recording on it whose tone matches one site's (CTCSS within 1 Hz, DCS by
 code in either polarity) has its `channel` set to that site's name, or to
@@ -64,8 +66,16 @@ the matching sites joined with ` / ` when linked sites share a tone. No
 tone, or one no site lists, leaves the combined name: the recording could
 be any of them. The channel list (`/api/v1/channels`) carries `sites` and
 the Channels page shows each with its tone. `scanner config retag <config>
-<recordings folder>` (`-n` to preview) re-applies the rule to recordings
-already in the index, after a tone is added or corrected.
+<recordings folder>` (`-n` to preview) renames recordings already in the
+index to the config's current names, by the same rule, after a name, a site
+or a tone changes.
+
+A config file can pull in others with a top-level `include = ["file.toml"]`
+(relative to the including file, resolved by `ConfigFile::load`). Their
+profiles' channels, repeaters and lockouts add to the same-named profile;
+a setting such as `span` may come from only one of the files. `rainier.toml`
+uses it for `rainier-custom.toml`, the hand-kept entries that survive a
+regeneration of the generated repeater lists.
 
 DTMF digits heard in a recording are stored too (`dtmf` in the index and
 API, groups split by a space: `*73 1234#`), from `dtmf::DtmfDecoder`. The

@@ -164,3 +164,76 @@ def test_repeaterbook_all_adds_uncoordinated():
     assert f[147.36].dcs == "754" and f[147.36].source == "RepeaterBook"
     assert 147.38 not in f
     assert f[147.1].source == "WWARA"  # same call and output: not added twice
+
+
+def test_repeaterbook_alone_is_the_whole_list(tmp_path, capsys):
+    rb = tmp_path / "rb.json"
+    rb.write_text(RB)
+    out = tmp_path / "out.toml"
+    assert ir.main(["--repeaterbook", str(rb), "--lat", "46.089", "--lon", "-122.936", "-o", str(out)]) == 0
+    text = out.read_text()
+    assert 'name     = "W1ZZZ Kelso, WA"' in text and 'name     = "K7BBB Gaston, OR"' in text
+    assert "not coordinated" not in text
+    assert "W1OFF" not in text
+    assert "3 RepeaterBook records" in capsys.readouterr().err
+
+
+# The website's JSON export (proximity search, Export > JSON).
+RB_WEB = """{"schema_version": 1, "export_format": "json", "count": 3, "records": [
+ {"callsign": "N7DEM", "freq_mhz": "147.260000", "input_freq": "147.860000", "offset_mhz": "0.60000000000002",
+  "tone": "114.8", "city": "Longview", "county": "Cowlitz", "state": "WA", "country": "US", "landmark": "",
+  "lat": "46.16120148", "lon": "-122.88700104", "mixed_mode": "Yes", "dmr": "", "dmr_cc": "0", "dstar_node": "",
+  "nxdn": "", "p25": "", "ysf": "", "m17": "", "wide_area": "Yes", "pl_tone": "114.8", "tsq_tone": "114.8"},
+ {"callsign": "W1DIG", "freq_mhz": "145.330000", "input_freq": "", "offset_mhz": "-0.59999999999999",
+  "tone": "CSQ", "city": "Kelso", "state": "WA", "lat": "46.15", "lon": "-122.90", "mixed_mode": "",
+  "dmr": "Yes", "dmr_cc": "1", "pl_tone": "CSQ"},
+ {"callsign": "W1ANA", "freq_mhz": "146.760000", "input_freq": "146.160000", "tone": "D023",
+  "city": "Rainier", "state": "OR", "lat": "46.09", "lon": "-122.94", "mixed_mode": "", "pl_tone": "D023"}
+]}"""
+
+
+def test_repeaterbook_website_export():
+    rb = {r.call: r for r in ir.parse_repeaterbook(RB_WEB)}
+    n = rb["N7DEM"]
+    assert (n.output_mhz, n.input_mhz, n.tone, n.location, n.modes) == (147.26, 147.86, 114.8, "Longview, WA", ["FM"])
+    d = rb["W1DIG"]
+    assert d.modes == ["DMR"] and d.primary_mode == "dmr" and d.tone is None
+    assert d.offset_khz == -600  # input from the offset
+    a = rb["W1ANA"]
+    assert a.modes == ["FM"] and a.dcs == "023"
+    assert a._latlon == (46.09, -122.94)
+
+
+def test_output_tone_where_it_differs():
+    # 147.18: NM7R takes 82.5 but transmits 103.5; W7LT uses 103.5 both ways.
+    web = """{"records": [
+     {"callsign": "NM7R", "freq_mhz": "147.18", "input_freq": "147.78", "city": "Chinook", "state": "WA",
+      "lat": "46.29", "lon": "-123.90", "mixed_mode": "Yes", "pl_tone": "82.5", "tsq_tone": "103.5"},
+     {"callsign": "W7LT", "freq_mhz": "147.18", "input_freq": "147.78", "city": "Clackamas", "state": "OR",
+      "lat": "45.45", "lon": "-122.55", "mixed_mode": "Yes", "pl_tone": "103.5", "tsq_tone": "103.5"}]}"""
+    reps, _ = ir.select([], [], ir.BANDS["2m"], **SITE, repeaterbook=ir.parse_repeaterbook(web), repeaterbook_all=True)
+    toml = ir.to_toml(reps, "p")
+    assert '{ call = "NM7R", location = "Chinook, WA", tone = 82.5, tone_out = 103.5 },' in toml
+    assert '{ call = "W7LT", location = "Clackamas, OR", tone = 103.5 },' in toml
+
+
+def test_tone_override_with_output_tone():
+    reps = ir.parse_wwara(WWARA)
+    ir.apply_tones(reps, ["W1AAA@147.10=82.5/103.5", "W1CCC@147.3=D023/D754"], [])
+    f = by_freq(reps)
+    assert (f[147.1].tone, f[147.1].tone_out) == (82.5, 103.5)
+    assert (f[147.3].dcs, f[147.3].dcs_out, f[147.3].tone) == ("023", "754", None)
+    try:
+        ir.apply_tones(reps, ["W1AAA@147.10=82.5/xyz"], [])
+    except ValueError as e:
+        assert "CALL@MHZ" in str(e)
+    else:
+        raise AssertionError("bad output tone accepted")
+
+
+def test_exclude_drops_one_site_of_a_shared_output():
+    reps, log = ir.select(ir.parse_wwara(WWARA), ir.parse_orrc(ORRC), ir.BANDS["2m"], **SITE, excludes=["k7eee@147.10"])
+    r = by_freq(reps)[147.1]
+    assert (r.call, r.source, r.sites) == ("W1AAA", "WWARA", [])
+    _, log = ir.select(ir.parse_wwara(WWARA), [], ir.BANDS["2m"], **SITE, excludes=["W9ZZZ@147.10"])
+    assert any("W9ZZZ" in line for line in log)
