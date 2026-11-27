@@ -59,7 +59,7 @@ enum Cmd {
     /// Scan a recording: detect transmissions and write one WAV per
     /// transmission, plus `index.sqlite`, under `--out`.
     Run(RunArgs),
-    /// List SDRplay radios the API can see.
+    /// List the SDRplay and Airspy radios this build can see.
     Devices,
     /// Manage admin accounts, API tokens and sessions for the web API.
     Admin(admin::AdminArgs),
@@ -141,8 +141,8 @@ struct CalibrateArgs {
 
 #[derive(clap::Args)]
 struct ServeArgs {
-    /// `sdrplay` (the first SDRplay radio), `sdrplay:<serial>`, or
-    /// `replay:<recording>` / `loop:<recording>` (a recording played at its
+    /// `sdrplay` (the first SDRplay radio), `sdrplay:<serial>`, `airspy`
+    /// (the first Airspy), `airspy:<hex serial>`, or `replay:<recording>` / `loop:<recording>` (a recording played at its
     /// real rate through the live path).
     #[arg(long)]
     source: serve::SourceSpec,
@@ -186,26 +186,36 @@ struct ServeArgs {
     insecure_cookies: bool,
 }
 
-/// Radio settings for `serve --source sdrplay`.
+/// Radio settings for `serve --source sdrplay|airspy`.
 #[derive(clap::Args)]
 struct RadioArgs {
     /// Tuner frequency in MHz (default: the middle of the profile's span plus
     /// 12.5 kHz, so the DC residual sits between 25 kHz channels).
     #[arg(long)]
     center_mhz: Option<f64>,
-    /// Sample rate in S/s (2 to 10.66 MS/s).
-    #[arg(long, default_value_t = 8e6)]
-    rate: f64,
-    /// LNA state: 0 is the most gain (0 to 9 for an RSP1A on 2 m).
+    /// Sample rate in S/s (default: 8 MS/s for SDRplay, which takes 2 to
+    /// 10.66 MS/s; 10 MS/s for an Airspy R2, which takes 10 or 2.5 MS/s; a
+    /// Mini takes 6 or 3 MS/s).
+    #[arg(long)]
+    rate: Option<f64>,
+    /// Airspy gain: `linearity:N` or `sensitivity:N` (presets, 0 to 21,
+    /// more is more gain), `manual:LNA,MIXER,VGA` (0-14, 0-15, 0-15), or
+    /// `agc:VGA`.
+    #[arg(long, default_value_t = scanner_sources::airspy::AirspyGain::default())]
+    airspy_gain: scanner_sources::airspy::AirspyGain,
+    /// Pack the Airspy's 12-bit samples on USB (less bandwidth, more CPU).
+    #[arg(long)]
+    packing: bool,
+    /// SDRplay LNA state: 0 is the most gain (0 to 9 for an RSP1A on 2 m).
     #[arg(long, default_value_t = 3)]
     lna: u8,
-    /// IF gain reduction in dB, 20 to 59 (more is less gain).
+    /// SDRplay IF gain reduction in dB, 20 to 59 (more is less gain).
     #[arg(long, default_value_t = 40)]
     gr: u8,
     /// IF filter bandwidth in kHz (8000, 7000, 6000, 5000, 1536, ...).
     #[arg(long, default_value_t = 8000)]
     if_bw_khz: u32,
-    /// Turn on the radio's AGC with this set point in dBFS (e.g. -30).
+    /// Turn on the SDRplay radio's AGC with this set point in dBFS (e.g. -30).
     /// Off by default: fixed gain keeps the noise floor steady.
     #[arg(long, allow_hyphen_values = true)]
     agc: Option<i32>,
@@ -221,23 +231,41 @@ struct RadioArgs {
     /// Switch in the RSP1A's DAB band-stop filter.
     #[arg(long)]
     dab_notch: bool,
-    /// Use USB bulk transfers instead of isochronous.
+    /// SDRplay: use USB bulk transfers instead of isochronous.
     #[arg(long)]
     usb_bulk: bool,
 }
 
 impl RadioArgs {
+    fn center_hz(&self, profile: &scanner_core::config::Profile) -> f64 {
+        self.center_mhz
+            .map(|m| m * 1e6)
+            .unwrap_or(profile.span.center() + 12.5e3)
+    }
+
+    fn airspy(
+        &self,
+        profile: &scanner_core::config::Profile,
+    ) -> scanner_sources::airspy::AirspyConfig {
+        scanner_sources::airspy::AirspyConfig {
+            serial: None,
+            sample_rate: self.rate.unwrap_or(10e6),
+            center_hz: self.center_hz(profile),
+            gain: self.airspy_gain,
+            ppm: self.ppm,
+            bias_t: self.bias_t,
+            packing: self.packing,
+        }
+    }
+
     fn sdrplay(
         &self,
         profile: &scanner_core::config::Profile,
     ) -> scanner_sources::sdrplay::SdrplayConfig {
         scanner_sources::sdrplay::SdrplayConfig {
             serial: None,
-            sample_rate: self.rate,
-            center_hz: self
-                .center_mhz
-                .map(|m| m * 1e6)
-                .unwrap_or(profile.span.center() + 12.5e3),
+            sample_rate: self.rate.unwrap_or(8e6),
+            center_hz: self.center_hz(profile),
             bandwidth_khz: self.if_bw_khz,
             lna_state: self.lna,
             gr_db: self.gr,
@@ -447,18 +475,23 @@ fn main() -> Result<()> {
         Cmd::Serve(a) => {
             let (profile, plan) = a.tuning.load()?;
             let sdrplay = a.radio.sdrplay(&profile);
-            if matches!(a.source, serve::SourceSpec::Sdrplay { .. }) {
-                sdrplay
-                    .validate()
-                    .map_err(|e| anyhow::anyhow!("radio settings: {e}"))?;
-                let half = sdrplay.sample_rate / 2.0;
-                if profile.span.start.0 < sdrplay.center_hz - half
-                    || profile.span.stop.0 > sdrplay.center_hz + half
-                {
+            let airspy = a.radio.airspy(&profile);
+            let tuned = match a.source {
+                serve::SourceSpec::Sdrplay { .. } => {
+                    Some((sdrplay.validate(), sdrplay.sample_rate, sdrplay.center_hz))
+                }
+                serve::SourceSpec::Airspy { .. } => {
+                    Some((airspy.validate(), airspy.sample_rate, airspy.center_hz))
+                }
+                serve::SourceSpec::Replay { .. } => None,
+            };
+            if let Some((valid, rate, center)) = tuned {
+                valid.map_err(|e| anyhow::anyhow!("radio settings: {e}"))?;
+                let half = rate / 2.0;
+                if profile.span.start.0 < center - half || profile.span.stop.0 > center + half {
                     eprintln!(
-                        "warning: {} S/s at {} covers only part of the profile's span",
-                        sdrplay.sample_rate,
-                        Hz(sdrplay.center_hz)
+                        "warning: {rate} S/s at {} covers only part of the profile's span",
+                        Hz(center)
                     );
                 }
             }
@@ -472,6 +505,7 @@ fn main() -> Result<()> {
             serve::serve(serve::ServeOptions {
                 source: a.source,
                 sdrplay,
+                airspy,
                 profile_name: profile.name.clone(),
                 http,
                 public: scanner_web::Public {
@@ -516,14 +550,49 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(feature = "sdrplay")]
 fn devices() -> Result<()> {
-    let devs = scanner_sources::sdrplay::list_devices()?;
-    if devs.is_empty() {
-        println!("no SDRplay radios found");
+    if !cfg!(any(feature = "sdrplay", feature = "airspy")) {
+        bail!(
+            "this scanner was built without radio support; rebuild with `--features sdrplay` \
+             and/or `--features airspy`"
+        );
     }
-    for d in devs {
-        println!("sdrplay:{}  {}", d.serial, d.model);
+    #[cfg(feature = "sdrplay")]
+    {
+        match scanner_sources::sdrplay::list_devices() {
+            Ok(devs) if devs.is_empty() => println!("no SDRplay radios found"),
+            Ok(devs) => {
+                for d in devs {
+                    println!("sdrplay:{}  {}", d.serial, d.model);
+                }
+            }
+            Err(e) => println!("SDRplay: {e}"),
+        }
+    }
+    #[cfg(feature = "airspy")]
+    {
+        match scanner_sources::airspy::list_devices() {
+            Ok(devs) if devs.is_empty() => println!("no Airspy radios found"),
+            Ok(devs) => {
+                for d in devs {
+                    let rates: Vec<String> = d
+                        .sample_rates
+                        .iter()
+                        .map(|r| format!("{}", *r as f64 / 1e6))
+                        .collect();
+                    println!(
+                        "airspy:{:016X}  Airspy {}  {} MS/s  {}",
+                        d.serial,
+                        d.model(),
+                        rates.join(", "),
+                        d.firmware
+                            .as_deref()
+                            .unwrap_or("(busy: in use by another program?)")
+                    );
+                }
+            }
+            Err(e) => println!("Airspy: {e}"),
+        }
     }
     Ok(())
 }
@@ -665,11 +734,6 @@ fn calibrate(a: CalibrateArgs) -> Result<()> {
 
 #[cfg(not(feature = "sdrplay"))]
 fn calibrate(_: CalibrateArgs) -> Result<()> {
-    bail!("this scanner was built without SDRplay support; rebuild with `--features sdrplay`")
-}
-
-#[cfg(not(feature = "sdrplay"))]
-fn devices() -> Result<()> {
     bail!("this scanner was built without SDRplay support; rebuild with `--features sdrplay`")
 }
 

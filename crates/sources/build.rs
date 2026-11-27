@@ -1,8 +1,41 @@
-//! Compiles the SDRplay shim when the `sdrplay` feature is on.
+//! Compiles the SDRplay shim when the `sdrplay` feature is on, and finds
+//! libairspy when the `airspy` feature is on.
 
 fn main() {
     #[cfg(feature = "sdrplay")]
     sdrplay();
+    #[cfg(feature = "airspy")]
+    airspy();
+}
+
+/// Tell the linker where libairspy is (the library itself is named by
+/// `#[link]` in `airspy/ffi.rs`): AIRSPY_LIB_DIR if set, else pkg-config's
+/// `libairspy`, else the usual prefixes.
+#[cfg(feature = "airspy")]
+fn airspy() {
+    println!("cargo:rerun-if-env-changed=AIRSPY_LIB_DIR");
+    if let Some(dir) = std::env::var_os("AIRSPY_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
+        return;
+    }
+    let pc = std::process::Command::new("pkg-config")
+        .args(["--libs-only-L", "libairspy"])
+        .output();
+    if let Ok(out) = pc
+        && out.status.success()
+    {
+        for flag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            if let Some(dir) = flag.strip_prefix("-L") {
+                println!("cargo:rustc-link-search=native={dir}");
+            }
+        }
+        return;
+    }
+    for dir in ["/opt/homebrew/lib", "/usr/local/lib"] {
+        if std::path::Path::new(dir).exists() {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
+    }
 }
 
 #[cfg(feature = "sdrplay")]

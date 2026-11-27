@@ -1,6 +1,6 @@
 [package]
 name = "scanner-sources"
-description = "IQ sample sources for sdr-scanner: files (SigMF), SDRplay"
+description = "IQ sample sources for sdr-scanner: files (SigMF), SDRplay, Airspy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,12 +10,13 @@ repository.workspace = true
 [features]
 default = []
 # Hardware backends are feature-gated so the rest of the workspace builds and
-# tests without a vendor SDK installed. (Airspy gets an `airspy` feature when
-# its backend is written.)
+# tests without a vendor SDK installed.
 # Needs the SDRplay API 3.x header (sdrplay_api.h) at build time; set
 # SDRPLAY_API_INCLUDE if it is not in /usr/local/include. The library is
 # opened at run time.
 sdrplay = ["dep:cc"]
+# Links libairspy (found with pkg-config, or AIRSPY_LIB_DIR). Airspy R2/Mini.
+airspy = []
 
 [dependencies]
 scanner-core.workspace = true

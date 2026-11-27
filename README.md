@@ -10,7 +10,7 @@ Needs stable Rust 1.85+ and CMake (libopus is built from source).
 cargo build --release -p scanner-cli
 ```
 
-The binary is `target/release/scanner`. To use an SDRplay radio, install the SDRplay API 3.x from sdrplay.com and build with `--features sdrplay`.
+The binary is `target/release/scanner`. To use an SDRplay radio, install the SDRplay API 3.x from sdrplay.com and build with `--features sdrplay`. For an Airspy R2 or Mini, install libairspy (`brew install airspy`, or `apt install libairspy-dev`) and build with `--features airspy`; `scanner devices` lists what it finds.
 
 Every NBFM channel, listed or on the fallback grid, also listens for DMR, System Fusion (C4FM), D-STAR and AFSK1200 packet. When one of them shows up (two DMR or C4FM syncs, a D-STAR header, a packet that passes its FCS), the channel switches to that decoder: calls are recorded under their own mode and packets are logged, and the FM recording of the digital noise is thrown away. An FM transmission that runs on into C4FM within the hang time (a Fusion repeater) keeps its FM part. `--no-auto-detect` turns this off, so only a channel's `mode` decides.
 
