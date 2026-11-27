@@ -1,6 +1,6 @@
 //! `scanner serve`: the long-running scanner (PLAN.md 3.4).
 //!
-//! A radio feeds a lock-free ring: an SDRplay device's stream callback, or a
+//! A radio feeds a lock-free ring: an SDRplay or Airspy stream callback, or a
 //! SigMF recording replayed at its real rate (optionally looped), which
 //! exercises exactly the same path (see `scanner_sources::radio`). The DSP
 //! thread reads the ring, runs the scanner and hands outputs on (console,
@@ -23,7 +23,7 @@ use num_complex::Complex32;
 use scanner_core::scanner::{Output, Scanner, ScannerConfig};
 use scanner_core::units::Hz;
 use scanner_sources::Source;
-use scanner_sources::radio::{BLOCK, Radio, Replay, SdrplayRadio, Session, reopen};
+use scanner_sources::radio::{AirspyRadio, BLOCK, Radio, Replay, SdrplayRadio, Session, reopen};
 use scanner_store::Recorder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +41,8 @@ pub enum SourceSpec {
     Replay { path: PathBuf, looped: bool },
     /// An SDRplay radio (RSP1A), optionally by serial number.
     Sdrplay { serial: Option<String> },
+    /// An Airspy (R2 or Mini), optionally by serial number.
+    Airspy { serial: Option<u64> },
 }
 
 impl std::str::FromStr for SourceSpec {
@@ -66,18 +68,32 @@ impl std::str::FromStr for SourceSpec {
                 serial: Some(serial.into()).filter(|s: &String| !s.is_empty()),
             });
         }
-        match s {
-            "airspy" => Err("airspy: the Airspy backend is not written yet".into()),
-            _ => Err(format!(
-                "unknown source {s:?} (try sdrplay, sdrplay:<serial>, replay:<recording> or loop:<recording>)"
-            )),
+        if s == "airspy" {
+            return Ok(SourceSpec::Airspy { serial: None });
         }
+        if let Some(serial) = s.strip_prefix("airspy:") {
+            return Ok(SourceSpec::Airspy {
+                serial: match serial {
+                    "" => None,
+                    s => Some(scanner_sources::airspy::parse_serial(s)?),
+                },
+            });
+        }
+        Err(format!(
+            "unknown source {s:?} (try sdrplay, sdrplay:<serial>, airspy, airspy:<serial>, \
+             replay:<recording> or loop:<recording>)"
+        ))
     }
 }
 
 impl SourceSpec {
-    /// The radio this names, with `sdrplay` settings for an SDRplay one.
-    fn radio(&self, sdrplay: &scanner_sources::sdrplay::SdrplayConfig) -> Box<dyn Radio> {
+    /// The radio this names, with `sdrplay` or `airspy` settings for one of
+    /// those.
+    fn radio(
+        &self,
+        sdrplay: &scanner_sources::sdrplay::SdrplayConfig,
+        airspy: &scanner_sources::airspy::AirspyConfig,
+    ) -> Box<dyn Radio> {
         match self {
             SourceSpec::Replay { path, looped } => Box::new(Replay {
                 path: path.clone(),
@@ -89,6 +105,12 @@ impl SourceSpec {
                     ..sdrplay.clone()
                 },
             }),
+            SourceSpec::Airspy { serial } => Box::new(AirspyRadio {
+                cfg: scanner_sources::airspy::AirspyConfig {
+                    serial: *serial,
+                    ..airspy.clone()
+                },
+            }),
         }
     }
 
@@ -96,6 +118,7 @@ impl SourceSpec {
         match self {
             SourceSpec::Replay { path, .. } => format!("opening {}", path.display()),
             SourceSpec::Sdrplay { .. } => "opening the SDRplay radio".into(),
+            SourceSpec::Airspy { .. } => "opening the Airspy".into(),
         }
     }
 }
@@ -105,6 +128,8 @@ pub struct ServeOptions<'a> {
     /// Radio settings for `SourceSpec::Sdrplay` (the serial comes from the
     /// source spec).
     pub sdrplay: scanner_sources::sdrplay::SdrplayConfig,
+    /// Radio settings for `SourceSpec::Airspy` (likewise).
+    pub airspy: scanner_sources::airspy::AirspyConfig,
     pub profile_name: String,
     /// Serve the HTTP API here.
     pub http: Option<std::net::SocketAddr>,
@@ -143,7 +168,7 @@ pub fn serve(o: ServeOptions) -> Result<()> {
         .context("installing Ctrl-C handler")?;
     }
 
-    let radio = o.source.radio(&o.sdrplay);
+    let radio = o.source.radio(&o.sdrplay, &o.airspy);
     let mut session = radio
         .open(&stop, &note)
         .with_context(|| o.source.describe())?;

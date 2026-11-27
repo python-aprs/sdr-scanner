@@ -10,7 +10,7 @@ crates/
   core/      band-profile config, sample-counter clock, PSD + peak finding,
              DSP (dsp.rs), fast-convolution channelizer (channelizer.rs),
              detector + slot state machine (detector.rs), pipeline (scanner.rs)
-  sources/   Source trait, SigMF FileSource; Airspy/SDRplay stubs (Phase 2)
+  sources/   Source trait, SigMF FileSource, SDRplay and Airspy radios
   store/     WAV and Ogg Opus writers, SQLite databases, recorder thread
   cli/       the `scanner` binary
   web/       HTTP API (axum): status, recordings search, audio; role guards
@@ -142,7 +142,7 @@ as a receive-only TNC. No APRS field parsing happens here.
 long-running mode: a radio thread pushes samples into a lock-free ring
 (`scanner_sources::ring`, drops counted and zero-filled so timestamps never
 slip), the DSP thread scans, and the recorder thread writes. The source is a
-radio (`--source sdrplay`, below) or a recording replayed at its real rate
+radio (`--source sdrplay` or `--source airspy`, below) or a recording replayed at its real rate
 (`replay:` once, `loop:` forever). Ctrl-C closes open transmissions and exits. It prints a status line
 (DSP load, ring fill, drops, active channels) every `--status-every` seconds.
 
@@ -404,8 +404,39 @@ reports those steps.
 stand-in header and runs `serve` against a fake API library that streams a
 keyed carrier, so the whole path can be exercised without the SDK or a radio.
 
-The Airspy backend (libairspy, behind an `airspy` feature) comes later; the
-feature is added along with it.
+### Airspy (R2, Mini)
+
+The Airspy backend is behind the `airspy` cargo feature and links libairspy
+(open source; `brew install airspy` on macOS, `apt install libairspy-dev` on
+Debian). The build finds it with `pkg-config libairspy`, or set
+`AIRSPY_LIB_DIR`. No background service is involved: libairspy talks to the
+radio over libusb while `scanner` runs.
+
+```sh
+cargo build --release -p scanner-cli --features airspy   # or airspy,sdrplay
+target/release/scanner devices        # airspy:<serial>  Airspy R2  10, 2.5 MS/s  <firmware>
+target/release/scanner serve --source airspy --config config/rainier.toml \
+    --out out/live [--airspy-gain linearity:14 --rate 10e6 --center-mhz 146.0125]
+```
+
+`--source airspy:<serial>` picks one radio by the hex serial `devices` (or
+`airspy_info`) prints. Radio options: `--rate` (10 or 2.5 MS/s for an R2, 6
+or 3 for a Mini; default 10 MS/s), `--airspy-gain` (`linearity:N` or
+`sensitivity:N`, presets 0–21 where more is more gain; `manual:LNA,MIXER,VGA`;
+`agc:VGA`), `--center-mhz`, `--ppm` (applied to the tuning frequency),
+`--bias-t`, `--packing` (12-bit packing on USB). The SDRplay-only options
+(`--lna`, `--gr`, `--if-bw-khz`, `--agc`, notches) are ignored.
+
+How it fits: `crates/sources/src/airspy/ffi.rs` declares the libairspy calls
+we use (no C shim, the header is public and stable). libairspy converts the
+R2's real 20 MS/s ADC stream to float IQ on its own thread, and
+`scanner_sources::airspy::StreamState` (unit tested without the library)
+gathers its ~65k-sample transfers into ring blocks. Buffers libairspy drops
+when its consumer falls behind are reported per transfer and zero-filled, so
+timestamps stay right. Unplugging stops libairspy's stream; the radio thread
+sees that and `serve` reopens the radio like it does for an SDRplay. The R2
+samples real, so there is no DC spike at the tuned frequency; the default
+`--dc-notch` costs nothing there since the LO sits between channels.
 
 
 ### DMR and the AMBE+2 vocoder (`mbelib`)

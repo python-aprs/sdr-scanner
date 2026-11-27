@@ -30,6 +30,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       # The SDRplay backend builds against a stand-in header; keep it building.
       - run: cargo clippy -p scanner-sources --all-targets --features sdrplay
+      # The Airspy backend only links libairspy at link time, so it can be
+      # checked without the library installed.
+      - run: cargo clippy -p scanner-cli --all-targets --features airspy
       # Likewise the mbelib vocoder, which falls back to a stand-in without the library.
       - run: cargo clippy -p scanner-cli --all-targets --features mbelib
       - run: cargo test --workspace

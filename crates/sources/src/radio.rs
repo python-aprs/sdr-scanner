@@ -313,3 +313,74 @@ impl Radio for SdrplayRadio {
         true
     }
 }
+
+/// An Airspy R2 or Mini.
+pub struct AirspyRadio {
+    pub cfg: crate::airspy::AirspyConfig,
+}
+
+impl Health for crate::airspy::AirspyEvents {
+    fn samples_received(&self) -> u64 {
+        self.samples_received.load(Ordering::Relaxed)
+    }
+    fn summary(&self) -> Option<String> {
+        crate::airspy::AirspyEvents::summary(self)
+    }
+}
+
+#[cfg(feature = "airspy")]
+impl Radio for AirspyRadio {
+    fn open(&self, stop: &Arc<AtomicBool>, note: &dyn Fn(&str)) -> Result<Session, SourceError> {
+        use crate::airspy::Airspy;
+        note("opening the Airspy...");
+        let (device, source) = Airspy::start(&self.cfg, BLOCKS, BLOCK)?;
+        let info = source.info().clone();
+        let events = device.events().clone();
+        let halt = Arc::new(AtomicBool::new(false));
+        let (stop, h) = (stop.clone(), halt.clone());
+        let thread = std::thread::Builder::new()
+            .name("radio".into())
+            .spawn(move || {
+                // libairspy streams on its own threads; this one owns the
+                // device and stops it on Ctrl-C or when streaming dies
+                // (unplugged, USB failure).
+                while !stop.load(Ordering::Relaxed) && !h.load(Ordering::Relaxed) {
+                    if !device.is_streaming() {
+                        drop(device);
+                        return Err(SourceError::Device(
+                            "the Airspy stopped streaming (unplugged?)".into(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                drop(device);
+                Ok(())
+            })?;
+        Ok(Session {
+            info,
+            source,
+            health: Some(events),
+            thread,
+            halt,
+        })
+    }
+
+    fn reopens(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(not(feature = "airspy"))]
+impl Radio for AirspyRadio {
+    fn open(&self, _: &Arc<AtomicBool>, _: &dyn Fn(&str)) -> Result<Session, SourceError> {
+        Err(SourceError::Device(
+            "this scanner was built without Airspy support; rebuild with `--features airspy` \
+             (needs libairspy installed)"
+                .into(),
+        ))
+    }
+
+    fn reopens(&self) -> bool {
+        true
+    }
+}

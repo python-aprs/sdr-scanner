@@ -6,6 +6,7 @@
 //! into a lock-free ring and serve `read` from the consumer side of that ring,
 //! so the driver callback never blocks (PLAN.md 3.4).
 
+pub mod airspy;
 pub mod file;
 pub mod radio;
 pub mod ring;
@@ -14,7 +15,7 @@ pub mod sigmf;
 pub mod sdrplay;
 
 pub use file::FileSource;
-pub use radio::{Health, Radio, Replay, SdrplayRadio, Session, reopen};
+pub use radio::{AirspyRadio, Health, Radio, Replay, SdrplayRadio, Session, reopen};
 pub use ring::{RingProducer, RingSource, ring};
 
 use num_complex::Complex32;
