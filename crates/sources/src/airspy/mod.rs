@@ -113,6 +113,62 @@ impl AirspyGain {
             AirspyGain::Agc { vga } => check("VGA", vga, 15),
         }
     }
+
+    /// The (LNA, mixer, VGA) register values this setting programs; `None`
+    /// for AGC, where the radio picks LNA and mixer itself.
+    pub fn stages(&self) -> Option<(u8, u8, u8)> {
+        // libairspy's preset tables (airspy.c), indexed by 21 - preset.
+        const LIN_VGA: [u8; 22] = [
+            13, 12, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 8, 7, 6, 5, 4,
+        ];
+        const LIN_MIXER: [u8; 22] = [
+            12, 12, 11, 9, 8, 7, 6, 6, 5, 0, 0, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0,
+        ];
+        const LIN_LNA: [u8; 22] = [
+            14, 14, 14, 13, 12, 10, 9, 9, 8, 9, 8, 6, 5, 3, 1, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        const SENS_VGA: [u8; 22] = [
+            13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        ];
+        const SENS_MIXER: [u8; 22] = [
+            12, 12, 12, 12, 11, 10, 10, 9, 9, 8, 7, 4, 4, 4, 3, 2, 2, 1, 0, 0, 0, 0,
+        ];
+        const SENS_LNA: [u8; 22] = [
+            14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 12, 12, 9, 9, 8, 7, 6, 5, 3, 2, 1, 0,
+        ];
+        match *self {
+            AirspyGain::Linearity(g) => {
+                let i = 21 - g.min(21) as usize;
+                Some((LIN_LNA[i], LIN_MIXER[i], LIN_VGA[i]))
+            }
+            AirspyGain::Sensitivity(g) => {
+                let i = 21 - g.min(21) as usize;
+                Some((SENS_LNA[i], SENS_MIXER[i], SENS_VGA[i]))
+            }
+            AirspyGain::Manual { lna, mixer, vga } => Some((lna, mixer, vga)),
+            AirspyGain::Agc { .. } => None,
+        }
+    }
+
+    /// Rough tuner gain in dB (0 with every stage at its lowest), from the
+    /// R820T's step sizes. Good to a dB or two, which is enough to compare
+    /// gain steps; `None` under AGC.
+    pub fn approx_gain_db(&self) -> Option<f32> {
+        // dB added by each register step, in tenths (rtl-sdr's r82xx.c).
+        const LNA_STEPS: [i16; 16] = [0, 9, 13, 40, 38, 13, 31, 22, 26, 31, 26, 14, 19, 5, 35, 13];
+        const MIXER_STEPS: [i16; 16] = [0, 5, 10, 10, 19, 9, 10, 25, 17, 10, 8, 16, 13, 6, 3, -8];
+        // The VGA moves 3.5 dB a step (R820T datasheet).
+        const VGA_STEP_DB: f32 = 3.5;
+        let (lna, mixer, vga) = self.stages()?;
+        let sum = |steps: &[i16; 16], n: u8| -> f32 {
+            steps[..=(n.min(15) as usize)]
+                .iter()
+                .map(|&x| x as f32)
+                .sum::<f32>()
+                / 10.0
+        };
+        Some(sum(&LNA_STEPS, lna) + sum(&MIXER_STEPS, mixer) + vga as f32 * VGA_STEP_DB)
+    }
 }
 
 /// Radio settings.
@@ -310,6 +366,18 @@ mod tests {
     use super::*;
     use crate::{Source, SourceInfo, ring};
     use std::sync::Arc;
+
+    #[test]
+    fn preset_gain_rises_with_the_preset() {
+        for mk in [AirspyGain::Linearity, AirspyGain::Sensitivity] {
+            let g: Vec<f32> = (0..=21).map(|n| mk(n).approx_gain_db().unwrap()).collect();
+            assert!(g.windows(2).all(|w| w[1] >= w[0] - 0.01), "{g:?}");
+            assert!(g[21] - g[0] > 30.0, "{g:?}");
+        }
+        assert_eq!(AirspyGain::Linearity(21).stages(), Some((14, 12, 13)));
+        assert_eq!(AirspyGain::Linearity(0).stages(), Some((0, 0, 4)));
+        assert_eq!(AirspyGain::Agc { vga: 5 }.approx_gain_db(), None);
+    }
 
     fn info() -> SourceInfo {
         SourceInfo {

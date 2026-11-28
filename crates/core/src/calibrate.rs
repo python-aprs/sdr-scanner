@@ -266,7 +266,7 @@ pub fn suggest(steps: &[Step]) -> Option<Suggestion> {
             let db = (b.gain_db - target).abs();
             da.total_cmp(&db).then(a.lna.cmp(&b.lna))
         })?;
-    let mut reason = format!("LNA {} / GR {}: {why}", pick.lna, pick.gr);
+    let mut reason = why;
     if target < want {
         reason.push_str(&format!(
             "; held to {:.0} dB, the most before clipping, overload or intermod",

@@ -117,21 +117,31 @@ struct DtmfArgs {
 
 #[derive(clap::Args)]
 struct CalibrateArgs {
-    /// `sdrplay` or `sdrplay:<serial>`.
+    /// `sdrplay`, `sdrplay:<serial>`, `airspy` or `airspy:<hex serial>`.
     #[arg(long, default_value = "sdrplay")]
     source: serve::SourceSpec,
     #[command(flatten)]
     tuning: Tuning,
-    /// Radio settings; --lna and --gr are ignored (they are swept).
+    /// Radio settings; --lna and --gr (SDRplay) or the --airspy-gain
+    /// preset number (Airspy) are ignored, as they are swept. An Airspy
+    /// sweeps the kind of preset --airspy-gain names (linearity unless
+    /// told otherwise).
     #[command(flatten)]
     radio: RadioArgs,
+    /// Airspy presets to try.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "0,2,4,6,8,10,12,14,16,18,20,21"
+    )]
+    airspy_presets: Vec<u8>,
     /// Seconds measured at each step (after 0.3 s to settle).
     #[arg(long, default_value_t = 2.0)]
     dwell: f64,
-    /// LNA states to try.
+    /// SDRplay LNA states to try.
     #[arg(long, value_delimiter = ',', default_value = "0,1,2,3,4,5,6,7,8,9")]
     lna_states: Vec<u8>,
-    /// IF gain reductions (dB) to try at each LNA state.
+    /// SDRplay IF gain reductions (dB) to try at each LNA state.
     #[arg(long, value_delimiter = ',', default_value = "59,50,40,30,20")]
     gr_steps: Vec<u8>,
     /// Print JSON (every step and the suggestion) instead of a table.
@@ -598,25 +608,32 @@ fn devices() -> Result<()> {
 }
 
 /// Print the sweep and what it suggests.
-#[cfg_attr(not(feature = "sdrplay"), allow(dead_code))]
+///
+/// `airspy` names the preset kind swept (`linearity` or `sensitivity`), whose
+/// number each step carries in `lna`; `None` is an SDRplay LNA/GR sweep.
+#[cfg_attr(not(any(feature = "sdrplay", feature = "airspy")), allow(dead_code))]
 fn report_calibration(
     steps: &[scanner_core::calibrate::Step],
     json: bool,
+    airspy: Option<&str>,
 ) -> Option<scanner_core::calibrate::Suggestion> {
     let s = scanner_core::calibrate::suggest(steps);
     if json {
         println!("{}", serde_json::json!({ "steps": steps, "suggestion": s }));
         return s;
     }
+    let setting = |lna: u8, gr: u8| match airspy {
+        Some(kind) => format!("{kind}:{lna}"),
+        None => format!("LNA {lna} GR {gr}"),
+    };
     println!(
-        "{:>3} {:>3} {:>6} {:>7} {:>7} {:>8} {:>7} {:>5} {:>6}",
-        "LNA", "GR", "gain", "rms", "peak", "clip ppm", "floor", "peaks", "idle99.9"
+        "{:>13} {:>6} {:>7} {:>7} {:>8} {:>7} {:>5} {:>6}",
+        "setting", "gain", "rms", "peak", "clip ppm", "floor", "peaks", "idle99.9"
     );
     for x in steps {
         println!(
-            "{:>3} {:>3} {:>6.0} {:>7.1} {:>7.1} {:>8.1} {:>7.1} {:>5} {:>6.1}{}",
-            x.lna,
-            x.gr,
+            "{:>13} {:>6.0} {:>7.1} {:>7.1} {:>8.1} {:>7.1} {:>5} {:>6.1}{}",
+            setting(x.lna, x.gr),
             x.gain_db,
             x.rms_dbfs,
             x.peak_dbfs,
@@ -629,10 +646,14 @@ fn report_calibration(
     }
     match &s {
         Some(g) => {
-            println!("\n{}", g.reason);
+            println!("\n{}: {}", setting(g.lna, g.gr), g.reason);
+            let flags = match airspy {
+                Some(kind) => format!("--airspy-gain {kind}:{}", g.lna),
+                None => format!("--lna {} --gr {}", g.lna, g.gr),
+            };
             println!(
-                "\nsuggested: --lna {} --gr {} --open-db {} --close-db {}",
-                g.lna, g.gr, g.open_db, g.close_db
+                "\nsuggested: {flags} --open-db {} --close-db {}",
+                g.open_db, g.close_db
             );
         }
         None => println!("\nno step was clean enough to suggest (all clipped or overloaded?)"),
@@ -640,8 +661,40 @@ fn report_calibration(
     s
 }
 
-#[cfg(feature = "sdrplay")]
 fn calibrate(a: CalibrateArgs) -> Result<()> {
+    match a.source {
+        serve::SourceSpec::Sdrplay { .. } => calibrate_sdrplay(a),
+        serve::SourceSpec::Airspy { .. } => calibrate_airspy(a),
+        serve::SourceSpec::Replay { .. } => {
+            bail!("calibrate needs a radio: --source sdrplay or --source airspy")
+        }
+    }
+}
+
+/// Read `secs` of samples from a radio, handing each chunk to `f`.
+#[cfg(any(feature = "sdrplay", feature = "airspy"))]
+fn read_for(
+    source: &mut scanner_sources::RingSource,
+    rate: f64,
+    secs: f64,
+    buf: &mut [Complex32],
+    f: &mut dyn FnMut(&[Complex32]),
+) -> Result<()> {
+    let chunk = buf.len();
+    let mut left = (secs * rate) as usize;
+    while left > 0 {
+        let k = source.read(&mut buf[..left.min(chunk)])?;
+        if k == 0 {
+            bail!("the radio stopped streaming");
+        }
+        f(&buf[..k]);
+        left -= k;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sdrplay")]
+fn calibrate_sdrplay(a: CalibrateArgs) -> Result<()> {
     use scanner_core::calibrate::{StepMeter, rsp1a_gain_db};
     use scanner_sources::sdrplay::Sdrplay;
     use std::sync::atomic::Ordering;
@@ -680,30 +733,15 @@ fn calibrate(a: CalibrateArgs) -> Result<()> {
         a.dwell
     );
     let mut buf = vec![Complex32::default(); 1 << 16];
-    let mut read_for = |source: &mut scanner_sources::RingSource,
-                        secs: f64,
-                        f: &mut dyn FnMut(&[Complex32])|
-     -> Result<()> {
-        let mut left = (secs * rate) as usize;
-        while left > 0 {
-            let k = source.read(&mut buf[..left.min(1 << 16)])?;
-            if k == 0 {
-                bail!("the radio stopped streaming");
-            }
-            f(&buf[..k]);
-            left -= k;
-        }
-        Ok(())
-    };
     let mut steps = Vec::new();
     for (i, &(lna, gr)) in steps_todo.iter().enumerate() {
         if i > 0 {
             device.set_gain(lna, gr)?;
         }
-        read_for(&mut source, 0.3, &mut |_| {})?;
+        read_for(&mut source, rate, 0.3, &mut buf, &mut |_| {})?;
         let overloads = events.overloads.load(Ordering::Relaxed);
         let mut meter = StepMeter::new(rate, cfg.center_hz, &plan.slots, &detector);
-        read_for(&mut source, a.dwell, &mut |x| meter.push(x))?;
+        read_for(&mut source, rate, a.dwell, &mut buf, &mut |x| meter.push(x))?;
         let overload = events.overloads.load(Ordering::Relaxed) > overloads
             || events.overloaded.load(Ordering::Relaxed);
         // The radio reports its actual LNA reduction; trust it over the
@@ -728,13 +766,96 @@ fn calibrate(a: CalibrateArgs) -> Result<()> {
         steps.push(step);
     }
     drop(device);
-    report_calibration(&steps, a.json);
+    report_calibration(&steps, a.json, None);
     Ok(())
 }
 
 #[cfg(not(feature = "sdrplay"))]
-fn calibrate(_: CalibrateArgs) -> Result<()> {
+fn calibrate_sdrplay(_: CalibrateArgs) -> Result<()> {
     bail!("this scanner was built without SDRplay support; rebuild with `--features sdrplay`")
+}
+
+/// Sweep the Airspy's linearity (or sensitivity) presets. Each step is
+/// recorded with the preset in `lna` and 0 in `gr`; gain is the R820T
+/// estimate relative to the most the preset kind gives.
+#[cfg(feature = "airspy")]
+fn calibrate_airspy(a: CalibrateArgs) -> Result<()> {
+    use scanner_core::calibrate::StepMeter;
+    use scanner_sources::airspy::{Airspy, AirspyGain};
+    use std::sync::atomic::Ordering;
+    let serve::SourceSpec::Airspy { serial } = a.source else {
+        bail!("calibrate needs a radio: --source airspy");
+    };
+    let (kind, mk): (&str, fn(u8) -> AirspyGain) = match a.radio.airspy_gain {
+        AirspyGain::Linearity(_) => ("linearity", AirspyGain::Linearity),
+        AirspyGain::Sensitivity(_) => ("sensitivity", AirspyGain::Sensitivity),
+        g => bail!("calibrate sweeps linearity or sensitivity presets, not {g}"),
+    };
+    let (profile, plan) = a.tuning.load()?;
+    let detector = a.tuning.scanner_config(&profile).detector;
+    let mut presets = a.airspy_presets.clone();
+    presets.retain(|&p| p <= 21);
+    // Least gain first, so the radio never starts out overloaded.
+    presets.sort_unstable();
+    presets.dedup();
+    let Some(&p0) = presets.first() else {
+        bail!("nothing to sweep");
+    };
+    let top = mk(21).approx_gain_db().unwrap_or(0.0);
+    let cfg = scanner_sources::airspy::AirspyConfig {
+        serial,
+        gain: mk(p0),
+        ..a.radio.airspy(&profile)
+    };
+    cfg.validate()
+        .map_err(|e| anyhow::anyhow!("radio settings: {e}"))?;
+    let (mut device, mut source) = Airspy::start(&cfg, 64, 1 << 16)?;
+    let rate = cfg.sample_rate;
+    let events = device.events().clone();
+    eprintln!(
+        "{}: sweeping {} {kind} presets, {:.1} s each",
+        source.info().description,
+        presets.len(),
+        a.dwell
+    );
+    let mut buf = vec![Complex32::default(); 1 << 16];
+    let mut steps = Vec::new();
+    for (i, &p) in presets.iter().enumerate() {
+        if i > 0 {
+            device.set_gain(mk(p))?;
+        }
+        read_for(&mut source, rate, 0.3, &mut buf, &mut |_| {})?;
+        let dropped = events.dropped_samples.load(Ordering::Relaxed);
+        let mut meter = StepMeter::new(rate, cfg.center_hz, &plan.slots, &detector);
+        read_for(&mut source, rate, a.dwell, &mut buf, &mut |x| meter.push(x))?;
+        let gain_db = mk(p).approx_gain_db().unwrap_or(0.0) - top;
+        let step = meter.finish(p, 0, gain_db, false);
+        let lost = events.dropped_samples.load(Ordering::Relaxed) - dropped;
+        eprintln!(
+            "  {kind}:{p}: floor {:.1} dB, rms {:.1} dBFS{}{}",
+            step.floor_db,
+            step.rms_dbfs,
+            if step.clip_ppm > 0.0 {
+                ", clipping"
+            } else {
+                ""
+            },
+            if lost > 0 {
+                format!(", {lost} samples dropped")
+            } else {
+                String::new()
+            }
+        );
+        steps.push(step);
+    }
+    drop(device);
+    report_calibration(&steps, a.json, Some(kind));
+    Ok(())
+}
+
+#[cfg(not(feature = "airspy"))]
+fn calibrate_airspy(_: CalibrateArgs) -> Result<()> {
+    bail!("this scanner was built without Airspy support; rebuild with `--features airspy`")
 }
 
 fn open(path: &Path) -> Result<FileSource> {
