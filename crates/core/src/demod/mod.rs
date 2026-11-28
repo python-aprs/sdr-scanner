@@ -137,6 +137,12 @@ pub trait Demod: Send {
         Vec::new()
     }
 
+    /// Packet preambles heard so far (counts up at least once per packet):
+    /// data on the air, decoded or not.
+    fn preambles(&self) -> u64 {
+        0
+    }
+
     /// The digital or packet mode this transmission has shown itself to be
     /// (syncs, a checked header or a frame that passed its FCS), if any.
     fn detected(&self) -> Option<Mode> {

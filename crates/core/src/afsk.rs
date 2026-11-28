@@ -24,6 +24,12 @@ const SPACE_GAINS: [f32; 5] = [0.5, 0.7, 1.0, 1.4, 2.0];
 const MAX_FRAME: usize = 340;
 /// Shortest: two addresses, control and FCS.
 const MIN_FRAME: usize = 17;
+/// Back-to-back HDLC flags that make a preamble (80 ms). Transmitters send
+/// tens of flags (TXDELAY, 100-500 ms) before a frame. Voice can slice into
+/// a few flags in a row (a ~150 Hz pitch flips mark and space every eight
+/// bits): four came out of three minutes of recorded 2 m voice, eight
+/// never did, so this keeps a margin.
+pub const PREAMBLE_FLAGS: u32 = 12;
 
 /// CRC-16/X.25 (the AX.25 FCS).
 pub fn fcs(data: &[u8]) -> u16 {
@@ -153,6 +159,11 @@ struct Slicer {
     cur: u8,
     nbits: u32,
     bytes: Vec<u8>,
+    /// Bits since the last flag, and flags in a row 8 bits apart.
+    since_flag: u32,
+    flag_run: u32,
+    /// Set when the run reaches [`PREAMBLE_FLAGS`].
+    preamble: bool,
 }
 
 impl Slicer {
@@ -169,6 +180,9 @@ impl Slicer {
             cur: 0,
             nbits: 0,
             bytes: Vec::new(),
+            since_flag: 0,
+            flag_run: 0,
+            preamble: false,
         }
     }
 
@@ -203,7 +217,17 @@ impl Slicer {
 
     fn bit(&mut self, b: bool) -> Option<Vec<u8>> {
         self.sr = (self.sr >> 1) | ((b as u8) << 7);
+        self.since_flag = self.since_flag.saturating_add(1);
         if self.sr == 0x7e {
+            self.flag_run = if self.since_flag == 8 {
+                self.flag_run + 1
+            } else {
+                1
+            };
+            self.since_flag = 0;
+            if self.flag_run == PREAMBLE_FLAGS {
+                self.preamble = true;
+            }
             // The flag's first seven bits went into `cur`: a frame that
             // ended on a byte boundary has exactly seven left over.
             let frame = (self.collecting
@@ -321,6 +345,10 @@ pub struct AfskDecoder {
     out: Vec<Decoded>,
     /// Frames that failed the FCS (for stats).
     pub bad_fcs: u64,
+    /// Counts up when a preamble is heard ([`PREAMBLE_FLAGS`] flags in a
+    /// row, on any slicer): a packet on the air, whether or not its frame
+    /// decodes.
+    pub preambles: u64,
 }
 
 impl AfskDecoder {
@@ -336,6 +364,7 @@ impl AfskDecoder {
             dedup_samples: rate as u64,
             out: Vec::new(),
             bad_fcs: 0,
+            preambles: 0,
         }
     }
 
@@ -348,10 +377,16 @@ impl AfskDecoder {
                 self.mark.renormalize();
                 self.space.renormalize();
             }
+            let mut preamble = false;
             for k in 0..self.slicers.len() {
                 if let Some(bytes) = self.slicers[k].sample(m, s) {
                     self.frame(bytes);
                 }
+                preamble |= std::mem::take(&mut self.slicers[k].preamble);
+            }
+            // Slicers at different weights hear the same preamble.
+            if preamble {
+                self.preambles += 1;
             }
         }
     }
@@ -493,6 +528,7 @@ pub(crate) mod tests {
             }
             let got = d.take();
             assert_eq!(got.len(), 1, "tilt {ma}/{sa}: {got:?}");
+            assert!(d.preambles > 0, "tilt {ma}/{sa}");
             let fr = &got[0].frame;
             assert_eq!(
                 fr.tnc2(),
@@ -515,5 +551,42 @@ pub(crate) mod tests {
         let mut d = AfskDecoder::new(rate);
         d.push(&x);
         assert!(d.take().is_empty());
+        // Still a packet on the air.
+        assert!(d.preambles > 0);
+    }
+
+    #[test]
+    fn no_preamble_in_noise_or_tones() {
+        let rate = 31250.0;
+        let mut seed = 7u32;
+        let noise: Vec<f32> = (0..(rate as usize * 20))
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect();
+        let mut d = AfskDecoder::new(rate);
+        d.push(&noise);
+        assert_eq!(d.preambles, 0, "noise");
+        // Steady mark or space, and the two alternating at a 150 Hz pitch
+        // whose period isn't on the bit clock.
+        for f in [MARK_HZ, SPACE_HZ, 0.0] {
+            let x: Vec<f32> = (0..(rate as usize * 5))
+                .map(|i| {
+                    let t = i as f64 / rate;
+                    let f = if f > 0.0 {
+                        f
+                    } else if (t * 150.0) % 1.0 < 0.5 {
+                        MARK_HZ
+                    } else {
+                        SPACE_HZ
+                    };
+                    (0.5 * (2.0 * PI * f * t).sin()) as f32
+                })
+                .collect();
+            let mut d = AfskDecoder::new(rate);
+            d.push(&x);
+            assert_eq!(d.preambles, 0, "{f} Hz");
+        }
     }
 }
