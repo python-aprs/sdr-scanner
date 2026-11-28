@@ -46,6 +46,11 @@ start  = "144.000 MHz"
 stop   = "144.300 MHz"
 reason = "CW, SSB and weak signal; not useful as NBFM (Phase 7)"
 
+[[profiles.rainier-2m.lockouts]]
+start = "146.442 MHz"
+stop = "146.443 MHz"
+reason = "Constant interference (1s undecodable digital)"
+
 # TODO: WWARA 2 m band plan simplex channels (listed explicitly so they get
 # names; until then the 25 kHz grid covers them).
 
