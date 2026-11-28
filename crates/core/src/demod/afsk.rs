@@ -40,6 +40,10 @@ impl Demod for AfskPacket {
         false
     }
 
+    fn preambles(&self) -> u64 {
+        self.decoder.preambles
+    }
+
     fn detected(&self) -> Option<Mode> {
         (self.frames > 0).then_some(Mode::Afsk1200)
     }

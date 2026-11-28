@@ -1675,6 +1675,140 @@ mod tests {
         }
     }
 
+    /// `audio` (at 31.25 kHz, +/-1 full deviation) FM-modulated onto a
+    /// 100 kHz carrier from `on` seconds, in `secs` of noise.
+    fn fm_audio_scene(audio: &[f32], secs: f64, on: f64) -> Vec<Complex32> {
+        let mut x = scene(secs, &[]);
+        add_fm_audio(&mut x, audio, on);
+        x
+    }
+
+    /// Add `audio` as in [`fm_audio_scene`], keyed up 0.1 s past its end.
+    fn add_fm_audio(x: &mut [Complex32], audio: &[f32], on: f64) {
+        let fs = params().sample_rate;
+        let on = (on * fs) as usize;
+        let mut ph = 0.0f64;
+        let len = (audio.len() as f64 / 31250.0 * fs) as usize;
+        for i in 0..len + (0.1 * fs) as usize {
+            let a = audio
+                .get((i as f64 * 31250.0 / fs) as usize)
+                .copied()
+                .unwrap_or(0.0);
+            let f = 100e3 + 5000.0 * a as f64;
+            ph = (ph + 2.0 * PI * f / fs).rem_euclid(2.0 * PI);
+            x[on + i] += Complex32::from_polar(0.1, ph as f32);
+        }
+    }
+
+    /// Live audio from `x` on one grid slot at 100 kHz: total seconds of
+    /// samples sent that are not silence, and the outputs.
+    fn live_run(x: &[Complex32]) -> (f64, Vec<Output>) {
+        let cfg = ScannerConfig::default();
+        let rate = cfg.audio_rate as f64;
+        let mut s =
+            Scanner::with_params(cfg, params(), 0.0, SystemTime::UNIX_EPOCH, &[slot(100e3)]);
+        s.set_live(true);
+        let (mut out, mut live) = (Vec::new(), Vec::new());
+        for c in x.chunks(20_000) {
+            s.push(c, &mut out);
+        }
+        s.finish(&mut out);
+        s.take_live(&mut live);
+        let loud = live
+            .iter()
+            .map(|l| match l {
+                LiveAudio::Audio { samples, .. } => {
+                    samples.iter().filter(|v| v.abs() > 0.01).count()
+                }
+                _ => 0,
+            })
+            .sum::<usize>();
+        (loud as f64 / rate, out)
+    }
+
+    #[test]
+    fn packet_bursts_are_not_heard_live_decoded_or_not() {
+        use crate::afsk::tests::{afsk_audio, ui_frame};
+        let frame = ui_frame(
+            "KF7HVM",
+            "APRS",
+            &[("WIDE1", 1, false), ("WIDE2", 1, false)],
+            b"!4559.61N/12302.48W-a position report long enough to hear",
+        );
+        let good = afsk_audio(&frame, 31250.0, 0.6, 0.6);
+        // The same burst with its body broken, so the FCS fails: a weak or
+        // collided packet, still a screech on the air.
+        let mut bad = good.clone();
+        let mid = bad.len() * 2 / 3;
+        bad[mid..mid + 200].fill(0.0);
+        let burst = good.len() as f64 / 31250.0;
+        for (name, audio) in [("decoded", &good), ("failed FCS", &bad)] {
+            let x = fm_audio_scene(audio, burst + 2.5, 0.3);
+            let (heard, out) = live_run(&x);
+            let packets = out
+                .iter()
+                .filter(|o| matches!(o, Output::Packet(_)))
+                .count();
+            assert_eq!(packets, (name == "decoded") as usize, "{name}");
+            assert!(
+                heard < 0.06,
+                "{name}: {heard:.3} s of a {burst:.3} s packet heard live"
+            );
+            assert_eq!(kept_opens(&out).len(), 0, "{name}: recorded");
+        }
+    }
+
+    #[test]
+    fn voice_around_a_packet_is_heard() {
+        use crate::afsk::tests::{afsk_audio, ui_frame};
+        let frame = ui_frame("KF7HVM", "APRS", &[], b">a status report");
+        let mut packet = afsk_audio(&frame, 31250.0, 0.6, 0.6);
+        let mid = packet.len() * 2 / 3;
+        packet[mid..mid + 200].fill(0.0);
+        let burst = packet.len() as f64 / 31250.0;
+        let voice = |secs: f64| -> Vec<f32> {
+            (0..(secs * 31250.0) as usize)
+                .map(|i| 0.6 * (2.0 * PI * 800.0 * i as f64 / 31250.0).sin() as f32)
+                .collect()
+        };
+        // 2 s of voice, a packet that fails its FCS on the same keyup, then
+        // 0.4 s later (within the hang time) 1 s more voice.
+        let mut first = voice(2.0);
+        first.extend(&packet);
+        let mut x = scene(2.0 + burst + 4.0, &[]);
+        add_fm_audio(&mut x, &first, 0.3);
+        let again = 0.3 + 2.0 + burst + 0.1 + 0.4;
+        add_fm_audio(&mut x, &voice(1.0), again);
+        let (heard, out) = live_run(&x);
+        assert!(
+            (2.7..3.1).contains(&heard),
+            "{heard:.3} s heard of 3 s voice and a {burst:.3} s packet"
+        );
+        assert_eq!(kept_opens(&out).len(), 1);
+    }
+
+    #[test]
+    fn voice_is_still_heard_live() {
+        // A 1.5 s FM tone, and speech-like bursts: never taken for packet.
+        let t = |i: usize| i as f64 / 31250.0;
+        let tone: Vec<f32> = (0..(1.5 * 31250.0) as usize)
+            .map(|i| 0.6 * (2.0 * PI * 1000.0 * t(i)).sin() as f32)
+            .collect();
+        // Alternating 1200 and 2200 Hz (the packet tones) at a syllable rate.
+        let warble: Vec<f32> = (0..(1.5 * 31250.0) as usize)
+            .map(|i| {
+                let f = if t(i) % 0.2 < 0.1 { 1200.0 } else { 2200.0 };
+                0.6 * (2.0 * PI * f * t(i)).sin() as f32
+            })
+            .collect();
+        for (name, audio) in [("tone", &tone), ("warble", &warble)] {
+            let x = fm_audio_scene(audio, 3.0, 0.3);
+            let (heard, out) = live_run(&x);
+            assert!(heard > 1.2, "{name}: only {heard:.3} s heard");
+            assert_eq!(kept_opens(&out).len(), 1, "{name}");
+        }
+    }
+
     #[test]
     fn dmr_slots_record_each_call_with_its_ids() {
         use crate::dmr::burst::Source;
