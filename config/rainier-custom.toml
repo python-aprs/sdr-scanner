@@ -19,3 +19,7 @@ modes    = ["FM", "YSF"]
 [[profiles.rainier-2m.channels]]
 freq = "146.4150 MHz"
 name = "146.415"
+
+[[profiles.rainier-2m.channels]]
+freq = "146.4425 MHz"
+name = "146.4425 (bad)"
